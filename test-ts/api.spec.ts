@@ -15,6 +15,33 @@ describe("DenoWorker API", () => {
     if (dw && !dw.isClosed()) await dw.close();
   });
 
+  test("postMessage throws and tryPostMessage returns false when closed", async () => {
+    await dw.close();
+    expect(dw.isClosed()).toBe(true);
+
+    expect(dw.tryPostMessage({ a: 1 })).toBe(false);
+    expect(() => dw.postMessage({ a: 1 })).toThrow(/postMessage dropped/i);
+  });
+
+  test("lastExecutionStats updates after evalSync and contains finite numbers", async () => {
+    const st0 = dw.lastExecutionStats;
+    expect(st0).toBeDefined();
+
+    expect(dw.evalSync("41 + 1")).toBe(42);
+    const st1 = dw.lastExecutionStats;
+    expect(typeof st1.cpuTimeMs).toBe("number");
+    expect(typeof st1.evalTimeMs).toBe("number");
+    expect(Number.isFinite(st1.cpuTimeMs!)).toBe(true);
+    expect(Number.isFinite(st1.evalTimeMs!)).toBe(true);
+
+    await expect(dw.eval("2 + 3")).resolves.toBe(5);
+    const st2 = dw.lastExecutionStats;
+    expect(typeof st2.cpuTimeMs).toBe("number");
+    expect(typeof st2.evalTimeMs).toBe("number");
+    expect(Number.isFinite(st2.cpuTimeMs!)).toBe(true);
+    expect(Number.isFinite(st2.evalTimeMs!)).toBe(true);
+  });
+
   test("eval evaluates basic expressions", async () => {
     await expect(dw.eval("1 + 1")).resolves.toBe(2);
     await expect(dw.eval('"Hello" + " " + "World"')).resolves.toBe("Hello World");

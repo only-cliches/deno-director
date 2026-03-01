@@ -4,11 +4,12 @@ use crate::worker::messages::{DenoMsg, ExecStats, NodeMsg};
 use neon::prelude::*;
 use neon::result::Throw;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use crate::bridge::promise::PromiseSettler; // can keep for local Node-side settlement only
+use crate::bridge::promise::PromiseSettler;
 
 #[derive(Default)]
 pub struct PendingRequests {
@@ -53,19 +54,40 @@ pub struct NodeCallbacks {
     pub console_error: Option<Arc<Root<JsFunction>>>,
 }
 
+#[derive(Debug, Clone)]
+pub enum EnvConfig {
+    Map(HashMap<String, String>),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InspectConfig {
+    pub host: String,
+    pub port: u16,
+    pub break_on_first_statement: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeLimits {
     pub max_memory_bytes: Option<u64>,
     pub max_stack_size_bytes: Option<u64>,
     pub max_eval_ms: Option<u64>,
+
     pub imports: ImportsPolicy,
+
     pub cwd: Option<String>,
-    pub node_compat: bool,
     pub permissions: Option<serde_json::Value>,
     pub startup: Option<String>,
 
-    // Wire JSON applied to globalThis.__globals["__denojs_worker_console"] before startup runs.
+    pub node_resolve: bool,
+    pub node_compat: bool,
+
     pub console: Option<serde_json::Value>,
+    pub inspect: Option<InspectConfig>,
+
+    /// env:
+    /// - None: default Deno behavior
+    /// - Some(Map): env vars to set (loaded from either string file path or object map in JS)
+    pub env: Option<EnvConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,75 +96,192 @@ pub struct WorkerCreateOptions {
     pub runtime_options: RuntimeLimits,
 }
 
+fn parse_dotenv_text_strict(text: &str) -> Vec<(String, String)> {
+    fn unquote(s: &str) -> String {
+        let ss = s.trim();
+        if ss.len() >= 2 {
+            let b = ss.as_bytes();
+            if (b[0] == b'"' && b[ss.len() - 1] == b'"') || (b[0] == b'\'' && b[ss.len() - 1] == b'\'') {
+                return ss[1..ss.len() - 1].to_string();
+            }
+        }
+        ss.to_string()
+    }
+
+    let mut out = Vec::new();
+
+    for line in text.lines() {
+        let mut l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+
+        if l.starts_with("export ") {
+            l = l.trim_start_matches("export ").trim();
+        }
+
+        let Some(eq) = l.find('=') else {
+            continue;
+        };
+
+        let key = l[..eq].trim();
+        if key.is_empty() {
+            continue;
+        }
+
+        let mut val = l[eq + 1..].trim();
+
+        let is_quoted = val.starts_with('"') || val.starts_with('\'');
+        if !is_quoted {
+            if let Some(hash) = val.find(" #") {
+                val = val[..hash].trim();
+            }
+        }
+
+        out.push((key.to_string(), unquote(val)));
+    }
+
+    out
+}
+
+fn resolve_env_path(base_cwd: &Path, raw: &str) -> PathBuf {
+    let s = raw.trim();
+
+    if s.starts_with("file://") {
+        if let Ok(u) = deno_core::url::Url::parse(s) {
+            if let Ok(p) = u.to_file_path() {
+                return p;
+            }
+        }
+    }
+
+    let p = Path::new(s);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base_cwd.join(p)
+    }
+}
+
+fn find_dotenv_upwards(start_dir: &Path) -> Option<PathBuf> {
+    let mut cur = std::fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
+    loop {
+        let cand = cur.join(".env");
+        if cand.is_file() {
+            return Some(cand);
+        }
+        let parent = cur.parent().map(|p| p.to_path_buf());
+        let Some(p) = parent else { return None; };
+        if p == cur {
+            return None;
+        }
+        cur = p;
+    }
+}
+
+fn validate_env_key(k: &str) -> bool {
+    if k.is_empty() || k.len() > 4096 {
+        return false;
+    }
+    if k.contains('\0') {
+        return false;
+    }
+    true
+}
+
+fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(map) = j.as_object() else {
+        return out;
+    };
+
+    for (k, v) in map.iter() {
+        if !validate_env_key(k) {
+            continue;
+        }
+        if let Some(s) = v.as_str() {
+            out.insert(k.to_string(), s.to_string());
+        }
+    }
+
+    out
+}
+
+fn load_dotenv_file_strict(cx: &mut FunctionContext, path: &Path) -> Result<HashMap<String, String>, Throw> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        cx.throw_error::<_, Throw>(format!(
+            "env file read failed: {} ({})",
+            path.to_string_lossy(),
+            e
+        ))
+        .unwrap_err()
+    })?;
+
+    let pairs = parse_dotenv_text_strict(&text);
+    let mut map = HashMap::new();
+    for (k, vv) in pairs {
+        if !validate_env_key(&k) {
+            continue;
+        }
+        map.insert(k, vv);
+    }
+    Ok(map)
+}
+
 impl WorkerCreateOptions {
     pub fn from_neon<'a>(cx: &mut FunctionContext<'a>, idx: i32) -> Result<Self, Throw> {
         let mut out = Self {
             channel_size: 512,
             ..Default::default()
         };
+
         if (idx as usize) >= cx.len() {
             return Ok(out);
         }
-        let raw = cx.argument::<JsValue>(idx as usize)?;
 
+        let raw = cx.argument::<JsValue>(idx as usize)?;
         let obj = match raw.downcast::<JsObject, _>(cx) {
             Ok(v) => v,
             Err(_) => return Ok(out),
         };
 
-        // Retire moduleRoot, replace with cwd. Keep legacy fallback.
-        let mut cwd_opt: Option<String> = None;
+        // cwd
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "cwd") {
             if let Ok(s) = v.downcast::<JsString, _>(cx) {
                 let raw = s.value(cx);
-                if !raw.trim().is_empty() {
-                    cwd_opt = Some(raw);
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    out.runtime_options.cwd = Some(trimmed.to_string());
                 }
             }
         }
-        if cwd_opt.is_none() {
-            if let Ok(v) = obj.get::<JsValue, _, _>(cx, "moduleRoot") {
-                if let Ok(s) = v.downcast::<JsString, _>(cx) {
-                    let raw = s.value(cx);
-                    if !raw.trim().is_empty() {
-                        cwd_opt = Some(raw);
-                    }
-                }
-            }
-        }
-        out.runtime_options.cwd = cwd_opt;
 
-        // startup (and legacy alias: index)
-        let mut startup_opt: Option<String> = None;
-
+        // startup
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "startup") {
             if let Ok(s) = v.downcast::<JsString, _>(cx) {
                 let raw = s.value(cx);
-                if !raw.trim().is_empty() {
-                    startup_opt = Some(raw);
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    out.runtime_options.startup = Some(trimmed.to_string());
                 }
             }
         }
 
-        if startup_opt.is_none() {
-            if let Ok(v) = obj.get::<JsValue, _, _>(cx, "index") {
-                if let Ok(s) = v.downcast::<JsString, _>(cx) {
-                    let raw = s.value(cx);
-                    if !raw.trim().is_empty() {
-                        startup_opt = Some(raw);
-                    }
-                }
+        // nodeResolve
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeResolve") {
+            if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
+                out.runtime_options.node_resolve = b.value(cx);
             }
         }
 
-        out.runtime_options.startup = startup_opt;
-
+        // nodeCompat
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeCompat") {
             if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
                 out.runtime_options.node_compat = b.value(cx);
             }
         }
 
+        // permissions
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "permissions") {
             if !v.is_a::<JsNull, _>(cx) && !v.is_a::<JsUndefined, _>(cx) {
                 if let Ok(bridged) = from_neon_value(cx, v) {
@@ -153,6 +292,7 @@ impl WorkerCreateOptions {
             }
         }
 
+        // channelSize
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "channelSize") {
             if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
                 let s = n.value(cx);
@@ -161,27 +301,42 @@ impl WorkerCreateOptions {
                 }
             }
         }
+
+        // maxEvalMs
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxEvalMs") {
             if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
-                out.runtime_options.max_eval_ms = Some(n.value(cx) as u64);
-            }
-        }
-        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxMemoryBytes") {
-            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
-                out.runtime_options.max_memory_bytes = Some(n.value(cx) as u64);
-            }
-        }
-        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxStackSizeBytes") {
-            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
-                out.runtime_options.max_stack_size_bytes = Some(n.value(cx) as u64);
+                let ms = n.value(cx);
+                if ms.is_finite() && ms > 0.0 {
+                    out.runtime_options.max_eval_ms = Some(ms as u64);
+                }
             }
         }
 
+        // maxMemoryBytes
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxMemoryBytes") {
+            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
+                let mb = n.value(cx);
+                if mb.is_finite() && mb > 0.0 {
+                    out.runtime_options.max_memory_bytes = Some(mb as u64);
+                }
+            }
+        }
+
+        // maxStackSizeBytes
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxStackSizeBytes") {
+            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
+                let sb = n.value(cx);
+                if sb.is_finite() && sb > 0.0 {
+                    out.runtime_options.max_stack_size_bytes = Some(sb as u64);
+                }
+            }
+        }
+
+        // imports: boolean | function
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "imports") {
             if v.is_a::<JsBoolean, _>(cx) {
                 if let Ok(bv) = v.downcast::<JsBoolean, _>(cx) {
-                    let b = bv.value(cx);
-                    out.runtime_options.imports = if b {
+                    out.runtime_options.imports = if bv.value(cx) {
                         ImportsPolicy::AllowDisk
                     } else {
                         ImportsPolicy::DenyAll
@@ -191,6 +346,110 @@ impl WorkerCreateOptions {
                 out.runtime_options.imports = ImportsPolicy::Callback;
             }
         }
+
+        // base cwd for env/envFile resolution
+        let base_cwd = out
+            .runtime_options
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        // envFile: boolean | string(path)
+        // - true: search .env upward from cwd
+        // - string: load explicit path
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "envFile") {
+            if !(v.is_a::<JsUndefined, _>(cx) || v.is_a::<JsNull, _>(cx)) {
+                if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
+                    if b.value(cx) {
+                        if let Some(p) = find_dotenv_upwards(&base_cwd) {
+                            let map = load_dotenv_file_strict(cx, &p)?;
+                            out.runtime_options.env = Some(EnvConfig::Map(map));
+                        }
+                    }
+                } else if let Ok(s) = v.downcast::<JsString, _>(cx) {
+                    let raw_path = s.value(cx);
+                    let trimmed = raw_path.trim();
+                    if !trimmed.is_empty() {
+                        let p = resolve_env_path(&base_cwd, trimmed);
+                        let map = load_dotenv_file_strict(cx, &p)?;
+                        out.runtime_options.env = Some(EnvConfig::Map(map));
+                    }
+                }
+            }
+        }
+
+        // env: undefined | string(path) | Record<string,string>
+        // Note: env overrides envFile if both provided.
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "env") {
+            if v.is_a::<JsUndefined, _>(cx) || v.is_a::<JsNull, _>(cx) {
+                // default behavior
+            } else if let Ok(s) = v.downcast::<JsString, _>(cx) {
+                let raw_path = s.value(cx);
+                let trimmed = raw_path.trim();
+                if !trimmed.is_empty() {
+                    let path = resolve_env_path(&base_cwd, trimmed);
+                    let map = load_dotenv_file_strict(cx, &path)?;
+                    out.runtime_options.env = Some(EnvConfig::Map(map));
+                }
+            } else if let Ok(bridged) = from_neon_value(cx, v) {
+                if let JsValueBridge::Json(j) = bridged {
+                    let map = env_map_from_js_object(&j);
+                    out.runtime_options.env = Some(EnvConfig::Map(map));
+                }
+            }
+        }
+
+        // inspect: boolean | { host?: string; port?: number; break?: boolean }
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "inspect") {
+            if v.is_a::<JsUndefined, _>(cx) || v.is_a::<JsNull, _>(cx) {
+                // none
+            } else if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
+                if b.value(cx) {
+                    out.runtime_options.inspect = Some(InspectConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: 9229,
+                        break_on_first_statement: false,
+                    });
+                }
+            } else if let Ok(o) = v.downcast::<JsObject, _>(cx) {
+                let mut host = "127.0.0.1".to_string();
+                let mut port: u16 = 9229;
+                let mut brk = false;
+
+                if let Ok(hv) = o.get::<JsValue, _, _>(cx, "host") {
+                    if let Ok(hs) = hv.downcast::<JsString, _>(cx) {
+                        let raw = hs.value(cx);
+                        let trimmed = raw.trim();
+                        if !trimmed.is_empty() {
+                            host = trimmed.to_string();
+                        }
+                    }
+                }
+
+                if let Ok(pv) = o.get::<JsValue, _, _>(cx, "port") {
+                    if let Ok(pn) = pv.downcast::<JsNumber, _>(cx) {
+                        let n = pn.value(cx);
+                        if n.is_finite() && n > 0.0 && n <= 65535.0 {
+                            port = n as u16;
+                        }
+                    }
+                }
+
+                if let Ok(bv) = o.get::<JsValue, _, _>(cx, "break") {
+                    if let Ok(bb) = bv.downcast::<JsBoolean, _>(cx) {
+                        brk = bb.value(cx);
+                    }
+                }
+
+                out.runtime_options.inspect = Some(InspectConfig {
+                    host,
+                    port,
+                    break_on_first_statement: brk,
+                });
+            }
+        }
+
         Ok(out)
     }
 }
@@ -204,7 +463,6 @@ pub enum ImportsPolicy {
 
 impl Default for ImportsPolicy {
     fn default() -> Self {
-        // Safer default: deny disk imports unless explicitly enabled
         ImportsPolicy::DenyAll
     }
 }

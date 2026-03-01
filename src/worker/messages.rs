@@ -33,7 +33,7 @@ pub enum EvalReply {
     Err {
         error: JsValueBridge,
         stats: ExecStats,
-    }, // error is a JsValueBridge::Error{...}
+    },
 }
 
 pub enum DenoMsg {
@@ -57,9 +57,6 @@ pub enum DenoMsg {
     Close {
         deferred: PromiseSettler,
     },
-    // Pump {
-    //     deferred: PromiseSettler,
-    // },
 }
 
 pub enum ResolvePayload {
@@ -68,9 +65,6 @@ pub enum ResolvePayload {
 
     /// Result of an operation that returns a bridge value.
     /// `Ok(value)` resolves, `Err(error_value)` rejects.
-    ///
-    /// `error_value` should normally be `JsValueBridge::Error { ... }`,
-    /// but it can be any bridge value.
     Result {
         result: Result<JsValueBridge, JsValueBridge>,
         stats: ExecStats,

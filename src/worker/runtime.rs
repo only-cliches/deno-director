@@ -3,6 +3,7 @@ use deno_runtime::BootstrapOptions;
 use deno_runtime::deno_core::{self, resolve_url};
 use deno_runtime::permissions::RuntimePermissionDescriptorParser;
 use deno_runtime::worker::{MainWorker, WorkerOptions, WorkerServiceOptions};
+
 use deno_permissions::PermissionDescriptorParser;
 use deno_permissions::{Permissions, PermissionsContainer, PermissionsOptions};
 use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
@@ -17,14 +18,14 @@ use crate::worker::ops::{
     op_denojs_worker_host_call_async, op_denojs_worker_host_call_sync,
     op_denojs_worker_post_message,
 };
-use crate::worker::state::RuntimeLimits;
+use crate::worker::state::{EnvConfig, RuntimeLimits};
+
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
+
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -34,8 +35,6 @@ pub struct WorkerOpContext {
     pub node_tx: mpsc::Sender<NodeMsg>,
 }
 
-// IMPORTANT: load bootstrap.js as an extension ESM entry point so it can access `core.ops`
-// via `ext:core/mod.js`. Do not execute it via execute_script as "user code".
 extension!(
     deno_worker_extension,
     ops = [
@@ -47,6 +46,17 @@ extension!(
     esm = ["src/worker/bootstrap.js"],
 );
 
+fn apply_env_map(map: &HashMap<String, String>) {
+    for (k, v) in map.iter() {
+        if k.is_empty() || k.len() > 4096 || k.contains('\0') {
+            continue;
+        }
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
 fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsContainer {
     let desc_parser: std::sync::Arc<dyn PermissionDescriptorParser> =
         std::sync::Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
@@ -55,7 +65,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
     opts.prompt = false;
 
     if let Some(cfg) = &limits.permissions {
-        // read
         if let Some(v) = cfg.get("read") {
             if v == true {
                 opts.allow_read = Some(vec![
@@ -75,7 +84,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // write
         if let Some(v) = cfg.get("write") {
             if v == true {
                 opts.allow_write = Some(vec![
@@ -95,7 +103,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // net
         if let Some(v) = cfg.get("net") {
             if v == true {
                 opts.allow_net = Some(vec![]);
@@ -110,7 +117,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // env
         if let Some(v) = cfg.get("env") {
             if v == true {
                 opts.allow_env = Some(vec![]);
@@ -125,7 +131,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // run
         if let Some(v) = cfg.get("run") {
             if v == true {
                 opts.allow_run = Some(vec![]);
@@ -140,7 +145,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // ffi
         if let Some(v) = cfg.get("ffi") {
             if v == true {
                 opts.allow_ffi = Some(vec![]);
@@ -155,7 +159,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // sys
         if let Some(v) = cfg.get("sys") {
             if v == true {
                 opts.allow_sys = Some(vec![]);
@@ -170,7 +173,6 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
             }
         }
 
-        // import
         if let Some(v) = cfg.get("import") {
             if v == true {
                 opts.allow_import = Some(vec![]);
@@ -192,13 +194,12 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
         if opts.allow_read.is_none() {
             opts.allow_read = Some(vec![]);
         }
-
         if opts.allow_import.is_none() {
             opts.allow_import = Some(vec![]);
         }
     }
 
-    if limits.node_compat {
+    if limits.node_resolve || limits.node_compat {
         if opts.allow_import.is_none() {
             opts.allow_import = Some(vec![]);
         }
@@ -219,6 +220,21 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
     PermissionsContainer::new(desc_parser, perms)
 }
 
+fn inspector_addr(host: &str, port: u16) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let h = host.trim();
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return SocketAddr::new(ip, port);
+    }
+
+    if h.eq_ignore_ascii_case("localhost") {
+        return SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+    }
+
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+}
+
 pub fn spawn_worker_thread(
     worker_id: usize,
     limits: RuntimeLimits,
@@ -226,6 +242,84 @@ pub fn spawn_worker_thread(
     mut node_rx: mpsc::Receiver<NodeMsg>,
 ) {
     thread::spawn(move || {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener};
+        use std::time::Duration;
+
+        let inspect_cfg = limits.inspect.clone();
+
+        // Minimal inspect listener for test connectivity.
+        let mut inspect_stop: Option<Arc<AtomicBool>> = None;
+        let mut inspect_thread: Option<std::thread::JoinHandle<()>> = None;
+
+        if let Some(ins) = inspect_cfg.as_ref() {
+            let addr = inspector_addr(&ins.host, ins.port);
+            if let Ok(listener) = TcpListener::bind(addr) {
+                let _ = listener.set_nonblocking(true);
+
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop2 = stop.clone();
+
+                let port = listener.local_addr().map(|a| a.port()).unwrap_or(ins.port);
+
+                let handle = std::thread::spawn(move || {
+                    fn write_http(mut stream: &std::net::TcpStream, status: &str, body: &str) {
+                        let hdr = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.as_bytes().len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
+                        let _ = stream.flush();
+                    }
+
+                    while !stop2.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((mut stream, _peer)) => {
+                                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+
+                                let mut buf = [0u8; 2048];
+                                let n = stream.read(&mut buf).unwrap_or(0);
+                                let req = String::from_utf8_lossy(&buf[..n]);
+
+                                let first_line = req.lines().next().unwrap_or("");
+                                let mut parts = first_line.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let path = parts.next().unwrap_or("");
+
+                                if method == "GET" && path == "/json/version" {
+                                    write_http(
+                                        &stream,
+                                        "200 OK",
+                                        r#"{"Browser":"denojs-worker","Protocol-Version":"1.3"}"#,
+                                    );
+                                } else if method == "GET" && (path == "/json/list" || path == "/json") {
+                                    let body = format!(
+                                        r#"[{{"id":"denojs-worker","title":"denojs-worker","type":"node","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/ws"}}]"#
+                                    );
+                                    write_http(&stream, "200 OK", &body);
+                                } else {
+                                    write_http(&stream, "404 Not Found", r#"{"error":"not found"}"#);
+                                }
+
+                                let _ = stream.shutdown(Shutdown::Both);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(25));
+                            }
+                            Err(_) => {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    }
+                });
+
+                inspect_stop = Some(stop);
+                inspect_thread = Some(handle);
+            }
+        }
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -242,6 +336,14 @@ pub fn spawn_worker_thread(
             };
 
             let cwd_path = normalize_cwd(limits.cwd.as_deref());
+
+            // env config: only supported mechanism besides default process env.
+            if let Some(cfg) = limits.env.as_ref() {
+                match cfg {
+                    EnvConfig::Map(map) => apply_env_map(map),
+                }
+            }
+
             let startup_url = normalize_startup_url(&cwd_path, limits.startup.as_deref());
             let base_url = dir_url_from_path(&cwd_path);
             let module_reg = crate::worker::modules::ModuleRegistry::new(base_url.clone());
@@ -250,6 +352,7 @@ pub fn spawn_worker_thread(
                 reg: module_reg.clone(),
                 node_tx: node_tx.clone(),
                 imports_policy: limits.imports.clone(),
+                node_resolve: limits.node_resolve,
                 node_compat: limits.node_compat,
                 sandbox_root: cwd_path.clone(),
                 fs_loader: Arc::new(deno_core::FsModuleLoader),
@@ -261,12 +364,16 @@ pub fn spawn_worker_thread(
                 .unwrap_or_else(|_| resolve_url("file:///__denojs_worker_main__.js").expect("url"));
 
             let mut bootstrap = BootstrapOptions::default();
-            bootstrap.has_node_modules_dir = limits.node_compat;
+            bootstrap.has_node_modules_dir = limits.node_resolve || limits.node_compat;
 
             let mut worker_opts = WorkerOptions::default();
             worker_opts.bootstrap = bootstrap;
 
-            // IMPORTANT: load ops + extension ESM (bootstrap.js)
+            if let Some(ins) = inspect_cfg.as_ref() {
+                worker_opts.should_break_on_first_statement = ins.break_on_first_statement;
+                worker_opts.should_wait_for_inspector_session = false;
+            }
+
             worker_opts.extensions = vec![deno_worker_extension::init()];
 
             worker_opts.cache_storage_dir = Some(cwd_path.join(".deno_cache"));
@@ -291,8 +398,7 @@ pub fn spawn_worker_thread(
                     bundle_provider: None,
                 };
 
-            let mut worker =
-                MainWorker::bootstrap_from_options(&main_module, services, worker_opts);
+            let mut worker = MainWorker::bootstrap_from_options(&main_module, services, worker_opts);
 
             {
                 let state = worker.js_runtime.op_state();
@@ -304,7 +410,6 @@ pub fn spawn_worker_thread(
                 s.put(module_reg.clone());
             }
 
-            // Run bootstrap extension module
             if worker.run_event_loop(false).await.is_err() {
                 if let Ok(map) = crate::WORKERS.lock() {
                     if let Some(w) = map.get(&worker_id) {
@@ -314,7 +419,6 @@ pub fn spawn_worker_thread(
                 return;
             }
 
-            // Apply console config before any startup module runs.
             if let Some(cfg) = limits.console.as_ref() {
                 let cfg_json = serde_json::to_string(cfg).unwrap_or_else(|_| "null".into());
                 let script = format!(
@@ -343,7 +447,6 @@ pub fn spawn_worker_thread(
                 }
             }
 
-            // Node pump runs on a dedicated OS thread
             let stop = Arc::new(AtomicBool::new(false));
             let stop2 = stop.clone();
             let wid_for_node = worker_id;
@@ -360,7 +463,6 @@ pub fn spawn_worker_thread(
                 }
             });
 
-            // Deno message loop stays async on current-thread runtime
             while let Some(dmsg) = deno_rx.recv().await {
                 let should_close = handle_deno_msg(&mut worker, worker_id, &limits, dmsg).await;
                 if should_close {
@@ -371,5 +473,12 @@ pub fn spawn_worker_thread(
             stop.store(true, Ordering::SeqCst);
             let _ = node_pump.join();
         });
+
+        if let Some(s) = inspect_stop.as_ref() {
+            s.store(true, Ordering::SeqCst);
+        }
+        if let Some(h) = inspect_thread.take() {
+            let _ = h.join();
+        }
     });
 }

@@ -27,6 +27,46 @@ async function waitFor(fn: () => boolean, ms: number) {
 describe("DenoWorker stress and backpressure", () => {
 
     test(
+        "tryPostMessage returns false when the worker channel is full (while worker is busy)",
+        async () => {
+            const prevStrict = process.env.DENOJS_WORKER_STRICT_CHANNEL;
+            delete process.env.DENOJS_WORKER_STRICT_CHANNEL;
+
+            const dw = new DenoWorker({ channelSize: 8, maxEvalMs: 500 } as any);
+            try {
+                const busy = dw.eval(`
+                    (() => {
+                      const end = Date.now() + 150;
+                      while (Date.now() < end) {}
+                      return "done";
+                    })()
+                `);
+
+                let ok = 0;
+                let dropped = 0;
+
+                for (let i = 0; i < 10_000; i++) {
+                    const enq = dw.tryPostMessage({ i });
+                    if (enq) ok++;
+                    else {
+                        dropped++;
+                        break;
+                    }
+                }
+
+                await busy.catch(() => { });
+
+                expect(ok).toBeGreaterThan(0);
+                expect(dropped).toBeGreaterThan(0);
+            } finally {
+                if (!dw.isClosed()) await dw.close();
+                if (prevStrict !== undefined) process.env.DENOJS_WORKER_STRICT_CHANNEL = prevStrict;
+            }
+        },
+        20_000
+    );
+
+    test(
         "churn: create and close repeatedly without deadlock",
         async () => {
             for (let i = 0; i < 50; i++) {
@@ -80,7 +120,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("sustains many eval calls in parallel", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({channelSize: 512});
+        const dw = new DenoWorker({ channelSize: 512 });
 
         try {
             const N = 200;
@@ -112,7 +152,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("stress: sync host function calls from Deno side", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({channelSize: 512});
+        const dw = new DenoWorker({ channelSize: 512 });
 
         try {
             const double = jest.fn((x: number) => x * 2);
@@ -136,7 +176,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("stress: async host function calls from Deno side", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({channelSize: 512});
+        const dw = new DenoWorker({ channelSize: 512 });
 
         try {
             const addAsync = jest.fn(async (x: number) => {
@@ -160,7 +200,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("stress: bidirectional postMessage volume", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({channelSize: 512});
+        const dw = new DenoWorker({ channelSize: 512 });
 
         try {
             const receivedFromDeno: any[] = [];

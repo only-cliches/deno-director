@@ -12,6 +12,43 @@ describe("DenoWorker data and errors", () => {
     if (dw && !dw.isClosed()) await dw.close();
   });
 
+    test("preserves -0 roundtrip for eval results and args", async () => {
+    const v = await dw.eval("-0");
+    expect(Object.is(v, -0)).toBe(true);
+
+    const isNegZero = await dw.eval("(x) => Object.is(x, -0)", { args: [-0] });
+    expect(isNegZero).toBe(true);
+  });
+
+  test("circular objects and functions as args degrade to undefined (no crash)", async () => {
+    const a: any = { n: 1 };
+    a.self = a;
+
+    const r1 = await dw.eval("(x) => x", { args: [a] });
+    expect(r1).toBeUndefined();
+
+    const fn: any = () => 1;
+    const r2 = await dw.eval("(x) => x", { args: [fn] });
+    expect(r2).toBeUndefined();
+  });
+
+  test("throwing an Error-like with code preserves name/message/code", async () => {
+    await expect(
+      dw.eval(`
+        (() => {
+          const e = new Error("boom");
+          e.name = "CustomError";
+          e.code = "E_BANG";
+          throw e;
+        })()
+      `)
+    ).rejects.toMatchObject({ name: "CustomError", message: "boom", code: "E_BANG" });
+  });
+
+  test("returning very large BigInt rejects (unsupported)", async () => {
+    await expect(dw.eval("2n ** 200n")).rejects.toThrow(/bigint/i);
+  });
+  
   test("passes primitives and JSON-compatible values", async () => {
     await expect(dw.eval("(x) => x", { args: ["Hello, 🌍!"] })).resolves.toBe("Hello, 🌍!");
     await expect(dw.eval("(x) => x", { args: [42] })).resolves.toBe(42);
@@ -52,13 +89,13 @@ describe("DenoWorker data and errors", () => {
       .rejects.toMatchObject({ kind: "E_OBJ", message: "object-reject", code: 123 });
   });
 
-  // test("thrown Errors are Errors on the Node side", async () => {
-  //   // let result = await expect(dw.eval('(() => { throw new Error("boom"); })()'));
-  //   // assertErrorLike(result);
+  test("thrown Errors are Errors on the Node side", async () => {
+    // let result = await expect(dw.eval('(() => { throw new Error("boom"); })()'));
+    // assertErrorLike(result);
 
-  //   await expect(dw.eval('(() => { throw new Error("boom"); })()')).rejects.toMatchObject({
-  //     name: "Error",
-  //     message: "boom",
-  //   });
-  // });
+    await expect(dw.eval('(() => { throw new Error("boom"); })()')).rejects.toMatchObject({
+      name: "Error",
+      message: "boom",
+    });
+  });
 });

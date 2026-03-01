@@ -167,21 +167,6 @@ function safeJson(v: unknown): string {
   }
 }
 
-function logPrefix(): string {
-  const t = new Date().toISOString();
-  return `[bench][${t}]`;
-}
-
-function log(...args: any[]) {
-  // eslint-disable-next-line no-console
-  console.log(logPrefix(), ...args);
-}
-
-function logErr(...args: any[]) {
-  // eslint-disable-next-line no-console
-  console.error(logPrefix(), ...args);
-}
-
 /**
  * Single-listener buffered message bus to avoid missing fast messages.
  * DenoWorker does not expose an "off" API, so this installs one handler for the run.
@@ -197,7 +182,6 @@ class MessageBus {
     private readonly dw: DenoWorker,
     private readonly opts: { logQueue: boolean }
   ) {
-    log("MessageBus: installing dw.on(message) handler");
     dw.on("message", (msg: any) => this.onMessage(msg));
   }
 
@@ -219,7 +203,7 @@ class MessageBus {
         msg && typeof msg === "object"
           ? msg.kind ?? (msg.__bench_done ? "__bench_done" : msg.__bench_ack ? "__bench_ack" : "obj")
           : typeof msg;
-      log("MessageBus: recv", { kind, recvCount: this.recvCount, queueLen: this.queue.length });
+     
     }
 
     for (let i = 0; i < this.waiters.length; i++) {
@@ -233,7 +217,7 @@ class MessageBus {
       if (ok) {
         this.waiters.splice(i, 1);
         if (this.opts.logQueue) {
-          log("MessageBus: matched waiter", w.label, "remainingWaiters=", this.waiters.length);
+         
         }
         w.resolve(msg);
         return;
@@ -242,7 +226,7 @@ class MessageBus {
 
     this.queue.push(msg);
     if (this.opts.logQueue) {
-      log("MessageBus: queued msg", "queueLen=", this.queue.length);
+     
     }
   }
 
@@ -251,7 +235,6 @@ class MessageBus {
   }
 
   async waitFor(pred: (m: any) => boolean, timeoutMs: number, label: string): Promise<any> {
-    log("MessageBus.waitFor: start", { label, timeoutMs, stats: this.stats() });
 
     for (let i = 0; i < this.queue.length; i++) {
       const m = this.queue[i];
@@ -263,7 +246,6 @@ class MessageBus {
       }
       if (ok) {
         this.queue.splice(i, 1);
-        log("MessageBus.waitFor: satisfied from queue", { label, stats: this.stats() });
         return m;
       }
     }
@@ -284,12 +266,9 @@ class MessageBus {
         label,
         resolve: (m) => {
           clearTimeout(t);
-          log("MessageBus.waitFor: satisfied via waiter", { label, stats: this.stats() });
           resolve(m);
         },
       });
-
-      log("MessageBus.waitFor: installed waiter", { label, stats: this.stats() });
     });
   }
 }
@@ -472,7 +451,7 @@ async function benchWorkerToNodePostMessage(
   args: Args
 ): Promise<BenchResult> {
   const { size, messages, durationMs, warmup, timeoutMs } = args;
-  log("benchWorkerToNodePostMessage: start", { size, messages, durationMs, warmup });
+ 
 
   for (let i = 0; i < warmup; i++) {
     // eslint-disable-next-line no-await-in-loop
@@ -490,16 +469,16 @@ async function benchWorkerToNodePostMessage(
     );
   }
 
-  log("benchWorkerToNodePostMessage: warmup complete, starting main run");
+ 
 
   const start = nowNs();
 
-  log("benchWorkerToNodePostMessage: invoking evalModule to start worker sends");
+ 
   void dw.evalModule(
     `moduleReturn(await globalThis.__bench.workerToNodePostMessage(${size}, ${messages}, ${durationMs}));`
   );
 
-  log("benchWorkerToNodePostMessage: waiting for done msg");
+ 
   const done = await bus.waitFor(
     (m) => m && m.__bench_done === true && m.kind === "workerToNodePostMessage",
     timeoutMs,
@@ -508,7 +487,7 @@ async function benchWorkerToNodePostMessage(
 
   const end = nowNs();
 
-  log("benchWorkerToNodePostMessage: done msg received", done);
+ 
 
   const bytes = typeof done.bytes === "number" ? done.bytes : 0;
   const seconds = nsToSec(end - start);
@@ -524,9 +503,9 @@ async function benchWorkerToNodePostMessage(
 
 async function benchHostCallSync(dw: DenoWorker, bus: MessageBus, args: Args): Promise<BenchResult> {
   const { size, durationMs, warmup, timeoutMs } = args;
-  log("benchHostCallSync: start", { size, durationMs, warmup });
+ 
 
-  log("benchHostCallSync: installing __bench_sink_sync");
+ 
   await dw.setGlobal("__bench_sink_sync", (buf: any) => {
     if (buf && typeof buf === "object" && typeof buf.byteLength === "number") return buf.byteLength;
     if (Array.isArray(buf)) return buf.length;
@@ -549,12 +528,12 @@ async function benchHostCallSync(dw: DenoWorker, bus: MessageBus, args: Args): P
     );
   }
 
-  log("benchHostCallSync: warmup complete, starting timed run");
+ 
   const start = nowNs();
 
   void dw.evalModule(`moduleReturn(await globalThis.__bench.hostCallSyncSink(${size}, 0, ${durationMs}));`);
 
-  log("benchHostCallSync: waiting for done msg");
+ 
   const done = await bus.waitFor(
     (m) => m && m.__bench_done === true && m.kind === "hostCallSyncSink",
     timeoutMs,
@@ -563,7 +542,7 @@ async function benchHostCallSync(dw: DenoWorker, bus: MessageBus, args: Args): P
 
   const end = nowNs();
 
-  log("benchHostCallSync: done msg received", done);
+ 
 
   const bytes = typeof done.bytes === "number" ? done.bytes : 0;
   const seconds = nsToSec(end - start);
@@ -579,9 +558,9 @@ async function benchHostCallSync(dw: DenoWorker, bus: MessageBus, args: Args): P
 
 async function benchHostCallAsync(dw: DenoWorker, bus: MessageBus, args: Args): Promise<BenchResult> {
   const { size, durationMs, warmup, timeoutMs } = args;
-  log("benchHostCallAsync: start", { size, durationMs, warmup });
+ 
 
-  log("benchHostCallAsync: installing __bench_sink_async");
+ 
   await dw.setGlobal("__bench_sink_async", async (buf: any) => {
     if (buf && typeof buf === "object" && typeof buf.byteLength === "number") return buf.byteLength;
     if (Array.isArray(buf)) return buf.length;
@@ -604,12 +583,12 @@ async function benchHostCallAsync(dw: DenoWorker, bus: MessageBus, args: Args): 
     );
   }
 
-  log("benchHostCallAsync: warmup complete, starting timed run");
+ 
   const start = nowNs();
 
   void dw.evalModule(`moduleReturn(await globalThis.__bench.hostCallAsyncSink(${size}, 0, ${durationMs}));`);
 
-  log("benchHostCallAsync: waiting for done msg");
+ 
   const done = await bus.waitFor(
     (m) => m && m.__bench_done === true && m.kind === "hostCallAsyncSink",
     timeoutMs,
@@ -618,7 +597,7 @@ async function benchHostCallAsync(dw: DenoWorker, bus: MessageBus, args: Args): 
 
   const end = nowNs();
 
-  log("benchHostCallAsync: done msg received", done);
+ 
 
   const bytes = typeof done.bytes === "number" ? done.bytes : 0;
   const seconds = nsToSec(end - start);
@@ -639,39 +618,38 @@ async function benchNodeToWorkerPostMessage(
 ): Promise<BenchResult> {
   const { size, messages, ackEvery, warmup, timeoutMs, logEverySend } = args;
 
-  log("benchNodeToWorkerPostMessage: start", { size, messages, ackEvery, warmup });
+ 
 
   // Buffer (not Uint8Array) to ensure Neon bridges it as JsBuffer -> Bytes -> {__bytes} -> Uint8Array.
   const payload = makeBytes(size);
 
-  log("benchNodeToWorkerPostMessage: warmup send begin", { warmup, payloadType: "Buffer", byteLength: payload.byteLength });
+ 
   for (let i = 0; i < warmup; i++) dw.postMessage(payload);
-  log("benchNodeToWorkerPostMessage: warmup send done");
+ 
 
-  log("benchNodeToWorkerPostMessage: sending reset cmd");
+ 
   dw.postMessage({ __bench_cmd: "nodeToWorkerReset", targetMsgs: messages, ackEvery });
 
-  log("benchNodeToWorkerPostMessage: waiting for reset ack");
+ 
   await bus.waitFor(
     (m) => m && m.__bench_ack === true && m.kind === "nodeToWorkerReset",
     timeoutMs,
     "nodeToWorkerReset ack"
   );
 
-  log("benchNodeToWorkerPostMessage: sending data messages", { messages, size });
+ 
 
   const start = nowNs();
 
   if (logEverySend > 0) {
     for (let i = 0; i < messages; i++) {
       dw.postMessage(payload);
-      if (i % logEverySend === 0) log("benchNodeToWorkerPostMessage: sent", { i });
     }
   } else {
     for (let i = 0; i < messages; i++) dw.postMessage(payload);
   }
 
-  log("benchNodeToWorkerPostMessage: sent all, waiting for done");
+ 
 
   const done = await bus.waitFor(
     (m) => m && m.__bench_done === true && m.kind === "nodeToWorkerPostMessage",
@@ -681,7 +659,7 @@ async function benchNodeToWorkerPostMessage(
 
   const end = nowNs();
 
-  log("benchNodeToWorkerPostMessage: done msg received", done);
+ 
 
   const receivedBytes =
     typeof done.receivedBytes === "number" ? done.receivedBytes : messages * payload.byteLength;
@@ -704,7 +682,7 @@ async function benchEvalReturnBytes(
 ): Promise<BenchResult> {
   const { size, evalIter, warmup } = args;
   const fnName = jsonMode ? "evalReturnJsonBytes" : "evalReturnBytes";
-  log("benchEvalReturnBytes: start", { size, evalIter, warmup, jsonMode });
+ 
 
   for (let i = 0; i < warmup; i++) {
     // eslint-disable-next-line no-await-in-loop
@@ -723,7 +701,7 @@ async function benchEvalReturnBytes(
       if (v instanceof Uint8Array) totalBytes += v.byteLength;
     }
     if (i === 0 || (i + 1) === evalIter || (i + 1) % 10 === 0) {
-      log("benchEvalReturnBytes: progress", { i: i + 1, evalIter, totalBytes });
+     
     }
   }
 
@@ -741,46 +719,42 @@ async function benchEvalReturnBytes(
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  log("main: args", args);
+ 
 
   const dw = new DenoWorker({ imports: false, channelSize: 4096 });
   const bus = new MessageBus(dw, { logQueue: args.logQueue });
 
-  const watchdog = setInterval(() => {
-    log("watchdog: bus stats", bus.stats());
-  }, 2000);
-
   try {
-    log("main: loading worker bench module");
+   
     await dw.evalModule(buildWorkerBenchModuleSource());
-    log("main: worker bench module loaded");
+   
 
     const results: BenchResult[] = [];
 
-    log("main: starting bench 1: Node -> Worker postMessage");
+   
     results.push(await benchNodeToWorkerPostMessage(dw, bus, args));
-    log("main: bench 1 complete");
+   
 
-    log("main: starting bench 2: Worker -> Node postMessage");
+   
     results.push(await benchWorkerToNodePostMessage(dw, bus, args));
-    log("main: bench 2 complete");
+   
 
-    log("main: starting bench 3: Worker -> Node host call sync");
+   
     results.push(await benchHostCallSync(dw, bus, args));
-    log("main: bench 3 complete");
+   
 
-    log("main: starting bench 4: Worker -> Node host call async");
+   
     results.push(await benchHostCallAsync(dw, bus, args));
-    log("main: bench 4 complete");
+   
 
-    log("main: starting bench 5: eval return Uint8Array");
+   
     results.push(await benchEvalReturnBytes(dw, args, false));
-    log("main: bench 5 complete");
+   
 
     if (args.json) {
-      log("main: starting bench 6: eval return JSON number[]");
+     
       results.push(await benchEvalReturnBytes(dw, args, true));
-      log("main: bench 6 complete");
+     
     }
 
     // eslint-disable-next-line no-console
@@ -799,17 +773,16 @@ async function main() {
 
     printResults(results);
   } catch (e) {
-    logErr("main: error", e);
+
     throw e;
   } finally {
-    clearInterval(watchdog);
-    log("main: closing worker");
+   
     try {
       if (!dw.isClosed()) await dw.close();
     } catch (e) {
-      logErr("main: close error", e);
+
     }
-    log("main: done");
+   
   }
 }
 

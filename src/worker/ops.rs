@@ -1,4 +1,3 @@
-// src/worker/ops.rs
 use deno_runtime::deno_core::{op2, OpState};
 use tokio::sync::oneshot;
 
@@ -12,6 +11,7 @@ fn err_wire(name: &str, message: impl Into<String>) -> serde_json::Value {
         message: message.into(),
         stack: None,
         code: None,
+        cause: None,
     };
     crate::bridge::wire::to_wire_json(&e)
 }
@@ -32,7 +32,6 @@ pub fn op_denojs_worker_post_message(state: &mut OpState, #[serde] msg: serde_js
     };
 
     let value: JsValueBridge = crate::bridge::wire::from_wire_json(msg);
-
     ctx.node_tx.try_send(NodeMsg::EmitMessage { value }).is_ok()
 }
 

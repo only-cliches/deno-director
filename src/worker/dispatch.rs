@@ -7,8 +7,40 @@ use crate::bridge::types::JsValueBridge;
 use crate::worker::eval::eval_in_runtime;
 use crate::worker::messages::{DenoMsg, EvalReply, ExecStats, NodeMsg, ResolvePayload};
 use crate::worker::state::RuntimeLimits;
-
 pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
+    fn get_node_process_env_obj<'a>(cx: &mut TaskContext<'a>) -> Option<Handle<'a, JsObject>> {
+        if let Ok(p) = cx.global::<JsObject>("process") {
+            return Some(p);
+        }
+
+        let req = cx.global::<JsFunction>("require").ok()?;
+        let arg = cx.string("process");
+        let undef = cx.undefined();
+        let v = cx
+            .try_catch(|cx| req.call(cx, undef, &[arg.upcast()]))
+            .ok()?;
+
+        v.downcast::<JsObject, _>(cx).ok()
+    }
+
+    #[allow(dead_code)]
+    fn node_process_env_get<'a>(cx: &mut TaskContext<'a>, key: &str) -> Option<String> {
+        let process = get_node_process_env_obj(cx)?;
+        let env_any = process.get_value(cx, "env").ok()?;
+        let env_obj = env_any.downcast::<JsObject, _>(cx).ok()?;
+
+        let val = env_obj.get_value(cx, key).ok()?;
+        if val.is_a::<JsUndefined, _>(cx) || val.is_a::<JsNull, _>(cx) {
+            return None;
+        }
+
+        if let Ok(s) = val.downcast::<JsString, _>(cx) {
+            return Some(s.value(cx));
+        }
+
+        val.to_string(cx).ok().map(|ss| ss.value(cx))
+    }
+
     let (channel, handle_snapshot) = match crate::WORKERS.lock() {
         Ok(map) => {
             if let Some(w) = map.get(&worker_id) {
@@ -39,6 +71,16 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
             cx.try_catch(f).ok()
         }
 
+        fn get_thenable<'a>(
+            cx: &mut TaskContext<'a>,
+            v: Handle<'a, JsValue>,
+        ) -> Option<(Handle<'a, JsObject>, Handle<'a, JsFunction>)> {
+            let obj = v.downcast::<JsObject, _>(cx).ok()?;
+            let then_any = obj.get_value(cx, "then").ok()?;
+            let then_fn = then_any.downcast::<JsFunction, _>(cx).ok()?;
+            Some((obj, then_fn))
+        }
+
         fn thrown_to_bridge<'a>(
             cx: &mut TaskContext<'a>,
             thrown: Handle<'a, JsValue>,
@@ -49,29 +91,38 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     message,
                     stack,
                     code,
+                    ..
                 }) => JsValueBridge::Error {
-                    name: if name.is_empty() { "HostFunctionError".into() } else { name },
+                    name: if name.is_empty() {
+                        "HostFunctionError".into()
+                    } else {
+                        name
+                    },
                     message,
                     stack,
                     code,
+                    cause: None,
                 },
                 Ok(JsValueBridge::String(s)) => JsValueBridge::Error {
                     name: "HostFunctionError".into(),
                     message: s,
                     stack: None,
                     code: None,
+                    cause: None,
                 },
                 Ok(other) => JsValueBridge::Error {
                     name: "HostFunctionError".into(),
                     message: format!("{:?}", other),
                     stack: None,
                     code: None,
+                    cause: None,
                 },
                 Err(e) => JsValueBridge::Error {
                     name: "HostFunctionError".into(),
                     message: e.to_string(),
                     stack: None,
                     code: None,
+                    cause: None,
                 },
             }
         }
@@ -86,9 +137,12 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     }
 
                     match payload {
-                        ResolvePayload::Void => settler.resolve_with_value_in_cx(cx, &JsValueBridge::Null),
+                        ResolvePayload::Void => {
+                            settler.resolve_with_value_in_cx(cx, &JsValueBridge::Null)
+                        }
                         ResolvePayload::Json(json) => {
-                            let s = serde_json::to_string(&json).unwrap_or_else(|_| "null".into());
+                            let s = serde_json::to_string(&json)
+                                .unwrap_or_else(|_| "null".into());
                             settler.resolve_with_json_in_cx(cx, &s);
                         }
                         ResolvePayload::Result { result, .. } => match result {
@@ -99,7 +153,11 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     Ok(())
                 }
 
-                NodeMsg::ImportRequest { specifier, referrer, reply } => {
+                NodeMsg::ImportRequest {
+                    specifier,
+                    referrer,
+                    reply,
+                } => {
                     use crate::worker::messages::ImportDecision;
 
                     if std::env::var("DENOJS_WORKER_DEBUG_IMPORTS").is_ok() {
@@ -130,113 +188,53 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     fn interpret_value<'a>(
                         cx: &mut TaskContext<'a>,
                         v: Handle<'a, JsValue>,
-                    ) -> Option<crate::worker::messages::ImportDecision> {
+                    ) -> Option<ImportDecision> {
                         use crate::worker::messages::ImportDecision;
 
-                        let debug = std::env::var("DENOJS_WORKER_DEBUG_IMPORTS")
-                            .ok()
-                            .map(|s| {
-                                let s = s.trim().to_ascii_lowercase();
-                                s == "1" || s == "true" || s == "yes" || s == "on"
-                            })
-                            .unwrap_or(false);
-
-                        let log = |msg: String| {
-                            if debug {
-                                println!("[denojs-worker][imports] {}", msg);
-                            }
-                        };
-
-                        // If it's a Promise, defer to the Promise handling path.
                         if v.is_a::<neon::types::JsPromise, _>(cx) {
-                            log("interpret_value: got JsPromise => defer".to_string());
                             return None;
                         }
 
-                        // String means JS source (legacy behavior)
                         if let Ok(s) = v.downcast::<JsString, _>(cx) {
-                            let code = s.value(cx);
-                            log(format!(
-                                "interpret_value: got JsString => SourceTyped ext=js bytes={}",
-                                code.len()
-                            ));
                             return Some(ImportDecision::SourceTyped {
                                 ext: "js".into(),
-                                code,
+                                code: s.value(cx),
                             });
                         }
 
-                        // Boolean means allow/block disk resolution
                         if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
-                            let allowed = b.value(cx);
-                            log(format!(
-                                "interpret_value: got JsBoolean={} => {}",
-                                allowed,
-                                if allowed { "AllowDisk" } else { "Block" }
-                            ));
-                            return Some(if allowed {
+                            return Some(if b.value(cx) {
                                 ImportDecision::AllowDisk
                             } else {
                                 ImportDecision::Block
                             });
                         }
 
-                        // Object forms:
-                        // - { js: "..." } | { ts: "..." } | { tsx: "..." } | { jsx: "..." }
-                        // - { resolve: "..." }
                         let Ok(obj) = v.downcast::<JsObject, _>(cx) else {
-                            if debug {
-                                log("interpret_value: unsupported (not string/bool/object) => None".to_string());
-                            }
                             return None;
                         };
 
-                        // { resolve: string }
                         if let Ok(rv) = obj.get_value(cx, "resolve") {
                             if let Ok(rs) = rv.downcast::<JsString, _>(cx) {
-                                let s = rs.value(cx);
-                                let trimmed = s.trim().to_string();
-                                if trimmed.is_empty() {
-                                    log("interpret_value: object { resolve: \"\" } => Block".to_string());
+                                let s = rs.value(cx).trim().to_string();
+                                if s.is_empty() {
                                     return Some(ImportDecision::Block);
                                 }
-                                log(format!(
-                                    "interpret_value: object {{ resolve: ... }} => Resolve({})",
-                                    trimmed
-                                ));
-                                return Some(ImportDecision::Resolve(trimmed));
-                            } else if debug && !rv.is_a::<JsUndefined, _>(cx) && !rv.is_a::<JsNull, _>(cx) {
-                                log("interpret_value: object has 'resolve' but it's not a string (ignored)".to_string());
+                                return Some(ImportDecision::Resolve(s));
                             }
                         }
 
-                        // { js|ts|tsx|jsx: string }
                         for ext in ["js", "ts", "tsx", "jsx"] {
                             if let Ok(vv) = obj.get_value(cx, ext) {
                                 if let Ok(ss) = vv.downcast::<JsString, _>(cx) {
-                                    let code = ss.value(cx);
-                                    log(format!(
-                                        "interpret_value: object {{ {}: <string> }} => SourceTyped ext={} bytes={}",
-                                        ext,
-                                        ext,
-                                        code.len()
-                                    ));
                                     return Some(ImportDecision::SourceTyped {
                                         ext: ext.to_string(),
-                                        code,
+                                        code: ss.value(cx),
                                     });
-                                } else if debug && !vv.is_a::<JsUndefined, _>(cx) && !vv.is_a::<JsNull, _>(cx) {
-                                    log(format!(
-                                        "interpret_value: object has key '{}' but value is not a string (ignored)",
-                                        ext
-                                    ));
                                 }
                             }
                         }
 
-                        // Important: do not default-block here, because Promises are objects.
-                        // Unknown objects will be blocked by the caller if they are not Promises.
-                        log("interpret_value: object shape not recognized => defer".to_string());
                         None
                     }
 
@@ -255,7 +253,9 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     let js_ref = cx.string(&referrer);
 
                     let this = cx.undefined();
-                    let returned = match cx.try_catch(|cx| cb.call(cx, this, &[js_spec.upcast(), js_ref.upcast()])) {
+                    let returned = match cx.try_catch(|cx| {
+                        cb.call(cx, this, &[js_spec.upcast(), js_ref.upcast()])
+                    }) {
                         Ok(v) => v,
                         Err(_) => {
                             state.send_once(ImportDecision::Block);
@@ -263,34 +263,36 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                         }
                     };
 
-
                     if let Some(d) = interpret_value(cx, returned) {
                         state.send_once(d);
                         return Ok(());
                     }
 
                     if returned.is_a::<neon::types::JsPromise, _>(cx) {
-                        let promise_obj: Handle<JsObject> = match returned.downcast::<JsObject, _>(cx) {
-                            Ok(o) => o,
-                            Err(_) => {
-                                state.send_once(ImportDecision::Block);
-                                return Ok(());
-                            }
-                        };
-
-                        let then_fn: Handle<JsFunction> =
-                            match cx.try_catch(|cx| promise_obj.get::<JsFunction, _, _>(cx, "then")) {
-                                Ok(f) => f,
+                        let promise_obj: Handle<JsObject> =
+                            match returned.downcast::<JsObject, _>(cx) {
+                                Ok(o) => o,
                                 Err(_) => {
                                     state.send_once(ImportDecision::Block);
                                     return Ok(());
                                 }
                             };
 
+                        let then_fn: Handle<JsFunction> = match cx.try_catch(|cx| {
+                            promise_obj.get::<JsFunction, _, _>(cx, "then")
+                        }) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                state.send_once(ImportDecision::Block);
+                                return Ok(());
+                            }
+                        };
+
                         let st_ok = state.clone();
                         let on_fulfilled = JsFunction::new(cx, move |mut cx| {
                             let v = cx.argument::<JsValue>(0)?;
-                            let decision = interpret_value(&mut cx, v).unwrap_or(ImportDecision::Block);
+                            let decision =
+                                interpret_value(&mut cx, v).unwrap_or(ImportDecision::Block);
                             st_ok.send_once(decision);
                             st_ok.clear_hooks();
                             Ok(cx.undefined())
@@ -312,11 +314,10 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                         }
 
                         let (on_fulfilled_handle, on_rejected_handle) = {
-                            let g = state
-                                .hooks
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.as_ref().map(|(f, r)| (f.clone(cx), r.clone(cx))));
+                            let g = state.hooks.lock().ok().and_then(|g| {
+                                g.as_ref()
+                                    .map(|(f, r)| (f.clone(cx), r.clone(cx)))
+                            });
                             match g {
                                 Some((f, r)) => (f.to_inner(cx), r.to_inner(cx)),
                                 None => (on_fulfilled, on_rejected),
@@ -392,6 +393,7 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                                 message: format!("Unknown host function id {func_id}"),
                                 stack: None,
                                 code: None,
+                                cause: None,
                             }));
                             return Ok(());
                         }
@@ -417,33 +419,26 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                         }
                     };
 
-                    if v.is_a::<neon::types::JsPromise, _>(cx) {
-                        // Suppress unhandled rejection warnings.
-                        if let Ok(promise_obj) = v.downcast::<JsObject, _>(cx) {
-                            let noop_reject = JsFunction::new(cx, |mut cx| Ok(cx.undefined()))?;
-                            let rooted = noop_reject.root(cx);
-                            std::mem::forget(rooted);
-
-                            if let Ok(catch_fn) = promise_obj.get::<JsFunction, _, _>(cx, "catch") {
-                                let _ = cx.try_catch(|cx| {
-                                    let _ = catch_fn.call(cx, promise_obj, &[noop_reject.upcast::<JsValue>()])?;
-                                    Ok(())
-                                });
-                            } else if let Ok(then_fn) = promise_obj.get::<JsFunction, _, _>(cx, "then") {
-                                let undef = cx.undefined().upcast::<JsValue>();
-                                let _ = cx.try_catch(|cx| {
-                                    let _ = then_fn.call(cx, promise_obj, &[undef, noop_reject.upcast()])?;
-                                    Ok(())
-                                });
-                            }
+                    if v.is_a::<neon::types::JsPromise, _>(cx) || get_thenable(cx, v).is_some() {
+                        // Prevent unhandled rejection on the returned thenable by attaching a swallow.
+                        if let Some((obj, then_fn)) = get_thenable(cx, v) {
+                            let on_ok = JsFunction::new(cx, |mut cx| Ok(cx.undefined()))?;
+                            let on_err = JsFunction::new(cx, |mut cx| Ok(cx.undefined()))?;
+                            let _ = cx.try_catch(|cx| {
+                                let args: Vec<Handle<JsValue>> = vec![on_ok.upcast(), on_err.upcast()];
+                                let _ = then_fn.call(cx, obj, args.as_slice())?;
+                                Ok(())
+                            });
                         }
 
                         send(Err(JsValueBridge::Error {
                             name: "HostFunctionError".into(),
-                            message: "Sync host function returned a Promise; use async host function instead"
-                                .into(),
+                            message:
+                                "Sync host function returned a Promise; use async host function instead"
+                                    .into(),
                             stack: None,
                             code: None,
+                            cause: None,
                         }));
                         return Ok(());
                     }
@@ -455,6 +450,7 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                             message: e.to_string(),
                             stack: None,
                             code: None,
+                            cause: None,
                         })),
                     }
 
@@ -463,7 +459,9 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
 
                 NodeMsg::InvokeHostFunctionAsync { func_id, args, reply } => {
                     struct AsyncState {
-                        reply: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<JsValueBridge, JsValueBridge>>>>,
+                        reply: std::sync::Mutex<
+                            Option<tokio::sync::oneshot::Sender<Result<JsValueBridge, JsValueBridge>>>,
+                        >,
                         hooks: std::sync::Mutex<Option<(Root<JsFunction>, Root<JsFunction>)>>,
                     }
 
@@ -493,6 +491,7 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                                 message: format!("Unknown host function id {func_id}"),
                                 stack: None,
                                 code: None,
+                                cause: None,
                             }));
                             return Ok(());
                         }
@@ -508,7 +507,6 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     }
 
                     let this = cx.undefined();
-
                     let returned = match cx.try_catch(|cx| func.call(cx, this, js_argv.as_slice())) {
                         Ok(v) => v,
                         Err(thrown) => {
@@ -518,9 +516,8 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                         }
                     };
 
-                    let is_promise = returned.is_a::<neon::types::JsPromise, _>(cx);
-
-                    if !is_promise {
+                    let thenable = get_thenable(cx, returned);
+                    if thenable.is_none() {
                         match crate::bridge::neon_codec::from_neon_value(cx, returned) {
                             Ok(b) => state.send_once(Ok(b)),
                             Err(e) => state.send_once(Err(JsValueBridge::Error {
@@ -528,10 +525,25 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                                 message: e.to_string(),
                                 stack: None,
                                 code: None,
+                                cause: None,
                             })),
                         }
                         return Ok(());
                     }
+
+                    let (promise_obj, then_fn) = match thenable {
+                        Some((o, f)) => (o, f),
+                        None => {
+                            state.send_once(Err(JsValueBridge::Error {
+                                name: "HostFunctionError".into(),
+                                message: "Async host function returned a non-thenable".into(),
+                                stack: None,
+                                code: None,
+                                cause: None,
+                            }));
+                            return Ok(());
+                        }
+                    };
 
                     let promise_obj: Handle<JsObject> = match returned.downcast::<JsObject, _>(cx) {
                         Ok(o) => o,
@@ -541,36 +553,39 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                                 message: "Async host function returned a non-object promise".into(),
                                 stack: None,
                                 code: None,
+                                cause: None,
                             }));
                             return Ok(());
                         }
                     };
 
-                    let then_fn: Handle<JsFunction> =
-                        match cx.try_catch(|cx| promise_obj.get::<JsFunction, _, _>(cx, "then")) {
-                            Ok(f) => f,
-                            Err(_) => {
-                                state.send_once(Err(JsValueBridge::Error {
-                                    name: "HostFunctionError".into(),
-                                    message: "Promise.then lookup failed".into(),
-                                    stack: None,
-                                    code: None,
-                                }));
-                                return Ok(());
-                            }
-                        };
+                    let then_fn: Handle<JsFunction> = match cx.try_catch(|cx| {
+                        promise_obj.get::<JsFunction, _, _>(cx, "then")
+                    }) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            state.send_once(Err(JsValueBridge::Error {
+                                name: "HostFunctionError".into(),
+                                message: "Promise.then lookup failed".into(),
+                                stack: None,
+                                code: None,
+                                cause: None,
+                            }));
+                            return Ok(());
+                        }
+                    };
 
                     let state_ok = state.clone();
                     let on_fulfilled = JsFunction::new(cx, move |mut cx| {
                         let v = cx.argument::<JsValue>(0)?;
-                        let bridged = crate::bridge::neon_codec::from_neon_value(&mut cx, v).unwrap_or_else(|e| {
-                            JsValueBridge::Error {
+                        let bridged = crate::bridge::neon_codec::from_neon_value(&mut cx, v)
+                            .unwrap_or_else(|e| JsValueBridge::Error {
                                 name: "HostFunctionError".into(),
                                 message: e.to_string(),
                                 stack: None,
                                 code: None,
-                            }
-                        });
+                                cause: None,
+                            });
 
                         state_ok.send_once(Ok(bridged));
                         state_ok.clear_hooks();
@@ -580,14 +595,14 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     let state_err = state.clone();
                     let on_rejected = JsFunction::new(cx, move |mut cx| {
                         let v = cx.argument::<JsValue>(0)?;
-                        let bridged = crate::bridge::neon_codec::from_neon_value(&mut cx, v).unwrap_or_else(|e| {
-                            JsValueBridge::Error {
+                        let bridged = crate::bridge::neon_codec::from_neon_value(&mut cx, v)
+                            .unwrap_or_else(|e| JsValueBridge::Error {
                                 name: "HostFunctionError".into(),
                                 message: e.to_string(),
                                 stack: None,
                                 code: None,
-                            }
-                        });
+                                cause: None,
+                            });
 
                         state_err.send_once(Err(bridged));
                         state_err.clear_hooks();
@@ -603,7 +618,9 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                     }
 
                     let (on_fulfilled_handle, on_rejected_handle) = {
-                        let g = state.hooks.lock().ok().and_then(|g| g.as_ref().map(|(f, r)| (f.clone(cx), r.clone(cx))));
+                        let g = state.hooks.lock().ok().and_then(|g| {
+                            g.as_ref().map(|(f, r)| (f.clone(cx), r.clone(cx)))
+                        });
                         match g {
                             Some((f, r)) => (f.to_inner(cx), r.to_inner(cx)),
                             None => (on_fulfilled, on_rejected),
@@ -625,6 +642,7 @@ pub fn dispatch_node_msg(worker_id: usize, msg: NodeMsg) {
                             message: "Promise.then invocation failed".into(),
                             stack: None,
                             code: None,
+                            cause: None,
                         }));
                         state.clear_hooks();
                     }
@@ -735,23 +753,21 @@ pub async fn handle_deno_msg(
             false
         }
 
-        // DenoMsg::Pump { deferred } => {
-        //     let res = worker.run_event_loop(false).await;
-
-        //     match res {
-        //         Ok(()) => deferred.resolve_with_value_via_channel(JsValueBridge::Undefined),
-        //         Err(e) => deferred.reject_with_error(e.to_string()),
-        //     }
-
-        //     false
-        // }
+        // src/worker/dispatch.rs (replace ONLY the DenoMsg::SetGlobal { .. } arm)
         DenoMsg::SetGlobal {
             key,
             value,
             deferred,
         } => {
-            let json = serde_json::to_string(&crate::bridge::wire::to_wire_json(&value))
-                .unwrap_or_else(|_| "null".into());
+            // Per tests: undefined is not representable reliably over our wire format for globals.
+            // Treat Undefined as null when setting globals.
+            let json = if matches!(value, JsValueBridge::Undefined) {
+                "null".to_string()
+            } else {
+                serde_json::to_string(&crate::bridge::wire::to_wire_json(&value))
+                    .unwrap_or_else(|_| "null".into())
+            };
+
             let key_json = serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".into());
             let script =
                 format!("globalThis.__globals[{key_json}] = {json}; globalThis.__applyGlobals();");
@@ -776,7 +792,9 @@ pub async fn handle_deno_msg(
                             message: e.to_string(),
                             stack: None,
                             code: None,
+                            cause: None,
                         };
+
                         send_node_msg_or_reject(
                             &tx,
                             NodeMsg::Resolve {
@@ -799,7 +817,6 @@ pub async fn handle_deno_msg(
 
             false
         }
-
         DenoMsg::Eval {
             source,
             options,

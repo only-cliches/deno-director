@@ -3,252 +3,745 @@
 
 const native = require("../index.node");
 
+// Provide a stable V8 serialize/deserialize bridge for the native addon.
+// The Rust side may emit JsValueBridge::V8Serialized values.
+try {
+	// eslint-disable-next-line @typescript-eslint/no-var-requires
+	const v8mod = require("node:v8");
+	const g: any = globalThis as any;
+	if (!g.__v8) {
+		g.__v8 = {
+			serialize: (value: any) => v8mod.serialize(value), // Buffer
+			deserialize: (buf: any) => v8mod.deserialize(buf),
+		};
+	}
+} catch {
+	// ignore
+}
+
+type WireJson = any;
+
+function wireUndef(): WireJson {
+	return { __undef: true };
+}
+
+function wireNum(tag: string): WireJson {
+	return { __num: tag };
+}
+
+function dehydrateForWire(value: any): WireJson {
+	const seen = typeof WeakSet !== "undefined" ? new WeakSet<object>() : null;
+
+	function inner(x: any, depth: number): WireJson {
+		if (x === undefined) return wireUndef();
+		if (x === null) return null;
+		if (depth > 200) return wireUndef();
+
+		const t = typeof x;
+
+		if (t === "number") {
+			if (Object.is(x, -0)) return { __denojs_worker_num: "-0" };
+			if (Number.isNaN(x)) return wireNum("NaN");
+			if (x === Number.POSITIVE_INFINITY) return wireNum("Infinity");
+			if (x === Number.NEGATIVE_INFINITY) return wireNum("-Infinity");
+			if (!Number.isFinite(x)) return wireUndef();
+			return x;
+		}
+
+		if (t === "string" || t === "boolean") return x;
+
+		if (t === "bigint") {
+			return { __bigint: x.toString() };
+		}
+
+		if (t === "function" || t === "symbol") return wireUndef();
+
+		if (Array.isArray(x)) return x.map((it) => inner(it, depth + 1));
+
+		if (typeof Date !== "undefined" && x instanceof Date) {
+			return { __date: x.getTime() };
+		}
+
+		if (typeof RegExp !== "undefined" && x instanceof RegExp) {
+			return { __regexp: { source: x.source, flags: x.flags } };
+		}
+
+		if (typeof URL !== "undefined" && x instanceof URL) {
+			return { __url: x.href };
+		}
+
+		if (typeof URLSearchParams !== "undefined" && x instanceof URLSearchParams) {
+			return { __urlSearchParams: x.toString() };
+		}
+
+		// ArrayBuffer + TypedArrays + DataView
+		if (typeof ArrayBuffer !== "undefined" && x instanceof ArrayBuffer) {
+			const bytes = Array.from(new Uint8Array(x));
+			return { __buffer: { kind: "ArrayBuffer", bytes, byteOffset: 0, length: bytes.length } };
+		}
+
+		if (typeof SharedArrayBuffer !== "undefined" && x instanceof SharedArrayBuffer) {
+			const bytes = Array.from(new Uint8Array(x));
+			return { __buffer: { kind: "SharedArrayBuffer", bytes, byteOffset: 0, length: bytes.length } };
+		}
+
+		if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(x)) {
+			const kind =
+				x && x.constructor && typeof x.constructor.name === "string" ? x.constructor.name : "Uint8Array";
+			const byteOffset = typeof x.byteOffset === "number" ? x.byteOffset : 0;
+			const byteLength = typeof x.byteLength === "number" ? x.byteLength : 0;
+			const length = kind === "DataView" ? byteLength : typeof (x as any).length === "number" ? (x as any).length : byteLength;
+
+			try {
+				const u8 = new Uint8Array(x.buffer, byteOffset, byteLength);
+				const bytes = Array.from(u8);
+				return { __buffer: { kind, bytes, byteOffset, length } };
+			} catch {
+				return wireUndef();
+			}
+		}
+
+		// Map/Set (primitive keys only)
+		if (typeof Map !== "undefined" && x instanceof Map) {
+			const out: any[] = [];
+			for (const [k, v] of x.entries()) {
+				const kt = typeof k;
+				const kOk = k === null || kt === "string" || kt === "number" || kt === "boolean" || kt === "bigint";
+				if (!kOk) continue;
+				out.push([inner(k, depth + 1), inner(v, depth + 1)]);
+			}
+			return { __map: out };
+		}
+
+		if (typeof Set !== "undefined" && x instanceof Set) {
+			const out: any[] = [];
+			for (const v of x.values()) out.push(inner(v, depth + 1));
+			return { __set: out };
+		}
+
+		// Error (best-effort)
+		if (typeof Error !== "undefined" && x instanceof Error) {
+			const out: any = {
+				__denojs_worker_type: "error",
+				name: typeof x.name === "string" ? x.name : "Error",
+				message: typeof x.message === "string" ? x.message : String((x as any).message ?? ""),
+			};
+			if (typeof (x as any).stack === "string") out.stack = (x as any).stack;
+			if ("code" in (x as any) && (x as any).code != null) out.code = String((x as any).code);
+
+			if ("cause" in (x as any) && (x as any).cause != null) {
+				out.cause = inner((x as any).cause, depth + 1);
+			}
+			return out;
+		}
+
+		if (t === "object") {
+			if (seen) {
+				if (seen.has(x)) return wireUndef();
+				seen.add(x);
+			}
+
+			const out: any = {};
+			for (const [k, v] of Object.entries(x)) out[k] = inner(v, depth + 1);
+			return out;
+		}
+
+		return wireUndef();
+	}
+
+	return inner(value, 0);
+}
+
+function dehydrateArgs(args: any[] | undefined): any[] {
+	if (!Array.isArray(args)) return [];
+	return args.map((a) => dehydrateForWire(a));
+}
+
+function maybeBigIntToNumber(x: bigint): number | bigint {
+	const n = Number(x);
+	if (Number.isSafeInteger(n) && BigInt(n) === x) return n;
+	return x;
+}
+
+function cloneViewToRealm(x: any): any {
+	// Preserve Buffer
+	if (typeof Buffer !== "undefined" && Buffer.isBuffer(x)) return Buffer.from(x);
+
+	if (typeof ArrayBuffer === "undefined" || typeof ArrayBuffer.isView !== "function") return x;
+	if (!ArrayBuffer.isView(x)) return x;
+
+	const kind =
+		x && x.constructor && typeof x.constructor.name === "string" ? x.constructor.name : "Uint8Array";
+	const bo = typeof x.byteOffset === "number" ? x.byteOffset : 0;
+	const bl = typeof x.byteLength === "number" ? x.byteLength : 0;
+	const len = kind === "DataView" ? bl : typeof (x as any).length === "number" ? (x as any).length : bl;
+
+	try {
+		const src = new Uint8Array(x.buffer, bo, bl);
+		const bytes = new Uint8Array(src); // copy
+		const ab = bytes.buffer;
+
+		if (kind === "DataView") return new DataView(ab, 0, bl);
+
+		const Ctor = (globalThis as any)[kind];
+		if (typeof Ctor === "function") {
+			try {
+				return new Ctor(ab, 0, len);
+			} catch {
+				// ignore
+			}
+		}
+
+		return new Uint8Array(ab, 0, bytes.byteLength);
+	} catch {
+		return x;
+	}
+}
+
+function bufferViewFromWire(obj: any): any {
+	const b = obj && obj.__buffer ? obj.__buffer : null;
+	if (!b || typeof b !== "object") return undefined;
+
+	const kind = typeof b.kind === "string" ? b.kind : "Uint8Array";
+	const bytes = Array.isArray(b.bytes) ? b.bytes : [];
+	const byteOffset = typeof b.byteOffset === "number" ? b.byteOffset : 0;
+	const length = typeof b.length === "number" ? b.length : bytes.length;
+
+	const u8 = new Uint8Array(bytes.map((n) => (typeof n === "number" ? n & 255 : 0)));
+
+	if (kind === "ArrayBuffer") return u8.buffer;
+
+	if (kind === "SharedArrayBuffer") {
+		if (typeof SharedArrayBuffer !== "undefined") {
+			const sab = new SharedArrayBuffer(u8.byteLength);
+			new Uint8Array(sab).set(u8);
+			return sab;
+		}
+		return u8.buffer;
+	}
+
+	const ab = u8.buffer;
+
+	if (kind === "DataView") {
+		try {
+			return new DataView(ab, byteOffset, length);
+		} catch {
+			return undefined;
+		}
+	}
+
+	const Ctor = (globalThis as any)[kind];
+	if (typeof Ctor === "function") {
+		try {
+			return new Ctor(ab, byteOffset, length);
+		} catch {
+			// ignore
+		}
+	}
+
+	try {
+		return new Uint8Array(ab, byteOffset, length);
+	} catch {
+		return undefined;
+	}
+}
+
+function hydrateFromWire(v: any): any {
+	function inner(x: any): any {
+		if (x == null) return x;
+
+		// BigInt from another realm stays a BigInt. Convert to number if safe.
+		if (typeof x === "bigint") return maybeBigIntToNumber(x);
+
+		if (typeof x !== "object") return x;
+
+		if (Array.isArray(x)) return x.map(inner);
+
+		// Cross-realm clones
+		const tag = Object.prototype.toString.call(x);
+
+		if (tag === "[object Date]" && typeof (x as any).getTime === "function") {
+			return new Date(Number((x as any).getTime()));
+		}
+		if (tag === "[object RegExp]" && typeof (x as any).source === "string") {
+			try {
+				return new RegExp((x as any).source, String((x as any).flags ?? ""));
+			} catch {
+				// ignore
+			}
+		}
+		if (tag === "[object Map]" && typeof (x as any).entries === "function") {
+			const m = new Map<any, any>();
+			for (const [k, v2] of (x as any).entries()) m.set(inner(k), inner(v2));
+			return m;
+		}
+		if (tag === "[object Set]" && typeof (x as any).values === "function") {
+			const s = new Set<any>();
+			for (const v2 of (x as any).values()) s.add(inner(v2));
+			return s;
+		}
+		if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(x)) {
+			return cloneViewToRealm(x);
+		}
+		if (typeof Buffer !== "undefined" && Buffer.isBuffer(x)) return Buffer.from(x);
+
+		// Wire tags
+		if ((x as any).__undef === true) return undefined;
+
+		if ((x as any).__denojs_worker_num === "-0") return -0;
+
+		if ((x as any).__num === "NaN") return NaN;
+		if ((x as any).__num === "Infinity") return Infinity;
+		if ((x as any).__num === "-Infinity") return -Infinity;
+
+		if ("__date" in x) return new Date(Number((x as any).__date));
+
+		if ("__bigint" in x) {
+			try {
+				const bi = BigInt(String((x as any).__bigint));
+				return maybeBigIntToNumber(bi);
+			} catch {
+				return undefined;
+			}
+		}
+
+		if ((x as any).__regexp && typeof (x as any).__regexp === "object") {
+			try {
+				const src = String((x as any).__regexp.source ?? "");
+				const flags = String((x as any).__regexp.flags ?? "");
+				return new RegExp(src, flags);
+			} catch {
+				return undefined;
+			}
+		}
+
+		if ("__url" in x) {
+			try {
+				return new URL(String((x as any).__url));
+			} catch {
+				return String((x as any).__url);
+			}
+		}
+
+		if ("__urlSearchParams" in x) {
+			try {
+				return new URLSearchParams(String((x as any).__urlSearchParams));
+			} catch {
+				return String((x as any).__urlSearchParams);
+			}
+		}
+
+		if ("__buffer" in x) {
+			return bufferViewFromWire(x);
+		}
+
+		if ((x as any).__map !== undefined && Array.isArray((x as any).__map)) {
+			const m = new Map<any, any>();
+			for (const pair of (x as any).__map) {
+				if (!Array.isArray(pair) || pair.length !== 2) continue;
+				m.set(inner(pair[0]), inner(pair[1]));
+			}
+			return m;
+		}
+
+		if ((x as any).__set !== undefined && Array.isArray((x as any).__set)) {
+			const s = new Set<any>();
+			for (const item of (x as any).__set) s.add(inner(item));
+			return s;
+		}
+
+		if ((x as any).__denojs_worker_type === "error") {
+			const msg = String((x as any).message ?? "");
+			const e = new Error(msg);
+
+			if (typeof (x as any).name === "string") (e as any).name = (x as any).name;
+			if (typeof (x as any).stack === "string") (e as any).stack = (x as any).stack;
+			if ("code" in x && (x as any).code != null) (e as any).code = (x as any).code;
+
+			if ("cause" in x && (x as any).cause != null) {
+				(e as any).cause = inner((x as any).cause);
+			}
+
+			return e;
+		}
+
+		const out: any = {};
+		for (const [k, v2] of Object.entries(x)) out[k] = inner(v2);
+		return out;
+	}
+
+	return inner(v);
+}
+
 export type DenoWorkerEvent = "message" | "close";
 export type DenoWorkerMessageHandler = (msg: any) => void;
 
-export type ImportsCallbackResult =
-  | boolean
-  | { js: string }
-  | { resolve: string };
+export type ImportsCallbackResult = boolean | { js: string } | { resolve: string };
 
-export type ImportsCallback = (
-  specifier: string,
-  referrer?: string
-) => ImportsCallbackResult | Promise<ImportsCallbackResult>;
+export type ImportsCallback = (specifier: string, referrer?: string) => ImportsCallbackResult | Promise<ImportsCallbackResult>;
 
 export type DenoPermissionValue = boolean | string[];
 export type DenoPermissions = {
-  read?: DenoPermissionValue;
-  write?: DenoPermissionValue;
-  net?: DenoPermissionValue;
-  env?: DenoPermissionValue;
-  run?: DenoPermissionValue;
-  ffi?: DenoPermissionValue;
-  sys?: DenoPermissionValue;
-  import?: DenoPermissionValue;
-  hrtime?: boolean;
+	read?: DenoPermissionValue;
+	write?: DenoPermissionValue;
+	net?: DenoPermissionValue;
+	env?: DenoPermissionValue;
+	run?: DenoPermissionValue;
+	ffi?: DenoPermissionValue;
+	sys?: DenoPermissionValue;
+	import?: DenoPermissionValue;
+	hrtime?: boolean;
 };
 
 export type DenoConsoleMethod = "log" | "info" | "warn" | "error" | "debug" | "trace";
 export type DenoConsoleHandler = false | undefined | ((...args: any[]) => any);
-export type DenoWorkerConsoleOption =
-  | undefined
-  | false
-  | Console
-  | Partial<Record<DenoConsoleMethod, DenoConsoleHandler>>;
+export type DenoWorkerConsoleOption = undefined | false | Console | Partial<Record<DenoConsoleMethod, DenoConsoleHandler>>;
+
+export type DenoWorkerInspectOption =
+	| undefined
+	| boolean
+	| {
+			host?: string;
+			port?: number;
+			break?: boolean;
+	  };
+
+/**
+ * env config:
+ * - undefined: default Deno behavior
+ * - string: dotenv file path to load (throws if missing or unreadable)
+ * - Record<string,string>: explicit env map
+ */
+export type DenoWorkerEnvOption = undefined | string | Record<string, string>;
 
 export type DenoWorkerOptions = {
-  maxEvalMs?: number;
-  maxMemoryBytes?: number;
-  maxStackSizeBytes?: number;
-  channelSize?: number;
+	maxEvalMs?: number;
+	maxMemoryBytes?: number;
+	maxStackSizeBytes?: number;
+	channelSize?: number;
 
-  imports?: boolean | ImportsCallback;
+	imports?: boolean | ImportsCallback;
 
-  cwd?: string;
+	cwd?: string;
+	startup?: string;
 
-  startup?: string;
-  index?: string;
+	permissions?: DenoPermissions;
 
-  permissions?: DenoPermissions;
+	nodeResolve?: boolean;
+	nodeCompat?: boolean;
 
-  nodeCompat?: boolean;
+	console?: DenoWorkerConsoleOption;
 
-  console?: DenoWorkerConsoleOption;
+	env?: DenoWorkerEnvOption;
+
+	/**
+	 * Convenience dotenv loader:
+	 * - true: search ".env" upwards from cwd
+	 * - string: load explicit dotenv path
+	 */
+	envFile?: boolean | string;
+
+	inspect?: DenoWorkerInspectOption;
 };
 
 export type EvalOptions = {
-  filename?: string;
-  type?: "script" | "module";
-  args?: any[];
-  maxEvalMs?: number;
+	filename?: string;
+	type?: "script" | "module";
+	args?: any[];
+	maxEvalMs?: number;
 };
 
 export type ExecStats = {
-  cpuTimeMs?: number;
-  evalTimeMs?: number;
+	cpuTimeMs?: number;
+	evalTimeMs?: number;
 };
 
 export type V8HeapStatistics = {
-  totalHeapSize: number;
-  totalHeapSizeExecutable: number;
-  totalPhysicalSize: number;
-  totalAvailableSize: number;
-  usedHeapSize: number;
-  heapSizeLimit: number;
-  mallocedMemory: number;
-  externalMemory: number;
-  peakMallocedMemory: number;
-  numberOfNativeContexts: number;
-  numberOfDetachedContexts: number;
-  doesZapGarbage: boolean;
+	totalHeapSize: number;
+	totalHeapSizeExecutable: number;
+	totalPhysicalSize: number;
+	totalAvailableSize: number;
+	usedHeapSize: number;
+	heapSizeLimit: number;
+	mallocedMemory: number;
+	externalMemory: number;
+	peakMallocedMemory: number;
+	numberOfNativeContexts: number;
+	numberOfDetachedContexts: number;
+	doesZapGarbage: boolean;
 };
 
 export type V8HeapSpaceStatistics = {
-  spaceName: string;
-  physicalSpaceSize: number;
-  spaceSize: number;
-  spaceUsedSize: number;
-  spaceAvailableSize: number;
+	spaceName: string;
+	physicalSpaceSize: number;
+	spaceSize: number;
+	spaceUsedSize: number;
+	spaceAvailableSize: number;
 };
 
 export type DenoWorkerMemory = {
-  heapStatistics: V8HeapStatistics;
-  heapSpaceStatistics: V8HeapSpaceStatistics[];
+	heapStatistics: V8HeapStatistics;
+	heapSpaceStatistics: V8HeapSpaceStatistics[];
 };
 
 type NativeWorker = {
-  postMessage(msg: any): boolean; // CHANGED: now returns enqueue ok
-  on(event: string, cb: (...args: any[]) => void): void;
-  isClosed(): boolean;
+	postMessage(msg: any): boolean;
+	on(event: string, cb: (...args: any[]) => void): void;
+	isClosed(): boolean;
 
-  close(): Promise<void>;
-  memory(): Promise<any>;
-  setGlobal(key: string, value: any): Promise<void>;
+	close(): Promise<void>;
+	memory(): Promise<any>;
+	setGlobal(key: string, value: any): Promise<void>;
 
-  eval(src: string, options?: EvalOptions): Promise<any>;
-  evalSync(src: string, options?: EvalOptions): any;
+	eval(src: string, options?: EvalOptions): Promise<any>;
+	evalSync(src: string, options?: EvalOptions): any;
 
-  lastExecutionStats: ExecStats;
+	evalModule?: (src: string, options?: EvalOptions) => Promise<any>;
+
+	lastExecutionStats: ExecStats;
 };
 
 function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undefined {
-  if (!options) return undefined;
-  const out: EvalOptions = {};
-  if (typeof options.filename === "string") out.filename = options.filename;
-  if (options.type === "module") out.type = "module";
-  if ("args" in options) out.args = Array.isArray(options.args) ? options.args : [];
-  if (
-    typeof options.maxEvalMs === "number" &&
-    Number.isFinite(options.maxEvalMs) &&
-    options.maxEvalMs > 0
-  ) {
-    out.maxEvalMs = options.maxEvalMs;
-  }
-  return out;
+	if (!options) return undefined;
+	const out: EvalOptions = {};
+	if (typeof options.filename === "string") out.filename = options.filename;
+	if (options.type === "module") out.type = "module";
+	if ("args" in options) out.args = Array.isArray(options.args) ? dehydrateArgs(options.args) : [];
+	if (typeof options.maxEvalMs === "number" && Number.isFinite(options.maxEvalMs) && options.maxEvalMs > 0) {
+		out.maxEvalMs = options.maxEvalMs;
+	}
+	return out;
 }
 
 function coerceMemoryPayload(raw: unknown): DenoWorkerMemory {
-  const hs = (raw as any).heapStatistics;
-  const hss = (raw as any).heapSpaceStatistics;
-  return { heapStatistics: hs, heapSpaceStatistics: hss };
+	const hs = (raw as any).heapStatistics;
+	const hss = (raw as any).heapSpaceStatistics;
+	return { heapStatistics: hs, heapSpaceStatistics: hss };
 }
 
 function normalizeConsoleOption(x: unknown): unknown {
-  if (x === undefined) return undefined;
-  if (x === false) return false;
+	if (x === undefined) return undefined;
+	if (x === false) return false;
 
-  // Route to Node console (best behavior and preserves binding)
-  if (x === console) {
-    return { __denojs_worker_console_mode: "node" };
-  }
+	if (x && typeof x === "object") {
+		const o: any = x as any;
+		if (typeof o.__denojs_worker_console_mode === "string") return o;
 
-  // Per-method config
-  if (x && typeof x === "object") {
-    const o: any = x as any;
+		const out: any = {};
+		const methods: DenoConsoleMethod[] = ["log", "info", "warn", "error", "debug", "trace"];
 
-    // Allow explicit marker passthrough
-    if (typeof o.__denojs_worker_console_mode === "string") return o;
+		for (const m of methods) {
+			if (!(m in o)) continue;
 
-    const out: any = {};
-    const methods: DenoConsoleMethod[] = ["log", "info", "warn", "error", "debug", "trace"];
+			const v = o[m];
+			if (v === undefined) out[m] = undefined;
+			else if (v === false) out[m] = false;
+			else if (typeof v === "function") out[m] = v;
+		}
 
-    for (const m of methods) {
-      if (!(m in o)) continue;
+		return out;
+	}
 
-      const v = o[m];
-      if (v === undefined) {
-        // Preserve explicit undefined if user set it.
-        out[m] = undefined;
-      } else if (v === false) {
-        out[m] = false;
-      } else if (typeof v === "function") {
-        out[m] = v;
-      }
-    }
-
-    return out;
-  }
-
-  // Unsupported values treated as default
-  return undefined;
+	return undefined;
 }
 
-function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerOptions {
-  const o: DenoWorkerOptions = { ...(options ?? {}) };
+function normalizeEnvOption(x: unknown): unknown {
+	if (x === undefined) return undefined;
 
-  const s = typeof o.startup === "string" ? o.startup : undefined;
-  const i = typeof o.index === "string" ? o.index : undefined;
-  if (!s && i) o.startup = i;
+	if (typeof x === "string") {
+		const s = x.trim();
+		return s ? s : undefined;
+	}
 
-  o.console = normalizeConsoleOption(o.console) as any;
+	if (x && typeof x === "object") {
+		const o: any = x as any;
+		const out: Record<string, string> = {};
 
-  return o;
+		for (const [k, v] of Object.entries(o)) {
+			if (typeof k !== "string" || !k) continue;
+			if (typeof v !== "string") continue;
+			out[k] = v;
+		}
+
+		return Object.keys(out).length ? out : {};
+	}
+
+	return undefined;
+}
+
+function normalizeInspectOption(x: unknown): unknown {
+	if (x === undefined) return undefined;
+
+	if (x === true || x === false) return x;
+
+	if (x && typeof x === "object") {
+		const o: any = x as any;
+		const out: any = {};
+
+		if (typeof o.host === "string") out.host = o.host;
+
+		if (typeof o.port === "number" && Number.isFinite(o.port) && o.port > 0 && o.port <= 65535) {
+			out.port = Math.trunc(o.port);
+		}
+
+		if (typeof o.break === "boolean") out.break = o.break;
+
+		return out;
+	}
+
+	return undefined;
+}
+
+function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerWorkerOptions {
+	const o: any = { ...(options ?? {}) };
+
+	if (typeof o.nodeResolve !== "boolean") delete o.nodeResolve;
+	if (typeof o.nodeCompat !== "boolean") delete o.nodeCompat;
+
+	o.console = normalizeConsoleOption(o.console);
+	o.env = normalizeEnvOption(o.env);
+	o.inspect = normalizeInspectOption(o.inspect);
+
+	if (!(typeof o.envFile === "boolean" || typeof o.envFile === "string")) delete o.envFile;
+	if (typeof o.envFile === "string") {
+		const s = o.envFile.trim();
+		if (!s) delete o.envFile;
+		else o.envFile = s;
+	}
+
+	return o as any;
+}
+
+// Alias to preserve existing exported name
+type DenoWorkerWorkerOptions = DenoWorkerOptions;
+
+function isModuleFnTag(x: any): x is { __denojs_worker_type: "module_fn"; spec: string; name: string } {
+	return x && typeof x === "object" && x.__denojs_worker_type === "module_fn" && typeof x.spec === "string" && typeof x.name === "string";
+}
+
+function wrapModuleNamespace<T extends Record<string, any>>(dw: DenoWorker, ns: any): T {
+	if (!ns || typeof ns !== "object") return ns as T;
+
+	const proto = Object.getPrototypeOf(ns);
+	const out: any = proto === null ? Object.create(null) : {};
+
+	for (const [k, v] of Object.entries(ns)) {
+		if (isModuleFnTag(v)) {
+			const specJson = JSON.stringify(v.spec);
+			const nameJson = JSON.stringify(v.name);
+
+			out[k] = (...args: any[]) => {
+				return dw.evalSync(`(...args) => import(${specJson}).then(m => m[${nameJson}](...args))`, { args });
+			};
+		} else {
+			out[k] = hydrateFromWire(v);
+		}
+	}
+
+	return out as T;
 }
 
 export class DenoWorker {
-  private readonly native: NativeWorker;
+	private readonly native: NativeWorker;
 
-  constructor(options?: DenoWorkerOptions) {
-    this.native = (native as any).DenoWorker(normalizeWorkerOptions(options)) as NativeWorker;
-  }
+	constructor(options?: DenoWorkerOptions) {
+		this.native = (native as any).DenoWorker(normalizeWorkerOptions(options)) as NativeWorker;
+	}
 
-  on(event: DenoWorkerEvent, cb: DenoWorkerMessageHandler): void {
-    this.native.on(event, cb);
-  }
+	on(event: DenoWorkerEvent, cb: DenoWorkerMessageHandler): void {
+		if (event === "message") {
+			this.native.on(event, (msg: any) => {
+				cb(hydrateFromWire(msg));
+			});
+			return;
+		}
+		this.native.on(event, cb);
+	}
 
-  postMessage(msg: any): void {
-    const ok = this.native.postMessage(msg);
-    if (!ok) {
-      throw new Error("DenoWorker.postMessage dropped: worker queue full or closed");
-    }
-  }
+	postMessage(msg: any): void {
+		if (this.isClosed()) {
+			throw new Error("DenoWorker.postMessage dropped: worker queue full or closed");
+		}
 
-  tryPostMessage(msg: any): boolean {
-    return this.native.postMessage(msg);
-  }
+		const ok = this.native.postMessage(dehydrateForWire(msg));
+		if (!ok) {
+			throw new Error("DenoWorker.postMessage dropped: worker queue full or closed");
+		}
+	}
 
-  isClosed(): boolean {
-    return this.native.isClosed();
-  }
+	tryPostMessage(msg: any): boolean {
+		if (this.isClosed()) return false;
+		return this.native.postMessage(dehydrateForWire(msg));
+	}
 
-  get lastExecutionStats(): ExecStats {
-    const v: any = (this.native as any).lastExecutionStats;
-    if (!v || typeof v !== "object") return {};
+	isClosed(): boolean {
+		return this.native.isClosed();
+	}
 
-    const cpu = v.cpuTimeMs;
-    const evalt = v.evalTimeMs;
+	get lastExecutionStats(): ExecStats {
+		const v: any = (this.native as any).lastExecutionStats;
+		if (!v || typeof v !== "object") return {};
 
-    if (typeof cpu === "number" && typeof evalt === "number") {
-      return { cpuTimeMs: cpu, evalTimeMs: evalt };
-    }
-    return {};
-  }
+		const cpu = v.cpuTimeMs;
+		const evalt = v.evalTimeMs;
 
-  async close(): Promise<void> {
-    await this.native.close();
-  }
+		if (typeof cpu === "number" && typeof evalt === "number") {
+			return { cpuTimeMs: cpu, evalTimeMs: evalt };
+		}
+		return {};
+	}
 
-  async memory(): Promise<DenoWorkerMemory> {
-    const raw = await this.native.memory();
-    return coerceMemoryPayload(raw);
-  }
+	async close(): Promise<void> {
+		await this.native.close();
+	}
 
-  async setGlobal(key: string, value: any): Promise<void> {
-    await this.native.setGlobal(key, value);
-  }
+	async memory(): Promise<DenoWorkerMemory> {
+		const raw = await this.native.memory();
+		return coerceMemoryPayload(raw);
+	}
 
-  async eval(src: string, options?: EvalOptions): Promise<any> {
-    return await this.native.eval(src, normalizeEvalOptions(options));
-  }
+	async setGlobal(key: string, value: any): Promise<void> {
+		try {
+			await this.native.setGlobal(key, dehydrateForWire(value));
+		} catch (e) {
+			throw hydrateFromWire(e);
+		}
+	}
 
-  evalSync(src: string, options?: EvalOptions): any {
-    return this.native.evalSync(src, normalizeEvalOptions(options));
-  }
+	async eval(src: string, options?: EvalOptions): Promise<any> {
+		try {
+			const raw = await this.native.eval(src, normalizeEvalOptions(options));
+			return hydrateFromWire(raw);
+		} catch (e) {
+			throw hydrateFromWire(e);
+		}
+	}
 
-  async evalModule(source: string, options?: Omit<EvalOptions, "type">): Promise<any> {
-    return await this.eval(source, { ...(options ?? {}), type: "module" });
-  }
+	evalSync(src: string, options?: EvalOptions): any {
+		try {
+			const raw = this.native.evalSync(src, normalizeEvalOptions(options));
+			return hydrateFromWire(raw);
+		} catch (e) {
+			throw hydrateFromWire(e);
+		}
+	}
+
+	async evalModule<T extends Record<string, any> = Record<string, any>>(
+		source: string,
+		options?: Omit<EvalOptions, "type">,
+	): Promise<T> {
+		let raw: any;
+		try {
+			if (typeof this.native.evalModule === "function") {
+				raw = await this.native.evalModule(source, normalizeEvalOptions({ ...(options ?? {}), type: "module" }));
+			} else {
+				raw = await this.eval(source, { ...(options ?? {}), type: "module" });
+			}
+		} catch (e) {
+			throw hydrateFromWire(e);
+		}
+		return wrapModuleNamespace<T>(this, raw);
+	}
 }
 
 export default DenoWorker;

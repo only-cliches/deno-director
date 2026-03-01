@@ -8,7 +8,11 @@ async function main() {
 
     console.log("\n\n=== deno-vm ===\n");
     const runtime = new DenoWorker({
-        console: console,
+        console: {
+            log: async (...args) => {
+                console.log(...args);
+            }
+        },
     });
     await runtime.eval(benchScript);
     await runtime.close();

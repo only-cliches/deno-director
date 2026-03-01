@@ -78,8 +78,6 @@ impl ModuleRegistry {
             .unwrap_or(false)
     }
 
-    /// Ephemeral module (default for evalModule entrypoints).
-    /// `uses_left` allows the runtime to request the same module multiple times during graph building.
     pub fn put_ephemeral(&self, specifier: &str, code: &str) {
         let mut map = self.modules.lock().expect("modules lock");
         map.insert(
@@ -87,12 +85,11 @@ impl ModuleRegistry {
             ModuleEntry {
                 code: code.to_string(),
                 persistent: false,
-                uses_left: Some(3), // matches your logs showing multiple resolves/loads for the same entry module
+                uses_left: Some(3),
             },
         );
     }
 
-    /// Persistent module (used for internal virtual modules you may want to re-export multiple times).
     pub fn put_persistent(&self, specifier: &str, code: &str) {
         let mut map = self.modules.lock().expect("modules lock");
         map.insert(
@@ -105,7 +102,6 @@ impl ModuleRegistry {
         );
     }
 
-    /// Called by ModuleLoader::load. Returns source if present, and decrements uses for ephemeral entries.
     pub fn get_for_load(&self, specifier: &str) -> Option<String> {
         let mut map = self.modules.lock().ok()?;
         let entry = map.get_mut(specifier)?;
@@ -135,12 +131,17 @@ pub struct DynamicModuleLoader {
     pub reg: ModuleRegistry,
     pub node_tx: mpsc::Sender<NodeMsg>,
     pub imports_policy: crate::worker::state::ImportsPolicy,
+    pub node_resolve: bool,
     pub node_compat: bool,
     pub sandbox_root: PathBuf,
     pub fs_loader: Arc<deno_core::FsModuleLoader>,
 }
 
 impl DynamicModuleLoader {
+    fn node_disk_resolve_enabled(&self) -> bool {
+        self.node_resolve || self.node_compat
+    }
+
     pub fn is_internal_virtual_url(u: &Url) -> bool {
         u.scheme() == "denojs-worker" && u.host_str() == Some("virtual")
     }
@@ -184,45 +185,12 @@ impl DynamicModuleLoader {
     }
 
     pub fn within_sandbox(&self, _file_url: &Url) -> bool {
-        // If imports are enabled, allow disk imports anywhere.
-        // Imports are already gated by `imports` configuration (DenyAll vs AllowDisk vs Callback).
         true
     }
 
     pub fn try_node_resolve_disk(&self, specifier: &str, referrer: &str) -> Option<Url> {
-        if !self.node_compat {
+        if !self.node_disk_resolve_enabled() {
             return None;
-        }
-
-        // Allow explicit node: specifiers
-        if specifier.starts_with("node:") {
-            return Url::parse(specifier).ok();
-        }
-
-        // Treat known node builtins as node:*
-        // Minimal mapping: common builtins only.
-        const BUILTINS: &[&str] = &[
-            "fs",
-            "path",
-            "os",
-            "crypto",
-            "buffer",
-            "util",
-            "stream",
-            "events",
-            "url",
-            "http",
-            "https",
-            "zlib",
-            "assert",
-            "module",
-            "process",
-            "child_process",
-            "net",
-            "tls",
-        ];
-        if BUILTINS.contains(&specifier) {
-            return Url::parse(&format!("node:{specifier}")).ok();
         }
 
         // Determine base directory for resolution
@@ -236,7 +204,7 @@ impl DynamicModuleLoader {
             self.sandbox_root.clone()
         };
 
-        // Relative or absolute path without extension: try Node-style extensions.
+        // Relative or absolute path without extension: try Node-style extensions and index.*
         if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
         {
             let p = if specifier.starts_with('/') {
@@ -245,12 +213,10 @@ impl DynamicModuleLoader {
                 base_dir.join(specifier)
             };
 
-            // If exact path exists, use it.
             if p.exists() {
                 return Url::from_file_path(p).ok();
             }
 
-            // Try file extensions
             let exts = ["js", "mjs", "cjs", "ts", "mts"];
             for ext in exts {
                 let mut pp = p.clone();
@@ -260,14 +226,11 @@ impl DynamicModuleLoader {
                 }
             }
 
-            // Try directory index
-            if !p.extension().is_some() {
-                if p.is_dir() {
-                    for ext in exts {
-                        let idx = p.join(format!("index.{ext}"));
-                        if idx.exists() {
-                            return Url::from_file_path(idx).ok();
-                        }
+            if p.extension().is_none() && p.is_dir() {
+                for ext in exts {
+                    let idx = p.join(format!("index.{ext}"));
+                    if idx.exists() {
+                        return Url::from_file_path(idx).ok();
                     }
                 }
             }
@@ -356,7 +319,16 @@ impl DynamicModuleLoader {
     }
 
     pub fn try_deno_resolve(&self, specifier: &str, referrer: &str) -> Result<Url, JsErrorBox> {
-        deno_core::resolve_import(specifier, referrer)
+        // Deno's resolver is strict about the referrer being a valid URL (often file://).
+        // When our referrer is an internal virtual URL, treat it like "cwd/" for resolution.
+        let effective_referrer = if referrer.starts_with("denojs-worker://virtual/") {
+            // base_url for the sandbox root
+            crate::worker::filesystem::dir_url_from_path(&self.sandbox_root).to_string()
+        } else {
+            referrer.to_string()
+        };
+
+        deno_core::resolve_import(specifier, &effective_referrer)
             .map_err(|e| JsErrorBox::generic(e.to_string()))
     }
 
@@ -365,6 +337,7 @@ impl DynamicModuleLoader {
             reg: self.reg.clone(),
             node_tx: self.node_tx.clone(),
             imports_policy: self.imports_policy.clone(),
+            node_resolve: self.node_resolve,
             node_compat: self.node_compat,
             sandbox_root: self.sandbox_root.clone(),
             fs_loader: self.fs_loader.clone(),
@@ -379,23 +352,21 @@ impl ModuleLoader for DynamicModuleLoader {
         referrer: &str,
         _kind: deno_core::ResolutionKind,
     ) -> Result<Url, JsErrorBox> {
-        // Allow internal virtual modules without consulting callback
+        // Allow internal virtual URLs to pass through unchanged.
         if let Ok(u) = Url::parse(specifier) {
             if Self::is_internal_virtual_url(&u) {
                 return Ok(u);
             }
         }
 
-        // NEW: If this specifier is a registry-backed ephemeral module, do not
-        // consult the imports callback. It must be loadable from memory even
-        // when imports policy is Callback.
+        // Allow direct hits for registry specifiers.
         if self.reg.has(specifier) {
             if let Ok(u) = Url::parse(specifier) {
                 return Ok(u);
             }
         }
 
-        // Callback-first for every specifier (except the bypass cases above)
+        // Callback path: always route via synthetic resolve URL.
         if matches!(
             self.imports_policy,
             crate::worker::state::ImportsPolicy::Callback
@@ -403,20 +374,14 @@ impl ModuleLoader for DynamicModuleLoader {
             return Ok(self.encode_resolve_url(specifier, referrer));
         }
 
-        // Non-callback: disk resolution (node then deno)
+        // Node-style disk resolution (when enabled).
         if let Some(u) = self.try_node_resolve_disk(specifier, referrer) {
             return Ok(u);
         }
 
-        if let Ok(u) = deno_core::resolve_import(specifier, referrer) {
-            return Ok(u);
-        }
-
-        Err(JsErrorBox::generic(format!(
-            "Unable to resolve import: {specifier} (referrer: {referrer})"
-        )))
+        // Deno resolver, but normalize virtual referrers into file://<cwd>/ for relative imports.
+        self.try_deno_resolve(specifier, referrer)
     }
-
 
     fn load(
         &self,
@@ -434,14 +399,11 @@ impl ModuleLoader for DynamicModuleLoader {
 
         let spec = module_specifier.as_str().to_string();
 
-        // Best-effort referrer string for callback
         let referrer_from_runtime = maybe_referrer
             .map(|r| r.specifier.as_str().to_string())
             .unwrap_or_default();
 
-        dbg_imports(format!("load() checking registry spec={}", spec));
-
-        // 1) Serve in-memory modules first (ephemeral eval modules and persistent virtual modules)
+        // 1) Serve in-memory modules first
         if let Some(code) = self.reg.get_for_load(&spec) {
             let source = ModuleSource::new(
                 ModuleType::JavaScript,
@@ -452,28 +414,24 @@ impl ModuleLoader for DynamicModuleLoader {
             return deno_core::ModuleLoadResponse::Sync(Ok(source));
         }
 
-        // 2) Decode synthetic resolve URL (callback path for otherwise-unresolvable specifiers)
+        // 2) Decode synthetic resolve URL (callback path)
         let decoded = Self::decode_resolve_url(module_specifier);
         let (orig_spec, orig_referrer) = decoded
             .clone()
             .unwrap_or_else(|| (spec.clone(), referrer_from_runtime.clone()));
 
-        // 3) Enforce imports policy for real module loads (in-memory already allowed)
+        // 3) Enforce imports policy for real module loads
         match self.imports_policy {
             crate::worker::state::ImportsPolicy::DenyAll => {
                 return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
                     "Import blocked (imports disabled): {orig_spec}"
                 ))));
             }
-            crate::worker::state::ImportsPolicy::AllowDisk => {
-                // continue
-            }
-            crate::worker::state::ImportsPolicy::Callback => {
-                // continue
-            }
+            crate::worker::state::ImportsPolicy::AllowDisk => {}
+            crate::worker::state::ImportsPolicy::Callback => {}
         }
 
-        // 4) Callback path (async): if configured, consult Node before resolving further.
+        // 4) Callback path
         if matches!(
             self.imports_policy,
             crate::worker::state::ImportsPolicy::Callback
@@ -483,18 +441,13 @@ impl ModuleLoader for DynamicModuleLoader {
             let this_loader = self.clone_for_async();
 
             let requested_specifier = module_specifier.clone();
-            let maybe_referrer_owned: Option<deno_core::ModuleLoadReferrer> = maybe_referrer.cloned();
-            let options = options;
+            let maybe_referrer_owned: Option<deno_core::ModuleLoadReferrer> =
+                maybe_referrer.cloned();
 
             return deno_core::ModuleLoadResponse::Async(Box::pin(async move {
                 use crate::worker::messages::ImportDecision;
 
                 let (tx, rx) = tokio::sync::oneshot::channel::<ImportDecision>();
-
-                dbg_imports(format!(
-                    "load() CALLBACK sending ImportRequest specifier={} referrer={}",
-                    orig_spec, orig_referrer
-                ));
 
                 if node_tx
                     .send(NodeMsg::ImportRequest {
@@ -510,7 +463,7 @@ impl ModuleLoader for DynamicModuleLoader {
 
                 let decision = rx.await.unwrap_or(ImportDecision::Block);
 
-                let out: Result<ModuleSource, JsErrorBox> = match decision {
+                match decision {
                     ImportDecision::Block => Err(JsErrorBox::generic(format!(
                         "Import blocked: {}",
                         orig_spec
@@ -519,7 +472,11 @@ impl ModuleLoader for DynamicModuleLoader {
                     ImportDecision::AllowDisk => {
                         let resolved = this_loader
                             .try_node_resolve_disk(&orig_spec, &orig_referrer)
-                            .or_else(|| this_loader.try_deno_resolve(&orig_spec, &orig_referrer).ok())
+                            .or_else(|| {
+                                this_loader
+                                    .try_deno_resolve(&orig_spec, &orig_referrer)
+                                    .ok()
+                            })
                             .ok_or_else(|| {
                                 JsErrorBox::generic(format!(
                                     "Unable to resolve import: {}",
@@ -531,10 +488,12 @@ impl ModuleLoader for DynamicModuleLoader {
                             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
                         }
 
-                        let loaded = match fs_loader.load(&resolved, maybe_referrer_owned.as_ref(), options) {
-                            deno_core::ModuleLoadResponse::Sync(r) => r,
-                            deno_core::ModuleLoadResponse::Async(fut) => fut.await,
-                        };
+                        let loaded =
+                            match fs_loader.load(&resolved, maybe_referrer_owned.as_ref(), options)
+                            {
+                                deno_core::ModuleLoadResponse::Sync(r) => r,
+                                deno_core::ModuleLoadResponse::Async(fut) => fut.await,
+                            };
 
                         loaded.map(|mut src| {
                             if requested_specifier.scheme() == "denojs-worker" {
@@ -573,10 +532,12 @@ impl ModuleLoader for DynamicModuleLoader {
                             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
                         }
 
-                        let loaded = match fs_loader.load(&resolved, maybe_referrer_owned.as_ref(), options) {
-                            deno_core::ModuleLoadResponse::Sync(r) => r,
-                            deno_core::ModuleLoadResponse::Async(fut) => fut.await,
-                        };
+                        let loaded =
+                            match fs_loader.load(&resolved, maybe_referrer_owned.as_ref(), options)
+                            {
+                                deno_core::ModuleLoadResponse::Sync(r) => r,
+                                deno_core::ModuleLoadResponse::Async(fut) => fut.await,
+                            };
 
                         loaded.map(|mut src| {
                             if requested_specifier.scheme() == "denojs-worker" {
@@ -598,23 +559,15 @@ impl ModuleLoader for DynamicModuleLoader {
                     }
 
                     ImportDecision::SourceTyped { ext, code } => {
-                        // Create an internal virtual module URL whose path ends with .js/.ts/.tsx/.jsx
-                        // so Deno's media type detection can parse it correctly.
                         let virt = this_loader.reg.next_virtual_specifier(&ext);
                         this_loader.reg.put_persistent(&virt, &code);
 
-                        // Return a tiny wrapper module for the requested specifier.
                         let wrapper = format!(
                             "export * from {v};\nexport {{ default }} from {v};\n",
                             v = serde_json::to_string(&virt).unwrap_or_else(|_| {
                                 "\"denojs-worker://virtual/__vm_bad.js\"".into()
                             })
                         );
-
-                        dbg_imports(format!(
-                            "load() CALLBACK SourceTyped ext={} creating virt={}",
-                            ext, virt
-                        ));
 
                         Ok(ModuleSource::new(
                             ModuleType::JavaScript,
@@ -623,18 +576,11 @@ impl ModuleLoader for DynamicModuleLoader {
                             None,
                         ))
                     }
-                };
-
-                dbg_imports(format!(
-                    "load() CALLBACK decision={:?} specifier={}",
-                    out, orig_spec
-                ));
-
-                out
+                }
             }));
         }
 
-        // 5) Non-callback: allow disk loads directly (resolved URL should already be usable)
+        // 5) Non-callback: allow disk loads directly
         if module_specifier.scheme() == "file" && !self.within_sandbox(module_specifier) {
             return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(
                 "Import blocked: outside sandbox",

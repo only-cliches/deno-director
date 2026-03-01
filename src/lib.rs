@@ -13,6 +13,7 @@ use crate::bridge::promise::PromiseSettler;
 use crate::bridge::types::{EvalOptions, JsValueBridge};
 use crate::worker::messages::{DenoMsg, EvalReply};
 use crate::worker::state::WorkerHandle;
+use deno_runtime::worker::WorkerServiceOptions;
 
 lazy_static! {
     pub static ref WORKERS: Mutex<HashMap<usize, WorkerHandle>> = Mutex::new(HashMap::new());
@@ -29,6 +30,7 @@ fn mk_err(message: impl Into<String>) -> JsValueBridge {
         message: message.into(),
         stack: None,
         code: None,
+        cause: None,
     }
 }
 
@@ -62,6 +64,14 @@ fn get_string_prop<'a, C: Context<'a>>(
     let v = obj.get_value(cx, key).ok()?;
     let s = v.downcast::<JsString, _>(cx).ok()?;
     Some(s.value(cx))
+}
+
+fn host_fn_tag(id: usize, is_async: bool) -> serde_json::Value {
+    json!({
+        "__denojs_worker_type": "function",
+        "id": id,
+        "async": is_async
+    })
 }
 
 fn host_fn_tag_async(id: usize) -> serde_json::Value {
@@ -106,7 +116,21 @@ fn build_node_console_bridge_fn<'a>(
         let argc = cx.len();
         let mut argv: Vec<Handle<JsValue>> = Vec::with_capacity(argc);
         for i in 0..argc {
-            argv.push(cx.argument::<JsValue>(i)?);
+            let v = cx.argument::<JsValue>(i)?;
+
+            // Jest worker transport cannot JSON stringify BigInt, so sanitize here.
+            let v2: Handle<JsValue> = if v.is_a::<neon::types::JsBigInt, _>(&mut cx) {
+                let s = cx
+                    .try_catch(|cx| v.to_string(cx))
+                    .ok()
+                    .map(|ss| ss.value(&mut cx))
+                    .unwrap_or_else(|| "0".to_string());
+                cx.string(format!("{s}n")).upcast()
+            } else {
+                v
+            };
+
+            argv.push(v2);
         }
 
         let _ = cx.try_catch(|cx| {
@@ -116,6 +140,42 @@ fn build_node_console_bridge_fn<'a>(
 
         Ok(cx.undefined())
     })
+}
+
+fn is_async_like<'a>(cx: &mut FunctionContext<'a>, func: Handle<'a, JsFunction>) -> bool {
+    let candidate: Handle<'a, JsFunction> = func;
+
+    let tag_is_async = (|| -> Option<bool> {
+        let object_ctor: Handle<JsFunction> = cx.global("Object").ok()?;
+        let proto_val = object_ctor.get_value(cx, "prototype").ok()?;
+        let proto = proto_val.downcast::<JsObject, _>(cx).ok()?;
+        let to_string_val = proto.get_value(cx, "toString").ok()?;
+        let to_string = to_string_val.downcast::<JsFunction, _>(cx).ok()?;
+
+        let s = to_string
+            .call_with(cx)
+            .this(candidate)
+            .apply::<JsString, _>(cx)
+            .ok()?
+            .value(cx);
+
+        Some(s == "[object AsyncFunction]")
+    })()
+    .unwrap_or(false);
+
+    if tag_is_async {
+        return true;
+    }
+
+    (|| -> Option<bool> {
+        let obj = candidate.upcast::<JsObject>();
+        let ctor_val = obj.get_value(cx, "constructor").ok()?;
+        let ctor_obj = ctor_val.downcast::<JsObject, _>(cx).ok()?;
+        let name_val = ctor_obj.get_value(cx, "name").ok()?;
+        let name = name_val.downcast::<JsString, _>(cx).ok()?.value(cx);
+        Some(name == "AsyncFunction")
+    })()
+    .unwrap_or(false)
 }
 
 fn build_console_config_from_neon<'a>(
@@ -139,10 +199,8 @@ fn build_console_config_from_neon<'a>(
     };
 
     // Marker mode: { __denojs_worker_console_mode: "node" }
-    if get_string_prop(cx, obj, "__denojs_worker_console_mode")
-        .as_deref()
-        == Some("node")
-    {
+    // This should be synchronous so logs stream during long sync CPU loops.
+    if get_string_prop(cx, obj, "__denojs_worker_console_mode").as_deref() == Some("node") {
         let methods: &[(&str, &'static str)] = &[
             ("log", "log"),
             ("info", "info"),
@@ -157,7 +215,8 @@ fn build_console_config_from_neon<'a>(
         for (k, m) in methods {
             if let Ok(f) = build_node_console_bridge_fn(cx, m) {
                 if let Some(id) = register_host_fn(worker_id, cx, f) {
-                    map.insert((*k).to_string(), host_fn_tag_async(id));
+                    // Node console routing should be sync.
+                    map.insert((*k).to_string(), host_fn_tag(id, false));
                 }
             }
         }
@@ -169,6 +228,10 @@ fn build_console_config_from_neon<'a>(
         }
     } else {
         // Per-method mode: { log, info, warn, error, debug, trace }
+        // - function: sync by default
+        // - async function: use async host call
+        // - false: ignore
+        // - missing: default behavior (restore originals in worker)
         let keys: &[&str] = &["log", "info", "warn", "error", "debug", "trace"];
         let mut map = serde_json::Map::new();
 
@@ -190,8 +253,9 @@ fn build_console_config_from_neon<'a>(
             }
 
             if let Ok(f) = v.downcast::<JsFunction, _>(cx) {
+                let async_like = is_async_like(cx, f);
                 if let Some(id) = register_host_fn(worker_id, cx, f) {
-                    map.insert((*k).to_string(), host_fn_tag_async(id));
+                    map.insert((*k).to_string(), host_fn_tag(id, async_like));
                 }
                 continue;
             }
@@ -419,45 +483,6 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                     .get_mut(&id2)
                     .ok_or_else(|| cx.throw_error::<_, ()>("Runtime is closed").unwrap_err())?;
 
-                fn is_async_like<'a>(
-                    cx: &mut FunctionContext<'a>,
-                    func: Handle<'a, JsFunction>,
-                ) -> bool {
-                    let candidate: Handle<'a, JsFunction> = func;
-
-                    let tag_is_async = (|| -> Option<bool> {
-                        let object_ctor: Handle<JsFunction> = cx.global("Object").ok()?;
-                        let proto_val = object_ctor.get_value(cx, "prototype").ok()?;
-                        let proto = proto_val.downcast::<JsObject, _>(cx).ok()?;
-                        let to_string_val = proto.get_value(cx, "toString").ok()?;
-                        let to_string = to_string_val.downcast::<JsFunction, _>(cx).ok()?;
-
-                        let s = to_string
-                            .call_with(cx)
-                            .this(candidate)
-                            .apply::<JsString, _>(cx)
-                            .ok()?
-                            .value(cx);
-
-                        Some(s == "[object AsyncFunction]")
-                    })()
-                    .unwrap_or(false);
-
-                    if tag_is_async {
-                        return true;
-                    }
-
-                    (|| -> Option<bool> {
-                        let obj = candidate.upcast::<JsObject>();
-                        let ctor_val = obj.get_value(cx, "constructor").ok()?;
-                        let ctor_obj = ctor_val.downcast::<JsObject, _>(cx).ok()?;
-                        let name_val = ctor_obj.get_value(cx, "name").ok()?;
-                        let name = name_val.downcast::<JsString, _>(cx).ok()?.value(cx);
-                        Some(name == "AsyncFunction")
-                    })()
-                    .unwrap_or(false)
-                }
-
                 let value = if let Ok(func) = js.downcast::<JsFunction, _>(&mut cx) {
                     let is_async = is_async_like(&mut cx, func);
 
@@ -578,6 +603,50 @@ fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             crate::bridge::neon_codec::eval_result_to_neon(&mut cx, result)
         })?;
         api.set(&mut cx, "evalSync", f)?;
+    }
+
+    // src/lib.rs (inside create_worker, add this whole block near eval()/evalSync() exports)
+
+    // evalModule(src, options?): Promise<any>
+    // Native-side convenience for CJS consumers that instantiate the raw native worker object.
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let src = cx.argument::<JsString>(0)?.value(&mut cx);
+
+            // Parse options but force type="module"
+            let mut options = parse_eval_options(&mut cx, 1);
+            options.is_module = true;
+
+            let (deferred, promise) = cx.promise();
+            let settler = PromiseSettler::new(deferred, cx.channel());
+
+            let tx = {
+                let map = WORKERS
+                    .lock()
+                    .map_err(|e| cx.throw_error::<_, ()>(e.to_string()).unwrap_err())?;
+                map.get(&id2).map(|w| w.deno_tx.clone())
+            };
+
+            match tx {
+                Some(tx) => try_send_deno_msg_or_reject(
+                    &tx,
+                    DenoMsg::Eval {
+                        source: src,
+                        options,
+                        deferred: Some(settler),
+                        sync_reply: None,
+                    },
+                ),
+                None => settler.reject_with_value_in_cx(
+                    &mut cx,
+                    &mk_err("Runtime is closed or request queue is full"),
+                ),
+            }
+
+            Ok(promise)
+        })?;
+        api.set(&mut cx, "evalModule", f)?;
     }
 
     // lastExecutionStats getter (unchanged)

@@ -1,5 +1,4 @@
 import { DenoWorker } from "../src/index";
-import { EventEmitter } from "events";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -22,20 +21,81 @@ describe("deno_worker: messaging", () => {
     expect(messages).toContainEqual({ hello: "from worker" });
   });
 
-  it("sends messages to the worker", async () => {
+  it("swallows exceptions thrown in Node message handlers and continues delivering", async () => {
     dw = new DenoWorker();
-    const events = new EventEmitter();
+    const seen: any[] = [];
+
+    dw.on("message", (msg: any) => {
+      seen.push(msg);
+      if (msg && msg.n === 1) {
+        throw new Error("handler boom");
+      }
+    });
+
+    await dw.eval(`hostPostMessage({ n: 1 })`);
+    await dw.eval(`hostPostMessage({ n: 2 })`);
+    await sleep(80);
+
+    expect(seen).toContainEqual({ n: 1 });
+    expect(seen).toContainEqual({ n: 2 });
+  });
+
+  it("dispatches Node -> worker messages to both on('message') and addEventListener('message')", async () => {
+    dw = new DenoWorker();
 
     await dw.eval(`
-      let received = null;
-      on("message", (msg) => { received = msg; });
+      globalThis.count = 0;
+      on("message", () => { globalThis.count++; });
+      addEventListener("message", () => { globalThis.count++; });
     `);
 
-    events.once("ready", () => void 0);
+    dw.postMessage({ ping: true });
+    await sleep(80);
+
+    await expect(dw.eval("globalThis.count")).resolves.toBe(2);
+  });
+
+  it("worker addEventListener('message') receives Node postMessage", async () => {
+    dw = new DenoWorker();
+
+    await dw.eval(`
+      globalThis.receivedA = null;
+      globalThis.receivedB = null;
+
+      on("message", (msg) => { globalThis.receivedA = msg; });
+      addEventListener("message", (e) => { globalThis.receivedB = e; });
+    `);
+
+    dw.postMessage({ a: 1 });
+    await sleep(50);
+
+    await expect(dw.eval("globalThis.receivedA")).resolves.toEqual({ a: 1 });
+    await expect(dw.eval("globalThis.receivedB")).resolves.toEqual({ a: 1 });
+  });
+
+  it("worker postMessage is aliased to hostPostMessage (worker -> Node)", async () => {
+    dw = new DenoWorker();
+    const messages: any[] = [];
+
+    dw.on("message", (msg: any) => messages.push(msg));
+
+    await dw.eval(`postMessage({ via: "postMessage" })`);
+    await sleep(80);
+
+    expect(messages).toContainEqual({ via: "postMessage" });
+  });
+
+  it("sends messages to the worker", async () => {
+    dw = new DenoWorker();
+
+    await dw.eval(`
+      globalThis.received = null;
+      on("message", (msg) => { globalThis.received = msg; });
+    `);
 
     dw.postMessage({ foo: "bar" });
     await sleep(50);
 
-    await expect(dw.eval("received")).resolves.toEqual({ foo: "bar" });
+    await expect(dw.eval("globalThis.received")).resolves.toEqual({ foo: "bar" });
   });
 });

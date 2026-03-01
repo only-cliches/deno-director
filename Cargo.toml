@@ -33,6 +33,7 @@ deno_io = "=0.144.0"
 serde = "1.0.228"
 urlencoding = "2.1.3"
 sys_traits = { version="=0.1.24"  }
+deno_inspector_server = "0.8.0"
 
 
 

@@ -5,12 +5,59 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe("deno_worker: promises and error propagation", () => {
   let dw: DenoWorker;
 
+  beforeEach(() => {
+    dw = new DenoWorker();
+  });
+
   afterEach(async () => {
     if (dw && !dw.isClosed()) await dw.close();
   });
 
+  it("rejects with non-Error values (e.g. string) without crashing the bridge", async () => {
+    await expect(dw.eval(`Promise.reject("nope")`)).rejects.toEqual("nope");
+  });
+
+  it("propagates worker-thrown non-Error values as rejection reasons", async () => {
+    await expect(dw.eval(`(() => { throw "boom"; })()`)).rejects.toEqual("boom");
+  });
+
+  it("propagates non-Error rejection reasons", async () => {
+    await expect(dw.eval(`Promise.reject("nope")`)).rejects.toBe("nope");
+    await expect(dw.eval(`Promise.reject(null)`)).rejects.toBeNull();
+    await expect(dw.eval(`Promise.reject({ x: 1 })`)).rejects.toEqual({ x: 1 });
+  });
+
+  it("settles nested promise returns", async () => {
+    await expect(dw.eval(`Promise.resolve(Promise.resolve(7))`)).resolves.toBe(7);
+    await expect(dw.eval(`(async () => Promise.resolve(5))()`)).resolves.toBe(5);
+  });
+
+  it("propagates Node-injected sync function errors into the worker (via host call)", async () => {
+    const nodeFn = jest.fn(() => {
+      throw new Error("SyncBoom");
+    });
+
+    await dw.setGlobal("nodeFn", nodeFn as any);
+
+    const script = `
+      (async () => {
+        try {
+          nodeFn();
+          return "nope";
+        } catch (e) {
+          return { name: e?.name, message: e?.message };
+        }
+      })()
+    `;
+
+    await expect(dw.eval(script)).resolves.toMatchObject({
+      name: "Error",
+      message: expect.stringMatching(/SyncBoom/),
+    });
+    expect(nodeFn).toHaveBeenCalledTimes(1);
+  });
+
   it("resolves a promise returned by the worker", async () => {
-    dw = new DenoWorker();
     const script = `
       (async () => {
         const step1 = await Promise.resolve("step 1");
@@ -22,16 +69,7 @@ describe("deno_worker: promises and error propagation", () => {
     await expect(dw.eval(script)).resolves.toBe("step 1 -> step 2 -> step 3");
   });
 
-  // it("rejects with an Error for worker-thrown errors", async () => {
-  //   dw = new DenoWorker();
-  //   await expect(dw.eval(`(async () => { throw new Error("Worker Boom"); })()`)).rejects.toThrow(
-  //     "Worker Boom"
-  //   );
-  // });
-
   it("propagates a Node-injected async function result into the worker", async () => {
-    dw = new DenoWorker();
-
     const asyncIdentity = async (val: string) => {
       await sleep(25);
       return "Node processed: " + val;
@@ -50,8 +88,6 @@ describe("deno_worker: promises and error propagation", () => {
   });
 
   it("propagates Node-injected async function errors into the worker as Error-like values", async () => {
-    dw = new DenoWorker();
-
     const nodeFn = jest.fn(async () => {
       const err: any = new Error("Node Boom!");
       err.name = "NodeCustomError";

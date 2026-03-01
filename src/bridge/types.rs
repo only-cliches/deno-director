@@ -9,18 +9,35 @@ pub enum JsValueBridge {
     Bool(bool),
     Number(f64),
     String(String),
+
+    BigInt(String), // decimal string
     DateMs(f64),
-    Bytes(Vec<u8>),
+
+    RegExp { source: String, flags: String },
+
+    // Binary values
+    BufferView {
+        kind: String, // "ArrayBuffer" | "Uint8Array" | "Int32Array" | "DataView" | ...
+        bytes: Vec<u8>,
+        byte_offset: usize,
+        length: usize, // for typed arrays: element length; for DataView: byteLength; for ArrayBuffer: byteLength
+    },
+
+    Map(Vec<(JsValueBridge, JsValueBridge)>), // primitive keys only
+    Set(Vec<JsValueBridge>),
+
+    Url { href: String },
+    UrlSearchParams { query: String },
 
     Json(serde_json::Value),
     V8Serialized(Vec<u8>),
 
-    // Replace BridgeError struct with inline fields
     Error {
         name: String,
         message: String,
         stack: Option<String>,
         code: Option<String>,
+        cause: Option<Box<JsValueBridge>>,
     },
 
     HostFunction {
@@ -73,6 +90,7 @@ impl EvalOptions {
                 out.filename = s.value(cx);
             }
         }
+
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "type") {
             if let Ok(s) = v.downcast::<JsString, _>(cx) {
                 out.is_module = s.value(cx) == "module";
@@ -104,13 +122,13 @@ impl EvalOptions {
 }
 
 impl JsValueBridge {
-
     pub fn js_error_to_bridge(e: Box<deno_core::error::JsError>) -> Self {
         Self::Error {
             name: "Error".into(),
             message: e.to_string(),
             stack: None,
             code: None,
+            cause: None,
         }
     }
 
@@ -120,6 +138,7 @@ impl JsValueBridge {
             message: e.to_string(),
             stack: None,
             code: None,
+            cause: None,
         }
     }
 
@@ -129,6 +148,7 @@ impl JsValueBridge {
             message: msg,
             stack: None,
             code: None,
+            cause: None,
         }
     }
 }

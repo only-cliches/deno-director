@@ -1,9 +1,9 @@
+use deno_core::url::Url;
 use deno_fs::{FileSystem, FsFileType, OpenOptions, RealFs};
 use deno_io::fs::FsResult;
 use deno_permissions::{CheckedPath, CheckedPathBuf};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use deno_core::url::Url;
 
 #[derive(Debug, Clone)]
 pub struct SandboxFs {

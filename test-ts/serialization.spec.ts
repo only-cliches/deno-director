@@ -27,10 +27,36 @@ describe("deno_worker: data serialization", () => {
       null,
     ]);
 
-    await expect(dw.eval(identityFn, { args: [{ foo: "bar", nested: { val: 123 } }] })).resolves.toEqual({
-      foo: "bar",
-      nested: { val: 123 },
-    });
+    await expect(dw.eval(identityFn, { args: [{ foo: "bar", nested: { val: 123 } }] })).resolves.toEqual(
+      {
+        foo: "bar",
+        nested: { val: 123 },
+      }
+    );
+  });
+
+
+  it("round-trips NaN and Infinity as primitive numbers", async () => {
+    dw = new DenoWorker();
+
+    const nan = await dw.eval("(x) => x", { args: [Number.NaN] });
+    expect(Number.isNaN(nan)).toBe(true);
+
+    const inf = await dw.eval("(x) => x", { args: [Number.POSITIVE_INFINITY] });
+    expect(inf).toBe(Number.POSITIVE_INFINITY);
+
+    const ninf = await dw.eval("(x) => x", { args: [Number.NEGATIVE_INFINITY] });
+    expect(ninf).toBe(Number.NEGATIVE_INFINITY);
+  });
+
+  it("preserves -0 as a primitive number and on return", async () => {
+    dw = new DenoWorker();
+
+    const out = await dw.eval("(x) => x", { args: [-0] });
+    expect(Object.is(out, -0)).toBe(true);
+
+    const out2 = await dw.eval("(() => -0)()");
+    expect(Object.is(out2, -0)).toBe(true);
   });
 
   it("round-trips Date instances", async () => {
@@ -51,11 +77,32 @@ describe("deno_worker: data serialization", () => {
     expect(Buffer.compare(input, out)).toBe(0);
   });
 
+  it("preserves -0 across the bridge (args and return)", async () => {
+    dw = new DenoWorker();
+
+    const out = await dw.eval(identityFn, { args: [-0] });
+    expect(Object.is(out, -0)).toBe(true);
+
+    const out2 = await dw.eval("-0");
+    expect(Object.is(out2, -0)).toBe(true);
+
+    const check = await dw.eval("(x) => Object.is(x, -0)", { args: [-0] });
+    expect(check).toBe(true);
+  });
+
+  it("converts small BigInt results to Number when lossless, rejects when too large", async () => {
+    dw = new DenoWorker();
+
+    await expect(dw.eval("1n")).resolves.toBe(1);
+
+    await expect(dw.eval("2n ** 200n")).rejects.toThrow(/bigint/i);
+  });
+
   it("does not mutate the original arguments (copy semantics)", async () => {
     dw = new DenoWorker();
     const inputObj: any = { val: 1 };
 
-    const script = `(x) => { x.val = 999; return x; }`;
+    const script = "(x) => { x.val = 999; return x; }";
     const result: any = await dw.eval(script, { args: [inputObj] });
 
     expect(result.val).toBe(999);

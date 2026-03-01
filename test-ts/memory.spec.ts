@@ -30,6 +30,13 @@ describe("DenoWorker memory()", () => {
     if (dw && !dw.isClosed()) await dw.close();
   });
 
+  test("memory() rejects after close", async () => {
+    await dw.close();
+    expect(dw.isClosed()).toBe(true);
+
+    await expect(dw.memory()).rejects.toBeDefined();
+  });
+
   test("memory() returns heapStatistics and heapSpaceStatistics", async () => {
     const mem = await dw.memory();
 

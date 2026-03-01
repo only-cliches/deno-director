@@ -1221,6 +1221,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "deno_fs",
+ "deno_inspector_server",
  "deno_io",
  "deno_node",
  "deno_permissions",
