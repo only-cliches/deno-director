@@ -43,7 +43,7 @@ npm install deno-director
 ### The Basics: Evaluated TS and Host Callbacks
 
 ```ts
-import { DenoWorker } from "./src/index";
+import { DenoWorker } from "deno-director";
 
 // 1. Boot a locked-down V8 isolate
 // Deno cannot touch the network or the disk. It only knows what we feed it.
