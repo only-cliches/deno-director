@@ -1,30 +1,33 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
-function u8of(x: any): Uint8Array {
+function u8of(x: unknown): Uint8Array {
   if (x instanceof Uint8Array) return x;
   if (x instanceof ArrayBuffer) return new Uint8Array(x);
   if (ArrayBuffer.isView(x)) return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
   throw new Error(`Expected ArrayBuffer or view, got: ${Object.prototype.toString.call(x)}`);
 }
 
-function bytesEq(actual: any, expected: number[]) {
+function bytesEq(actual: unknown, expected: number[]) {
   const a = Array.from(u8of(actual));
   expect(a).toEqual(expected);
 }
 
-function expectMapEq(m: any, entries: Array<[any, any]>) {
+function expectMapEq(m: unknown, entries: Array<[unknown, unknown]>) {
+  const map = m as Map<unknown, unknown>;
   expect(m).toBeInstanceOf(Map);
-  expect(m.size).toBe(entries.length);
+  expect(map.size).toBe(entries.length);
   for (const [k, v] of entries) {
-    expect(m.get(k)).toEqual(v);
+    expect(map.get(k)).toEqual(v);
   }
 }
 
-function expectSetEq(s: any, values: any[]) {
+function expectSetEq(s: unknown, values: unknown[]) {
+  const set = s as Set<unknown>;
   expect(s).toBeInstanceOf(Set);
-  expect(s.size).toBe(values.length);
+  expect(set.size).toBe(values.length);
   for (const v of values) {
-    expect(s.has(v)).toBe(true);
+    expect(set.has(v)).toBe(true);
   }
 }
 
@@ -32,7 +35,7 @@ describe("bridge: expanded types", () => {
   jest.setTimeout(60_000);
 
   test("Deno -> Node: BigInt", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval("9007199254740993n");
       expect(typeof out).toBe("bigint");
@@ -43,7 +46,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: BigInt", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       await dw.setGlobal("x", 9007199254740993n);
       expect(await dw.eval("typeof x")).toBe("bigint");
@@ -54,7 +57,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: Date", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval("new Date(1700000000000)");
       expect(out).toBeInstanceOf(Date);
@@ -65,7 +68,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: Date", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const d = new Date(1700000000000);
       await dw.setGlobal("d", d);
@@ -77,7 +80,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: RegExp", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval("(/a+b/gi)");
       expect(out).toBeInstanceOf(RegExp);
@@ -90,7 +93,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: RegExp", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       await dw.setGlobal("r", /a+b/gi);
       expect(await dw.eval("r instanceof RegExp")).toBe(true);
@@ -101,7 +104,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: ArrayBuffer", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval(
         "(() => { const ab = new ArrayBuffer(3); new Uint8Array(ab).set([1,2,3]); return ab; })()",
@@ -114,7 +117,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: ArrayBuffer", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const ab = new ArrayBuffer(3);
       new Uint8Array(ab).set([7, 8, 9]);
@@ -127,9 +130,9 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: TypedArrays (roundtrip class + bytes)", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
-      const cases: Array<[string, number[]]> = [
+      const cases: Array<[string, number[] | bigint[]]> = [
         ["Uint8Array", [1, 2, 255]],
         ["Int8Array", [-1, 0, 1]],
         ["Uint16Array", [1, 2, 65535]],
@@ -139,8 +142,8 @@ describe("bridge: expanded types", () => {
         ["Float32Array", [1.5, -2.25, 3.75]],
         ["Float64Array", [1.5, -2.25, 3.75]],
         ["Uint8ClampedArray", [0, 128, 255]],
-        ["BigInt64Array", [1n, -2n, 3n] as any],
-        ["BigUint64Array", [1n, 2n, 3n] as any],
+        ["BigInt64Array", [1n, -2n, 3n]],
+        ["BigUint64Array", [1n, 2n, 3n]],
       ];
 
       for (const [ctorName, vals] of cases) {
@@ -165,19 +168,21 @@ describe("bridge: expanded types", () => {
         })();
 
         const out = await dw.eval(`(() => { const x = ${src}; return x; })()`);
-        expect(out).toBeInstanceOf((global as any)[ctorName]);
+        const ctor = (globalThis as unknown as Record<string, Function>)[ctorName];
+        expect(out).toBeInstanceOf(ctor);
 
         if (ctorName === "BigInt64Array" || ctorName === "BigUint64Array") {
-          expect(Array.from(out as any)).toEqual(vals as any);
+          expect(Array.from(out as ArrayLike<bigint>)).toEqual(vals as bigint[]);
         } else if (ctorName === "Float32Array" || ctorName === "Float64Array") {
           // Float comparisons: exact for these literals on both sides is fine, but keep it tolerant anyway.
-          const got = Array.from(out as any);
+          const got = Array.from(out as ArrayLike<number>);
           expect(got.length).toBe(3);
-          expect(got[0]).toBeCloseTo((vals as any)[0], 6);
-          expect(got[1]).toBeCloseTo((vals as any)[1], 6);
-          expect(got[2]).toBeCloseTo((vals as any)[2], 6);
+          const numVals = vals as number[];
+          expect(got[0]).toBeCloseTo(numVals[0], 6);
+          expect(got[1]).toBeCloseTo(numVals[1], 6);
+          expect(got[2]).toBeCloseTo(numVals[2], 6);
         } else {
-          expect(Array.from(out as any)).toEqual(vals as any);
+          expect(Array.from(out as ArrayLike<number>)).toEqual(vals as number[]);
         }
       }
     } finally {
@@ -186,7 +191,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: TypedArrays + DataView", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const i16 = new Int16Array([1, 2, 3]);
       await dw.setGlobal("i16", i16);
@@ -205,7 +210,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: DataView", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval(
         "(() => { const ab = new ArrayBuffer(4); const dv = new DataView(ab); dv.setUint32(0, 0x01020304, false); return dv; })()",
@@ -218,7 +223,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: Map (primitive keys only)", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval("new Map([['a', 1], [2, 'b'], [true, false]])");
       expectMapEq(out, [
@@ -232,7 +237,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: Map (primitive keys only)", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const m = new Map<any, any>([
         ["a", 1],
@@ -250,7 +255,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: Set", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval("new Set([1, 'a', true])");
       expectSetEq(out, [1, "a", true]);
@@ -260,7 +265,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: Set", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const s = new Set<any>([1, "a", true]);
       await dw.setGlobal("s", s);
@@ -274,7 +279,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: Error (name/message/stack/cause best-effort)", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const out = await dw.eval(
         "(() => { const cause = new TypeError('root'); const e = new Error('top', { cause }); e.name = 'MyError'; return e; })()",
@@ -284,9 +289,10 @@ describe("bridge: expanded types", () => {
       expect(out.message).toBe("top");
 
       // cause is best-effort. If implemented, it should be Error-like.
-      if ((out as any).cause != null) {
-        expect((out as any).cause).toBeInstanceOf(Error);
-        expect(String((out as any).cause.message)).toBe("root");
+      const errWithCause = out as Error & { cause?: unknown };
+      if (errWithCause.cause != null) {
+        expect(errWithCause.cause).toBeInstanceOf(Error);
+        expect(String((errWithCause.cause as Error).message)).toBe("root");
       }
     } finally {
       await dw.close();
@@ -294,7 +300,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Deno -> Node: URL + URLSearchParams", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const url = await dw.eval("new URL('https://example.com/a?b=c')");
       expect(url).toBeInstanceOf(URL);
@@ -312,7 +318,7 @@ describe("bridge: expanded types", () => {
   });
 
   test("Node -> Deno: URL + URLSearchParams", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const url = new URL("https://example.com/a?b=c");
       await dw.setGlobal("u", url);

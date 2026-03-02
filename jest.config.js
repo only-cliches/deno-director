@@ -8,6 +8,7 @@ module.exports = {
   roots: ["<rootDir>/src", "<rootDir>/test-ts"],
 
   testMatch: ["<rootDir>/test-ts/**/*.spec.ts"],
+  setupFilesAfterEnv: ["<rootDir>/test-ts/jest.setup.ts"],
 
   // Extra safety: regex ignores (do not rely on <rootDir> substitution here)
   testPathIgnorePatterns: ["/node_modules/", "/target/", "/build/", "/out/", "/coverage/"],

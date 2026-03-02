@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -10,7 +11,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("receives messages from the worker", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const messages: any[] = [];
 
     dw.on("message", (msg: any) => messages.push(msg));
@@ -22,7 +23,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("swallows exceptions thrown in Node message handlers and continues delivering", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const seen: any[] = [];
 
     dw.on("message", (msg: any) => {
@@ -41,7 +42,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("dispatches Node -> worker messages to both on('message') and addEventListener('message')", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     await dw.eval(`
       globalThis.count = 0;
@@ -56,7 +57,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("worker addEventListener('message') receives Node postMessage", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     await dw.eval(`
       globalThis.receivedA = null;
@@ -74,7 +75,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("worker postMessage is aliased to hostPostMessage (worker -> Node)", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const messages: any[] = [];
 
     dw.on("message", (msg: any) => messages.push(msg));
@@ -86,7 +87,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("sends messages to the worker", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     await dw.eval(`
       globalThis.received = null;
@@ -100,7 +101,7 @@ describe("deno_worker: messaging", () => {
   });
 
   it("round-trips recursive message graphs", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const seen: any[] = [];
     dw.on("message", (msg: any) => seen.push(msg));
 

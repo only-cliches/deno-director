@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 function makeTempDir(prefix = "deno-director-imports-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -35,7 +36,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:false blocks static import",
   //   async () => {
-  //     dw = new DenoWorker({ imports: false });
+  //     dw = createTestWorker({ imports: false });
 
   //     const src = `
   //       import x from "file:///does_not_matter.js";
@@ -50,7 +51,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:false blocks dynamic import()",
   //   async () => {
-  //     dw = new DenoWorker({ imports: false });
+  //     dw = createTestWorker({ imports: false });
 
   //     const src = `
   //       const m = await import("file:///does_not_matter.js");
@@ -74,7 +75,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     `
   //     );
 
-  //     dw = new DenoWorker({ imports: true });
+  //     dw = createTestWorker({ imports: true });
 
   //     const src = `
   //       import x from ${JSON.stringify(toFileUrl(modPath))};
@@ -98,7 +99,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     `
   //     );
 
-  //     dw = new DenoWorker({ imports: true });
+  //     dw = createTestWorker({ imports: true });
 
   //     const src = `
   //       const m = await import(${JSON.stringify(toFileUrl(modPath))});
@@ -113,7 +114,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:sync callback returning source intercepts static import",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier === "virtual:sync-static") {
   //           return { js: `export default "OK_SYNC_STATIC";` };
@@ -135,7 +136,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:sync callback returning source intercepts dynamic import()",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier === "virtual:sync-dynamic") {
   //           return { js: `export default "OK_SYNC_DYNAMIC";` };
@@ -157,7 +158,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:async callback returning source intercepts static import",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: async (specifier: string) => {
   //         if (specifier === "virtual:async-static") {
   //           return { js: `export default "OK_ASYNC_STATIC";` };
@@ -179,7 +180,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:async callback returning source intercepts dynamic import()",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: async (specifier: string) => {
   //         if (specifier === "virtual:async-dynamic") {
   //           return { js: `export default "OK_ASYNC_DYNAMIC";` };
@@ -201,7 +202,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:sync callback returning false blocks module load",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier === "virtual:block") return false;
   //         return true;
@@ -221,7 +222,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:async callback returning false blocks module load",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: async (specifier: string) => {
   //         if (specifier === "virtual:block-async") return false;
   //         return true;
@@ -245,7 +246,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     const modPath = path.join(dir, "fallback.js");
   //     writeFile(modPath, `export default "DISK_OK_STATIC";`);
 
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: () => true,
   //     });
 
@@ -266,7 +267,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     const modPath = path.join(dir, "fallback.js");
   //     writeFile(modPath, `export default "DISK_OK_DYNAMIC";`);
 
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: async () => true,
   //     });
 
@@ -285,7 +286,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //   async () => {
   //     const seen: Array<{ specifier: string; referrer?: string }> = [];
 
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string, referrer?: string) => {
   //         seen.push({ specifier, referrer });
   //         if (specifier === "virtual:referrer") return { js: `export default 1;` };
@@ -314,7 +315,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     writeFile(path.join(dir, "dep.js"), `export default "FROM_CWD";`);
 
-  //     dw = new DenoWorker({ imports: true });
+  //     dw = createTestWorker({ imports: true });
 
   //     const src = `
   //       import x from "./dep.js";
@@ -334,7 +335,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     writeFile(path.join(dir, "dep.js"), `export default "FROM_CWD_DYNAMIC";`);
 
-  //     dw = new DenoWorker({ imports: true });
+  //     dw = createTestWorker({ imports: true });
 
   //     const src = `
   //       const m = await import("./dep.js");
@@ -352,7 +353,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     const dir = makeTempDir();
   //     writeFile(path.join(dir, "dep.js"), `export default "FROM_CWD_OPT";`);
 
-  //     dw = new DenoWorker({ imports: true, cwd: dir });
+  //     dw = createTestWorker({ imports: true, cwd: dir });
 
   //     const src = `
   //       import x from "./dep.js";
@@ -370,7 +371,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     const dir = makeTempDir();
   //     writeFile(path.join(dir, "dep.js"), `export default "FROM_CWD_OPT_DYNAMIC";`);
 
-  //     dw = new DenoWorker({ imports: true, cwd: dir });
+  //     dw = createTestWorker({ imports: true, cwd: dir });
 
   //     const src = `
   //       const m = await import("./dep.js");
@@ -390,7 +391,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const fileUrl = toFileUrl(dir + (dir.endsWith(path.sep) ? "" : path.sep));
 
-  //     dw = new DenoWorker({ imports: true, cwd: fileUrl });
+  //     dw = createTestWorker({ imports: true, cwd: fileUrl });
 
   //     const src = `
   //       import x from "./dep.js";
@@ -409,7 +410,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:async callback can return a Promise that resolves to source (static)",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier !== "virtual:promise-static") return false;
   //         return Promise.resolve({ js: `export default "OK_PROMISE_STATIC";` });
@@ -429,7 +430,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:async callback can return a Promise that resolves to source (dynamic)",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier !== "virtual:promise-dynamic") return false;
   //         return Promise.resolve({ js: `export default "OK_PROMISE_DYNAMIC";` });
@@ -449,7 +450,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:callback Promise rejection blocks module load",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier !== "virtual:reject") return false;
   //         return Promise.reject(new Error("nope"));
@@ -469,7 +470,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:callback throw blocks module load",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier === "virtual:throw") throw new Error("boom");
   //         return false;
@@ -493,7 +494,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     const target = path.join(dir, "resolved.js");
   //     writeFile(target, `export default "RESOLVED_STATIC";`);
 
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier === "virtual:resolve-static") return { resolve: toFileUrl(target) };
   //         return false;
@@ -517,7 +518,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //     const target = path.join(dir, "resolved.js");
   //     writeFile(target, `export default "RESOLVED_DYNAMIC";`);
 
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: async (specifier: string) => {
   //         if (specifier === "virtual:resolve-dynamic") return { resolve: toFileUrl(target) };
   //         return false;
@@ -537,7 +538,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:callback { resolve: \"\" } blocks module load",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         if (specifier === "virtual:resolve-empty") return { resolve: "" };
   //         return true;
@@ -559,7 +560,7 @@ describe("deno_worker: imports/module loader combinations", () => {
   //   async () => {
   //     const seen: string[] = [];
 
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       imports: (specifier: string) => {
   //         seen.push(specifier);
   //         if (specifier === "virtual:dep") return { js: `export default "DEP";` };
@@ -590,9 +591,9 @@ describe("deno_worker: imports/module loader combinations", () => {
   // it(
   //   "imports:callback returning non-recognized object blocks module load",
   //   async () => {
-  //     dw = new DenoWorker({
+  //     dw = createTestWorker({
   //       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  //       imports: (_specifier: string) => ({ nope: 123 } as any),
+  //       imports: (_specifier: string) => ({ nope: 123 }),
   //     });
 
   //     const src = `

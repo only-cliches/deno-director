@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 describe("deno_worker: runtime-local env namespace", () => {
   const key = `TEST_ENV_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -12,11 +13,11 @@ describe("deno_worker: runtime-local env namespace", () => {
   });
 
   test("startup env is isolated per worker", async () => {
-    const dw1 = new DenoWorker({
+    const dw1 = createTestWorker({
       env: { [key]: "from-worker-1" },
       permissions: { env: true },
     });
-    const dw2 = new DenoWorker({
+    const dw2 = createTestWorker({
       permissions: { env: true },
     });
     workers.push(dw1, dw2);
@@ -26,8 +27,8 @@ describe("deno_worker: runtime-local env namespace", () => {
   });
 
   test("Deno.env.set/delete are isolated across running workers", async () => {
-    const dw1 = new DenoWorker({ permissions: { env: true } });
-    const dw2 = new DenoWorker({ permissions: { env: true } });
+    const dw1 = createTestWorker({ permissions: { env: true } });
+    const dw2 = createTestWorker({ permissions: { env: true } });
     workers.push(dw1, dw2);
 
     await dw1.eval(`Deno.env.set("${key}", "v1")`);
@@ -46,8 +47,8 @@ describe("deno_worker: runtime-local env namespace", () => {
   });
 
   test("toObject reflects only the current worker namespace", async () => {
-    const dw1 = new DenoWorker({ permissions: { env: true } });
-    const dw2 = new DenoWorker({ permissions: { env: true } });
+    const dw1 = createTestWorker({ permissions: { env: true } });
+    const dw2 = createTestWorker({ permissions: { env: true } });
     workers.push(dw1, dw2);
 
     await dw1.eval(`Deno.env.set("${key}", "local")`);
@@ -57,7 +58,7 @@ describe("deno_worker: runtime-local env namespace", () => {
   });
 
   test("restart discards runtime-local env mutations and reapplies startup env", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       permissions: { env: true },
       env: { [key]: "boot" },
     });

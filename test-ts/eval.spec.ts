@@ -1,10 +1,14 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 describe("deno_worker: eval", () => {
   let dw: DenoWorker;
 
   beforeEach(() => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
   });
 
   afterEach(async () => {
@@ -16,17 +20,17 @@ describe("deno_worker: eval", () => {
   });
 
   it("args provided but evaluated value is not a function: returns value (ignores args)", async () => {
-    await expect(dw.eval("123", { args: [1, 2, 3] } as any)).resolves.toBe(123);
+    await expect(dw.eval("123", { args: [1, 2, 3] })).resolves.toBe(123);
   });
 
   it(
     "evalSync honors maxEvalMs and returns promptly on runaway scripts",
     async () => {
       await dw.close();
-      dw = new DenoWorker({ maxEvalMs: 5_000 } as any);
+      dw = createTestWorker({ maxEvalMs: 5_000 });
 
       const started = Date.now();
-      expect(() => dw.evalSync("while (true) {}", { maxEvalMs: 25 } as any)).toThrow();
+      expect(() => dw.evalSync("while (true) {}", { maxEvalMs: 25 })).toThrow();
       const elapsed = Date.now() - started;
 
       expect(elapsed).toBeLessThan(2_000);
@@ -101,13 +105,41 @@ describe("deno_worker: eval", () => {
     expect(dw.lastExecutionStats?.evalTimeMs).toEqual(expect.any(Number));
   });
 
+  it("transpiles TypeScript for eval and evalSync when top-level transpileTs is enabled", async () => {
+    await dw.close();
+    dw = createTestWorker({
+      transpileTs: true,
+    });
+
+    await expect(dw.eval("const n: number = 41; n + 1;")).resolves.toBe(42);
+    expect(dw.evalSync("const n: number = 2; n + 3;")).toBe(5);
+  });
+
+  it("writes transpile cache entries when tsCompiler.cacheDir is set", async () => {
+    await dw.close();
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "deno-director-ts-cache-"));
+
+    dw = createTestWorker({
+      transpileTs: true,
+      tsCompiler: { cacheDir },
+    });
+
+    try {
+      await expect(dw.eval("const n: number = 7; n + 1;")).resolves.toBe(8);
+      const entries = fs.readdirSync(cacheDir);
+      expect(entries.length).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
   it(
     "per-eval maxEvalMs overrides global maxEvalMs for that call only",
     async () => {
       await dw.close();
-      dw = new DenoWorker({ maxEvalMs: 5_000 } as any);
+      dw = createTestWorker({ maxEvalMs: 5_000 });
 
-      const err1 = await dw.eval("while (true) {}", { maxEvalMs: 25 } as any).catch((e) => e);
+      const err1 = await dw.eval("while (true) {}", { maxEvalMs: 25 }).catch((e) => e);
       expect(err1).toBeTruthy();
 
       await expect(dw.eval("1 + 1")).resolves.toBe(2);
@@ -119,7 +151,7 @@ describe("deno_worker: eval", () => {
     "per-eval maxEvalMs can be longer than global (overrides for that call)",
     async () => {
       await dw.close();
-      dw = new DenoWorker({ maxEvalMs: 25 } as any);
+      dw = createTestWorker({ maxEvalMs: 25 });
 
       await expect(
         dw.eval(
@@ -127,8 +159,7 @@ describe("deno_worker: eval", () => {
         const start = Date.now();
         while (Date.now() - start < 75) {}
         123;
-        `,
-          { maxEvalMs: 500 } as any
+        `, { maxEvalMs: 500  }
         )
       ).resolves.toBe(123);
 
@@ -142,9 +173,9 @@ describe("deno_worker: eval", () => {
     "per-eval maxEvalMs overrides global maxEvalMs for that call only (and does not poison subsequent evals)",
     async () => {
       await dw.close();
-      dw = new DenoWorker({ maxEvalMs: 5_000 } as any);
+      dw = createTestWorker({ maxEvalMs: 5_000 });
 
-      const err1 = await dw.eval("while (true) {}", { maxEvalMs: 25 } as any).catch((e) => e);
+      const err1 = await dw.eval("while (true) {}", { maxEvalMs: 25 }).catch((e) => e);
       expect(err1).toBeTruthy();
 
       await expect(dw.eval("1 + 1")).resolves.toBe(2);

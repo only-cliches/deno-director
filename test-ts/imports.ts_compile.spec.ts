@@ -1,11 +1,12 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 describe("imports callback ts/tsx/jsx + dynamic flag", () => {
   test("imports callback receives isDynamicImport for static and dynamic loads", async () => {
     const seen: Array<{ specifier: string; isDynamicImport?: boolean }> = [];
 
-    const dw = new DenoWorker({
-      moduleLoader: { transpileTs: true },
+    const dw = createTestWorker({
+      transpileTs: true,
       permissions: { import: true },
       imports: (specifier: string, _referrer?: string, isDynamicImport?: boolean) => {
         seen.push({ specifier, isDynamicImport });
@@ -19,7 +20,7 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
 
         return false;
       },
-    } as any);
+    });
 
     try {
       const out = await dw.evalModule(`
@@ -28,8 +29,9 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
         export const result = [s, d.default];
       `);
 
-      const first = (out as any)?.result?.[0];
-      const second = (out as any)?.result?.[1];
+      const resultOut = out as { result?: unknown[] };
+      const first = resultOut?.result?.[0];
+      const second = resultOut?.result?.[1];
       expect([first, second]).toEqual([1, 2]);
 
       const staticCall = seen.find((x) => x.specifier === "virtual:static");
@@ -45,8 +47,8 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
   });
 
   test("imports callback can return { ts }", async () => {
-    const dw = new DenoWorker({
-      moduleLoader: { transpileTs: true },
+    const dw = createTestWorker({
+      transpileTs: true,
       permissions: { import: true },
       imports: (specifier: string) => {
         if (specifier !== "virtual:typed-ts") return false;
@@ -57,7 +59,7 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
           `,
         };
       },
-    } as any);
+    });
 
     try {
       await expect(
@@ -72,8 +74,8 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
   });
 
   test("imports callback { ts } rejects with guidance when transpileTs is disabled", async () => {
-    const dw = new DenoWorker({
-      moduleLoader: { transpileTs: false },
+    const dw = createTestWorker({
+      transpileTs: false,
       permissions: { import: true },
       imports: (specifier: string) => {
         if (specifier !== "virtual:typed-ts-disabled") return false;
@@ -84,7 +86,7 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
           `,
         };
       },
-    } as any);
+    });
 
     try {
       await expect(
@@ -92,21 +94,19 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
           import v from "virtual:typed-ts-disabled";
           export const out = v;
         `),
-      ).rejects.toThrow(/moduleLoader:\s*\{\s*transpileTs:\s*true\s*\}/i);
+      ).rejects.toThrow(/transpileTs:\s*true/i);
     } finally {
       await dw.close();
     }
   });
 
   test("imports callback can return { tsx } with tsCompiler jsxFactory settings", async () => {
-    const dw = new DenoWorker({
-      moduleLoader: {
-        transpileTs: true,
-        tsCompiler: {
-          jsx: "react",
-          jsxFactory: "h",
-          jsxFragmentFactory: "Fragment",
-        },
+    const dw = createTestWorker({
+      transpileTs: true,
+      tsCompiler: {
+        jsx: "react",
+        jsxFactory: "h",
+        jsxFragmentFactory: "Fragment",
       },
       permissions: { import: true },
       imports: (specifier: string) => {
@@ -130,7 +130,7 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
           `,
         };
       },
-    } as any);
+    });
 
     try {
       await expect(
@@ -145,14 +145,12 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
   });
 
   test("imports callback can return { jsx } with tsCompiler jsxFactory settings", async () => {
-    const dw = new DenoWorker({
-      moduleLoader: {
-        transpileTs: true,
-        tsCompiler: {
-          jsx: "react",
-          jsxFactory: "h",
-          jsxFragmentFactory: "Fragment",
-        },
+    const dw = createTestWorker({
+      transpileTs: true,
+      tsCompiler: {
+        jsx: "react",
+        jsxFactory: "h",
+        jsxFragmentFactory: "Fragment",
       },
       permissions: { import: true },
       imports: (specifier: string) => {
@@ -168,7 +166,7 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
           `,
         };
       },
-    } as any);
+    });
 
     try {
       await expect(

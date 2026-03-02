@@ -1,6 +1,6 @@
 {
   "name": "deno-director",
-  "version": "0.8.3",
+  "version": "0.8.5",
   "description": "High-performance Node.js <-> Deno bridge with native worker isolation, fast binary channels, and rich type-safe cross-runtime messaging.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -10,7 +10,8 @@
     "build-release": "npm run build -- --release && tsc --project tsconfig.idx.json",
     "test-txt": "jest --verbose --silent=false &> test_results.txt",
     "test-json": "jest --json > test_results.json",
-    "test": "cargo test && jest"
+    "test": "npm run test:guard:any && cargo test && jest",
+    "test:guard:any": "bash codex/check-test-any.sh"
   },
   "keywords": [
     "deno",

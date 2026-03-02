@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -20,7 +21,7 @@ describe("deno_worker: modules", () => {
   });
 
   it("evaluates ES modules and returns namespace exports", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const code = `
       export const x = 10;
       export const y = 10;
@@ -30,7 +31,7 @@ describe("deno_worker: modules", () => {
   });
 
   it("supports top-level await in modules", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const code = `
       const v = await Promise.resolve(42);
       export const out = v;
@@ -48,7 +49,7 @@ describe("deno_worker: modules", () => {
           "utf8"
         );
 
-        dw = new DenoWorker({ cwd: dir, imports: true } as any);
+        dw = createTestWorker({ cwd: dir, imports: true });
 
         const code = `
           import { x, add } from "./dep.js";
@@ -65,7 +66,7 @@ describe("deno_worker: modules", () => {
     "module import failures surface as rejections",
     async () => {
       await withTempDir(async (dir) => {
-        dw = new DenoWorker({ cwd: dir, imports: true } as any);
+        dw = createTestWorker({ cwd: dir, imports: true });
 
         const code = `
           import "./does_not_exist.js";
@@ -80,7 +81,7 @@ describe("deno_worker: modules", () => {
 
   it("getModule loads through imports callback and returns callable namespace", async () => {
     const seen: string[] = [];
-    dw = new DenoWorker({
+    dw = createTestWorker({
       imports: (specifier: string) => {
         seen.push(specifier);
         if (specifier === "virtual:math") {
@@ -95,7 +96,7 @@ describe("deno_worker: modules", () => {
         }
         return false;
       },
-    } as any);
+    });
 
     const mod = await dw.getModule("virtual:math");
     expect(seen).toContain("virtual:math");
@@ -106,7 +107,7 @@ describe("deno_worker: modules", () => {
   });
 
   it("getModule propagates import rejection", async () => {
-    dw = new DenoWorker({ imports: false } as any);
+    dw = createTestWorker({ imports: false });
     await expect(dw.getModule("virtual:nope")).rejects.toBeDefined();
   });
 });

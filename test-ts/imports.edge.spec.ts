@@ -1,7 +1,6 @@
 // test-ts/imports.edge.spec.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -19,10 +18,10 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback returning undefined blocks", async () => {
     const dir = await mkTempDir("denojs-worker-imports-undef-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
-      imports: () => undefined as any,
-    } as any);
+      imports: (() => undefined) as unknown as ((specifier: string) => boolean),
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 7;\n");
@@ -42,10 +41,10 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback returning null blocks", async () => {
     const dir = await mkTempDir("denojs-worker-imports-null-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
-      imports: () => null as any,
-    } as any);
+      imports: (() => null) as unknown as ((specifier: string) => boolean),
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 7;\n");
@@ -65,10 +64,10 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback returning non-supported primitive blocks", async () => {
     const dir = await mkTempDir("denojs-worker-imports-prim-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
-      imports: () => 123 as any,
-    } as any);
+      imports: (() => 123) as unknown as ((specifier: string) => boolean),
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 7;\n");
@@ -88,10 +87,10 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback Promise<boolean>: true allows disk resolution", async () => {
     const dir = await mkTempDir("denojs-worker-imports-allow-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: async () => true,
-    } as any);
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 7;\n");
@@ -111,10 +110,10 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback Promise<boolean>: false blocks", async () => {
     const dir = await mkTempDir("denojs-worker-imports-block-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: async () => false,
-    } as any);
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 7;\n");
@@ -134,13 +133,13 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback Promise<resolve>: can rewrite relative specifiers", async () => {
     const dir = await mkTempDir("denojs-worker-imports-rewrite-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: async (specifier: string) => {
         if (specifier === "./alias") return { resolve: "./a.js" };
         return true;
       },
-    } as any);
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 123;\n");
@@ -160,10 +159,10 @@ describe("DenoWorker imports callback edge cases", () => {
   test("callback Promise<resolve>: empty resolve string blocks", async () => {
     const dir = await mkTempDir("denojs-worker-imports-rewrite-empty-");
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: async () => ({ resolve: "   " }),
-    } as any);
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 123;\n");
@@ -184,13 +183,13 @@ describe("DenoWorker imports callback edge cases", () => {
     const dir = await mkTempDir("denojs-worker-imports-restart-");
     let count = 0;
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: async () => {
         count += 1;
         return true;
       },
-    } as any);
+    });
 
     try {
       await writeFile(path.join(dir, "a.js"), "export default 9;\n");

@@ -2,7 +2,7 @@ use deno_core::url::Url;
 use deno_fs::{FileSystem, FsFileType, OpenOptions, RealFs};
 use deno_io::fs::FsResult;
 use deno_permissions::{CheckedPath, CheckedPathBuf};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -533,6 +533,50 @@ pub fn normalize_cwd(raw: Option<&str>) -> PathBuf {
 pub fn dir_url_from_path(p: &Path) -> Url {
     Url::from_directory_path(p).unwrap_or_else(|_| Url::parse("file:///").expect("file url"))
 }
+
+pub fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let mut has_root = false;
+
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(last) = parts.last() {
+                    if last != ".." {
+                        let _ = parts.pop();
+                        continue;
+                    }
+                }
+                if !has_root {
+                    parts.push(std::ffi::OsString::from(".."));
+                }
+            }
+            Component::Normal(seg) => parts.push(seg.to_os_string()),
+        }
+    }
+
+    if has_root {
+        out.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+    }
+    for part in parts {
+        out.push(part);
+    }
+
+    if out.as_os_str().is_empty() {
+        if has_root {
+            PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+        } else {
+            PathBuf::from(".")
+        }
+    } else {
+        out
+    }
+}
+
 pub fn sandboxed_path_list(root: &Path, items: &[String]) -> Vec<String> {
     let root_abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut out = Vec::with_capacity(items.len());
@@ -556,6 +600,7 @@ pub fn sandboxed_path_list(root: &Path, items: &[String]) -> Vec<String> {
         };
 
         let abs = std::fs::canonicalize(&p).unwrap_or(p);
+        let abs = normalize_lexical_path(&abs);
         if abs.starts_with(&root_abs) {
             out.push(abs.to_string_lossy().to_string());
         }
@@ -565,7 +610,10 @@ pub fn sandboxed_path_list(root: &Path, items: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dir_url_from_path, normalize_cwd, normalize_startup_url, sandboxed_path_list};
+    use super::{
+        dir_url_from_path, normalize_cwd, normalize_lexical_path, normalize_startup_url,
+        sandboxed_path_list,
+    };
     use std::path::{Path, PathBuf};
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -684,6 +732,33 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("inside.js"));
 
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside_root);
+    }
+
+    #[test]
+    fn normalize_lexical_path_collapses_parent_segments() {
+        let p = PathBuf::from("/tmp/a/../b/./c");
+        let out = normalize_lexical_path(&p);
+        assert_eq!(out, PathBuf::from("/tmp/b/c"));
+    }
+
+    #[test]
+    fn sandboxed_path_list_blocks_lexical_escape_for_nonexistent_paths() {
+        let root = unique_temp_dir("sandbox-lexical-root");
+        let outside_root = unique_temp_dir("sandbox-lexical-outside");
+        let outside_target = outside_root.join("escaped.txt");
+
+        let rel_escape = Path::new("..")
+            .join(outside_root.file_name().expect("outside basename"))
+            .join("escaped.txt")
+            .to_string_lossy()
+            .to_string();
+
+        let out = sandboxed_path_list(&root, &[rel_escape]);
+        assert_eq!(out.len(), 0);
+
+        let _ = std::fs::write(outside_target, "x");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside_root);
     }

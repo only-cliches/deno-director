@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 function isBindPermissionError(err: any): boolean {
   const msg = String(err?.message ?? err ?? "");
@@ -44,8 +45,23 @@ async function makeTempCacheDir(prefix = "deno-director-remote-cache-"): Promise
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
-describe("moduleLoader.denoRemote MVP", () => {
-  test("remote http import is blocked when denoRemote is disabled", async () => {
+async function withHardTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  return await Promise.race([
+    p,
+    (async () => {
+      await new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms);
+      });
+      throw new Error(`test hard-timeout after ${ms}ms`);
+    })(),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+describe("moduleLoader.httpsResolve MVP", () => {
+  test("remote http import is blocked when httpResolve is disabled", async () => {
     let srv: { base: string; close: () => Promise<void> } | undefined;
     try {
       srv = await startServer({
@@ -56,7 +72,7 @@ describe("moduleLoader.denoRemote MVP", () => {
       throw e;
     }
 
-    const dw = new DenoWorker({ imports: true });
+    const dw = createTestWorker({ imports: true });
     try {
       const src = `
         import { Application } from "${srv.base}/oak/mod.ts";
@@ -69,7 +85,7 @@ describe("moduleLoader.denoRemote MVP", () => {
     }
   });
 
-  test("remote ts import works with denoRemote+transpileTs", async () => {
+  test("remote ts import works with httpsResolve+transpileTs", async () => {
     let srv: { base: string; close: () => Promise<void> } | undefined;
     const cacheDir = await makeTempCacheDir();
     try {
@@ -85,11 +101,12 @@ describe("moduleLoader.denoRemote MVP", () => {
       throw e;
     }
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       imports: true,
-      moduleLoader: { denoRemote: true, transpileTs: true, cacheDir },
+      transpileTs: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true, cacheDir },
       permissions: { import: true, net: true },
-    } as any);
+    });
 
     try {
       const src = `
@@ -104,7 +121,7 @@ describe("moduleLoader.denoRemote MVP", () => {
     }
   });
 
-  test("denoRemote implicitly enables imports when imports is not set", async () => {
+  test("httpsResolve implicitly enables imports when imports is not set", async () => {
     let srv: { base: string; close: () => Promise<void> } | undefined;
     const cacheDir = await makeTempCacheDir();
     try {
@@ -116,10 +133,11 @@ describe("moduleLoader.denoRemote MVP", () => {
       throw e;
     }
 
-    const dw = new DenoWorker({
-      moduleLoader: { denoRemote: true, transpileTs: true, cacheDir },
+    const dw = createTestWorker({
+      transpileTs: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true, cacheDir },
       permissions: { import: true, net: true },
-    } as any);
+    });
 
     try {
       const src = `
@@ -146,11 +164,12 @@ describe("moduleLoader.denoRemote MVP", () => {
       throw e;
     }
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       imports: true,
-      moduleLoader: { denoRemote: true, transpileTs: false, cacheDir },
+      transpileTs: false,
+      moduleLoader: { httpsResolve: true, httpResolve: true, cacheDir },
       permissions: { import: true, net: true },
-    } as any);
+    });
 
     try {
       const src = `
@@ -162,6 +181,118 @@ describe("moduleLoader.denoRemote MVP", () => {
       if (!dw.isClosed()) await dw.close();
       await srv.close();
       await fs.rm(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  test("callback import path still enforces net/import permissions for remote URLs", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/oak/mod.ts": `export const v: string = "ok";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const dw = createTestWorker({
+      imports: () => true,
+      transpileTs: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true },
+      permissions: { import: true, net: false },
+    });
+
+    try {
+      const src = `
+        import { v } from "${srv.base}/oak/mod.ts";
+        export const out = v;
+      `;
+      await expect(dw.evalModule(src)).rejects.toBeTruthy();
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+      await srv.close();
+    }
+  });
+
+  test("imports callback promise timeout rejects instead of hanging", async () => {
+    const dw = createTestWorker({
+      imports: async () => await new Promise(() => {}),
+    });
+
+    try {
+      const src = `
+        import { x } from "virtual:never";
+        export const out = x;
+      `;
+      await expect(withHardTimeout(dw.evalModule(src), 7000)).rejects.toBeTruthy();
+    } finally {
+      if (!dw.isClosed()) await dw.close({ force: true }).catch(() => undefined);
+    }
+  }, 12000);
+
+  test("jsr specifier is blocked when jsrResolve is disabled", async () => {
+    const dw = createTestWorker({
+      imports: true,
+      moduleLoader: { httpsResolve: true, jsrResolve: false },
+      permissions: { import: true, net: true },
+    });
+
+    try {
+      const src = `
+        import { assert } from "jsr:@std/assert";
+        export const out = typeof assert;
+      `;
+      await expect(dw.evalModule(src)).rejects.toBeTruthy();
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("jsrResolve maps @std/* to jsr.io and still enforces net permissions", async () => {
+    const dw = createTestWorker({
+      imports: true,
+      moduleLoader: { httpsResolve: true, jsrResolve: true },
+      permissions: { import: true, net: false },
+    });
+
+    try {
+      const src = `
+        import { assert } from "@std/assert";
+        export const out = typeof assert;
+      `;
+      await expect(withHardTimeout(dw.evalModule(src), 12000)).rejects.toThrow(/jsr\.io/i);
+    } finally {
+      if (!dw.isClosed()) await dw.close().catch(() => undefined);
+    }
+  }, 20000);
+
+  test("remote payload is rejected when it exceeds maxPayloadBytes", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/big/mod.ts": `export const data = "${"x".repeat(8192)}";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const dw = createTestWorker({
+      imports: true,
+      transpileTs: true,
+      moduleLoader: { httpResolve: true, maxPayloadBytes: 1024 },
+      permissions: { import: true, net: true },
+    });
+
+    try {
+      const src = `
+        import { data } from "${srv.base}/big/mod.ts";
+        export const out = data.length;
+      `;
+      await expect(dw.evalModule(src)).rejects.toThrow(/payload too large/i);
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+      await srv.close();
     }
   });
 });

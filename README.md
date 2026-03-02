@@ -19,7 +19,7 @@ Whether you are building a multi-tenant edge-compute platform, executing untrust
 * **Zero-Serialization Friction:** Unlike standard IPC, Deno Director uses a highly optimized native bridge. Pass `Map`, `Set`, `ArrayBuffer`, `Date`, `RegExp`, native `Error` objects, **recursive values**, and even **Functions** across the Node/Deno boundary without losing fidelity.
 * **Wield Host Functions:** Pass a Node.js function *into* the Deno sandbox. Call it from Deno, and it executes in Node. Synchronously or asynchronously.
 * **Ironclad Sandboxing:** Every worker is a Deno isolate. You have absolute control over `read`, `write`, `net`, `env`, and `ffi` permissions. Lock it down.
-* **Native TypeScript & JSX:** Evaluate `.ts` and `.tsx` files directly. No build step required. Deno Director handles transpilation on the fly.
+* **Native TypeScript & JSX:** Evaluate TS/JSX directly in `eval`, `evalSync`, `evalModule`, and import pipelines. No build step required. Deno Director handles transpilation on the fly.
 * **Fleet Orchestration:** Spin up thousands of runtimes. Tag them, label them, and manage their lifecycles seamlessly with the built-in `DenoDirector` orchestration class.
 * **Telemetry:** Extract granular V8 heap space statistics and exact CPU/Wall-clock execution times for every script evaluation.
 
@@ -46,9 +46,11 @@ npm install deno-director
 import { DenoWorker } from "deno-director";
 
 // 1. Boot a locked-down V8 isolate
-// Deno cannot touch the network or the disk. It only knows what we feed it.
 const worker = new DenoWorker({
-    permissions: { net: false, read: false, env: false }
+    // Deno cannot touch the network or the disk. It only knows what we feed it.
+    permissions: { net: false, read: false, env: false },
+    // automatically compile any TS provided to the runtime.
+    transpileTs: true
 });
 
 // 2. Drop an ASYNC Node.js function into Deno's global scope
@@ -68,7 +70,10 @@ const sandbox = await worker.evalModule(`
         console.log(\`[Deno] Initiating secure processing for \${userId}...\`);
 
         // Call the async Node.js function from inside the isolated Deno sandbox
-        const rawData = await globalThis.hostFetchData(userId);
+        const rawData: {  // TS is OK!
+          id: string,
+          secret: string 
+        } = await globalThis.hostFetchData(userId);
         
         // Return the processed data back to Node
         return { 
@@ -185,7 +190,7 @@ import { DenoWorker } from "deno-director";
 const moduleCache = new Map<string, string>();
 
 const worker = new DenoWorker({
-  moduleLoader: { transpileTs: true }, // We want Deno to handle our TS/JSX
+  transpileTs: true, // We want Deno Director to transpile TS/JSX
   
   // The ultimate import interceptor
   imports: async (specifier, referrer, isDynamicImport) => {
@@ -300,6 +305,97 @@ const customWorker = new DenoWorker({
 ```
 ---
 
+### 🧩 nodeCompat and nodeResolve Examples
+
+Use `nodeCompat` when you want broader Node compatibility behavior, and `moduleLoader.nodeResolve` when you specifically want Node-style package resolution.
+
+```ts
+import { DenoWorker } from "deno-director";
+
+// Example 1: broader Node compatibility mode
+const compatWorker = new DenoWorker({
+  nodeCompat: true,
+  imports: true,
+  moduleLoader: { nodeResolve: true },
+});
+
+const compatOut = await compatWorker.evalModule(`
+  import path from "path";
+  export const out = path.join("a", "b");
+`);
+console.log(compatOut.out); // "a/b" (platform-dependent separators may vary)
+
+await compatWorker.close();
+
+// Example 2: targeted Node-style resolver only
+const resolveWorker = new DenoWorker({
+  imports: true,
+  moduleLoader: { nodeResolve: true },
+});
+
+const resolveOut = await resolveWorker.evalModule(`
+  import pkg from "some-installed-package";
+  export const name = typeof pkg;
+`);
+console.log(resolveOut.name);
+
+await resolveWorker.close();
+```
+
+### 🌊 Streaming Across the Bridge
+
+You can stream byte chunks between Node and the worker runtime in both directions.
+
+```ts
+import { DenoWorker } from "deno-director";
+
+const worker = new DenoWorker();
+const upload = worker.stream.create();
+const uploadKey = upload.getKey();
+const downloadKey = crypto.randomUUID();
+
+await worker.eval(`
+  async (uploadKey, downloadKey) => {
+    const inStream = await hostStreams.accept(uploadKey);
+    for await (const _chunk of inStream) {}
+
+    const outStream = hostStreams.create(downloadKey);
+    await outStream.write(new TextEncoder().encode("ok"));
+    await outStream.close();
+  }
+`, { args: [uploadKey, downloadKey] });
+
+// Node -> worker
+await upload.write(new TextEncoder().encode("hello "));
+await upload.write(new TextEncoder().encode("world"));
+await upload.close();
+
+// worker -> Node
+const reader = await worker.stream.accept(downloadKey);
+for await (const chunk of reader) {
+  console.log("download chunk bytes:", chunk.byteLength);
+}
+
+await worker.close();
+```
+
+Inside worker code:
+
+```ts
+// Keys can be injected via eval args.
+// Example eval src:
+// async (uploadKey, downloadKey) => { ... }
+const inStream = await hostStreams.accept(uploadKey);
+for await (const chunk of inStream) {
+  // chunk is Uint8Array
+}
+
+// Use the generated download key passed in from host
+const outStream = hostStreams.create(downloadKey);
+await outStream.write(new TextEncoder().encode("ok"));
+await outStream.close();
+```
+
 ### 🌍 Environment Variables: The Secure Way
 
 By default, Deno Director locks down environment variables.  You can inject explicit key value pairs, or have the worker dynamically load a `.env` file from disk.
@@ -325,6 +421,11 @@ await worker.eval(`
 `);
 
 ```
+
+Permission note:
+- If you provide `env` as a map and `permissions.env` is missing (or `[]`), the runtime auto-populates `permissions.env` with those env-map keys.
+- If `permissions.env` is already set, it is not changed.
+- If configured env keys are not readable under `permissions.env`, startup emits a warning.
 
 ---
 
@@ -363,6 +464,33 @@ Evaluates JavaScript or TypeScript synchronously (blocks Node event loop while w
 Evaluates the source as an ES Module and returns a callable Proxy namespace to the exports.
 * `getModule<T>(specifier: string): Promise<T>`
 Imports a module specifier through the runtime import pipeline and returns a callable Proxy namespace to the exports.
+* `stream.create(key?: string): DenoWorkerStreamWriter`
+Creates a byte stream from Node -> worker. If `key` is omitted, a cryptographically secure random key is generated.
+* `stream.accept(key: string): Promise<DenoWorkerStreamReader>`
+Accepts a byte stream opened from worker -> Node.
+
+When `transpileTs: true` is enabled, all three evaluation entrypoints (`eval`, `evalSync`, `evalModule`) run source through the TS/JSX transpiler before execution.
+
+Stream writer methods:
+
+- `getKey(): string`
+- `ready(minBytes?: number): Promise<void>`
+- `write(chunk: Uint8Array | ArrayBuffer): Promise<void>`
+- `writeMany(chunks: Array<Uint8Array | ArrayBuffer>): Promise<number>`
+- `close(): Promise<void>`
+- `error(message: string): Promise<void>`
+- `cancel(reason?: string): Promise<void>`
+
+Default stream flow-control tuning:
+
+- per-stream send window: `16 MiB`
+- credit flush threshold: `256 KiB`
+
+Stream reader methods:
+
+- `read(): Promise<IteratorResult<Uint8Array>>`
+- `cancel(reason?: string): Promise<void>`
+- async iteration: `for await (const chunk of reader) { ... }`
 
 #### **Environment & Memory**
 
@@ -394,6 +522,11 @@ Passed into `new DenoWorker(opts)` or used as `workerOptions` in templates.
 
 ```ts
 type DenoWorkerOptions = {
+  bridge?: {                    // Transport tuning
+    channelSize?: number;       // Internal command queue capacity
+    streamWindowBytes?: number; // Per-stream flow-control window
+    streamCreditFlushBytes?: number; // Credit flush threshold
+  };
   cwd?: string;                 // Virtual root for the filesystem sandbox
   maxEvalMs?: number;           // Hard timeout for eval operations
   maxMemoryBytes?: number;      // V8 Heap limit
@@ -408,23 +541,48 @@ type DenoWorkerOptions = {
   };
   env?: Record<string, string>; // Custom environment variables
   envFile?: string | boolean;   // Load from a .env file
+  nodeCompat?: boolean;         // Enable Node compatibility mode
   imports?: boolean | ImportsCallback; // Custom module resolution interceptor
+  transpileTs?: boolean;         // Enable TS/TSX/JSX transpilation for eval + imports
+  tsCompiler?: {                 // TS/JSX transpiler options
+    jsx?: "react" | "react-jsx" | "react-jsxdev" | "preserve";
+    jsxFactory?: string;
+    jsxFragmentFactory?: string;
+    cacheDir?: string;           // Optional on-disk transpile output cache directory
+  };
   moduleLoader?: {
-    denoRemote?: boolean;       // Enable https:// imports
-    transpileTs?: boolean;      // Enable TypeScript / JSX
+    httpsResolve?: boolean;     // Enable https:// imports
+    httpResolve?: boolean;      // Enable http:// imports (insecure; startup warning emitted)
+    nodeResolve?: boolean;      // Enable Node-style disk/module resolution
+    jsrResolve?: boolean;       // Resolve jsr: and @std/* via jsr.io
     cacheDir?: string;          // Where to cache remote imports
     reload?: boolean;           // Bypass cache
-    tsCompiler?: {              // JSX Factory configurations
-      jsx?: "react" | "react-jsx" | "preserve";
-      jsxFactory?: string;
-      jsxFragmentFactory?: string;
-    }
+    maxPayloadBytes?: number;   // Remote module payload size cap in bytes (-1 disables limit, default 10 MiB)
   };
   console?: false | Console | Record<string, Function | false>; // Route console logs
   inspect?: boolean | { host?: string; port?: number; break?: boolean; }; // V8 Debugging
 };
 
 ```
+
+### `nodeCompat` vs `moduleLoader.nodeResolve`
+
+Both options affect how bare specifiers (for example, `"lodash"` or `"pkg/subpath"`) are resolved.
+
+- `moduleLoader.nodeResolve: true`
+  - Enables Node-style disk/package resolution for imports.
+  - This is the explicit import-resolution switch and the preferred option when you only need Node-like module lookup.
+
+- `nodeCompat: true`
+  - Enables broader Node compatibility behavior in the runtime.
+  - Also enables Node-style module resolution behavior for imports.
+  - Use this when you want Node compatibility semantics beyond just resolving packages.
+
+Current behavior notes:
+
+- If both are `false`/unset, unresolved bare imports are rejected.
+- If either is enabled, bare package resolution is allowed.
+- `moduleLoader.nodeResolve` is more targeted; `nodeCompat` is the broader compatibility mode.
 
 ## Notes
 

@@ -17,78 +17,78 @@ import type { DenoWorkerTemplateCreateOptions, DenoWorkerTemplateOptions } from 
  * 5. run `setup` hooks (template first, then per-create override)
  */
 export class DenoWorkerTemplate {
-	private readonly options: DenoWorkerTemplateOptions;
+    private readonly options: DenoWorkerTemplateOptions;
 
-	/**
-	 * @example
-	 * ```ts
-	 * const template = new DenoWorkerTemplate({
-	 *   workerOptions: { permissions: { env: true } },
-	 *   globals: { APP: "director" },
-	 *   bootstrapScripts: "globalThis.VERSION = 1;",
-	 * });
-	 * ```
-	 */
-	constructor(options?: DenoWorkerTemplateOptions) {
-		this.options = options ?? {};
-	}
+    /**
+     * @example
+     * ```ts
+     * const template = new DenoWorkerTemplate({
+     *   workerOptions: { permissions: { env: true } },
+     *   globals: { APP: "director" },
+     *   bootstrapScripts: "globalThis.VERSION = 1;",
+     * });
+     * ```
+     */
+    constructor(options?: DenoWorkerTemplateOptions) {
+        this.options = options ?? {};
+    }
 
-	/**
-	 * Create a new runtime instance from this template.
-	 *
-	 * Merge semantics:
-	 * - `workerOptions`: `createOptions.workerOptions` override template values.
-	 * - `globals`: shallow merge with per-create values overriding by key.
-	 * - `bootstrapScripts`/`bootstrapModules`: concatenated template-first then per-create.
-	 *
-	 * Failure behavior:
-	 * - if any setup step fails, the worker is closed before error is re-thrown.
-	 *
-	 * @example
-	 * ```ts
-	 * const runtime = await template.create({
-	 *   globals: { TENANT: "a" },
-	 *   bootstrapScripts: "globalThis.TENANT_READY = true;",
-	 * });
-	 * ```
-	 */
-	async create(createOptions?: DenoWorkerTemplateCreateOptions): Promise<DenoWorker> {
-		const workerOptions = mergeWorkerOptions(this.options.workerOptions, createOptions?.workerOptions);
-		const worker = new DenoWorker(workerOptions);
-		let ready = false;
+    /**
+     * Create a new runtime instance from this template.
+     *
+     * Merge semantics:
+     * - `workerOptions`: `createOptions.workerOptions` override template values.
+     * - `globals`: shallow merge with per-create values overriding by key.
+     * - `bootstrapScripts`/`bootstrapModules`: concatenated template-first then per-create.
+     *
+     * Failure behavior:
+     * - if any setup step fails, the worker is closed before error is re-thrown.
+     *
+     * @example
+     * ```ts
+     * const runtime = await template.create({
+     *   globals: { TENANT: "a" },
+     *   bootstrapScripts: "globalThis.TENANT_READY = true;",
+     * });
+     * ```
+     */
+    async create(createOptions?: DenoWorkerTemplateCreateOptions): Promise<DenoWorker> {
+        const workerOptions = mergeWorkerOptions(this.options.workerOptions, createOptions?.workerOptions);
+        const worker = new DenoWorker(workerOptions);
+        let ready = false;
 
-		try {
-			const globals = {
-				...(this.options.globals ?? {}),
-				...(createOptions?.globals ?? {}),
-			};
-			for (const [k, v] of Object.entries(globals)) {
-				await worker.setGlobal(k, v);
-			}
+        try {
+            const globals = {
+                ...(this.options.globals ?? {}),
+                ...(createOptions?.globals ?? {}),
+            };
+            for (const [k, v] of Object.entries(globals)) {
+                await worker.setGlobal(k, v);
+            }
 
-			for (const script of [...asStringArray(this.options.bootstrapScripts), ...asStringArray(createOptions?.bootstrapScripts)]) {
-				await worker.eval(script);
-			}
+            for (const script of [...asStringArray(this.options.bootstrapScripts), ...asStringArray(createOptions?.bootstrapScripts)]) {
+                await worker.eval(script);
+            }
 
-			for (const mod of [...asStringArray(this.options.bootstrapModules), ...asStringArray(createOptions?.bootstrapModules)]) {
-				await worker.evalModule(mod);
-			}
+            for (const mod of [...asStringArray(this.options.bootstrapModules), ...asStringArray(createOptions?.bootstrapModules)]) {
+                await worker.evalModule(mod);
+            }
 
-			if (typeof this.options.setup === "function") {
-				await this.options.setup(worker);
-			}
-			if (typeof createOptions?.setup === "function") {
-				await createOptions.setup(worker);
-			}
+            if (typeof this.options.setup === "function") {
+                await this.options.setup(worker);
+            }
+            if (typeof createOptions?.setup === "function") {
+                await createOptions.setup(worker);
+            }
 
-			ready = true;
-			return worker;
-		} finally {
-			if (!ready && !worker.isClosed()) {
-				await worker.close().catch(() => {
-					// ignore
-				});
-			}
-		}
-	}
+            ready = true;
+            return worker;
+        } finally {
+            if (!ready && !worker.isClosed()) {
+                await worker.close().catch(() => {
+                    // ignore
+                });
+            }
+        }
+    }
 }

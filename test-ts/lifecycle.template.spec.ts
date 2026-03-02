@@ -1,9 +1,10 @@
 import { DenoWorker, DenoWorkerTemplate } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 describe("DenoWorker lifecycle hooks + templates", () => {
   test("lifecycle hooks fire in deterministic order for normal start/stop", async () => {
     const phases: string[] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       lifecycle: {
         beforeStart: () => phases.push("beforeStart"),
         afterStart: () => phases.push("afterStart"),
@@ -21,7 +22,7 @@ describe("DenoWorker lifecycle hooks + templates", () => {
 
   test("restart emits stop/start lifecycle sequence without crash", async () => {
     const phases: string[] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       lifecycle: {
         beforeStart: () => phases.push("beforeStart"),
         afterStart: () => phases.push("afterStart"),

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as net from "node:net";
 
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 async function mkTempDir(prefix: string): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -61,7 +62,7 @@ describe("inspect + envFile", () => {
 
     let dw: DenoWorker | undefined;
     try {
-      dw = new DenoWorker({
+      dw = createTestWorker({
         inspect: { host: "127.0.0.1", port },
         permissions: { env: true },
       });
@@ -90,7 +91,7 @@ describe("inspect + envFile", () => {
 
     let dw: DenoWorker | undefined;
     try {
-      dw = new DenoWorker({
+      dw = createTestWorker({
         inspect: { host: "localhost", port },
         permissions: { env: true },
       });
@@ -109,7 +110,7 @@ describe("inspect + envFile", () => {
 
   test("env option injects values at startup and auto-enables env permission", async () => {
     const key = `TEST_ENV_${Date.now()}`;
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       env: { [key]: "from-config" },
     });
 
@@ -129,7 +130,7 @@ describe("inspect + envFile", () => {
     const key = `TEST_ENV_${Date.now()}`;
     await writeFile(path.join(root, ".env"), `${key}=from-dotenv\n`);
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: nested,
       envFile: true,
       permissions: { env: true, read: true },
@@ -151,7 +152,7 @@ describe("inspect + envFile", () => {
     const key = `TEST_ENV_${Date.now()}`;
     await writeFile(envPath, `${key}=from-explicit\n`);
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: root,
       envFile: envPath,
       permissions: { env: true, read: true },
@@ -174,12 +175,12 @@ describe("inspect + envFile", () => {
     const key = `TEST_ENV_${Date.now()}`;
     await writeFile(path.join(root, ".env"), `${key}=from-dotenv-local\n`);
 
-    const dw1 = new DenoWorker({
+    const dw1 = createTestWorker({
       cwd: nested,
       envFile: true,
       permissions: { env: true, read: true },
     });
-    const dw2 = new DenoWorker({
+    const dw2 = createTestWorker({
       cwd: nested,
       permissions: { env: true, read: true },
     });
@@ -212,7 +213,7 @@ describe("inspect + envFile", () => {
       ].join("\n")
     );
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: root,
       envFile: true,
       permissions: { env: true, read: true },
@@ -228,21 +229,21 @@ describe("inspect + envFile", () => {
     }
   });
 
-  test("envFile auto-enables env permission (even if env:false is provided)", async () => {
+  test("envFile does not override explicit env:false permission", async () => {
     const root = await mkTempDir("denojs-worker-envfile-perms-");
     const envPath = path.join(root, ".env");
 
     const key = `TEST_ENV_${Date.now()}`;
     await writeFile(envPath, `${key}=secret\n`);
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: root,
       envFile: true,
       permissions: { env: false, read: true },
     });
 
     try {
-      await expect(dw.eval(`Deno.env.get("${key}")`)).resolves.toBe("secret");
+      await expect(dw.eval(`Deno.env.get("${key}")`)).rejects.toBeTruthy();
     } finally {
       if (!dw.isClosed()) await dw.close();
       await rmRF(root);

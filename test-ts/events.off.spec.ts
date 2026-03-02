@@ -1,4 +1,5 @@
 import { DenoWorker, DenoWorkerLifecycleContext } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -7,7 +8,7 @@ function sleep(ms: number) {
 describe("DenoWorker on/off event adapters", () => {
   test("on('lifecycle') receives lifecycle events and off() unsubscribes", async () => {
     const phases: string[] = [];
-    const dw = new DenoWorker();
+    const dw = createTestWorker();
     const lifecycleCb = (ctx: DenoWorkerLifecycleContext) => phases.push(ctx.phase);
 
     dw.on("lifecycle", lifecycleCb);
@@ -16,7 +17,7 @@ describe("DenoWorker on/off event adapters", () => {
     expect(phases).toEqual(["beforeStop", "afterStop"]);
 
     phases.length = 0;
-    const dw2 = new DenoWorker();
+    const dw2 = createTestWorker();
     dw2.on("lifecycle", lifecycleCb);
     dw2.off("lifecycle", lifecycleCb);
     await dw2.close();
@@ -26,7 +27,7 @@ describe("DenoWorker on/off event adapters", () => {
 
   test("on('message') can be removed with off()", async () => {
     const received: any[] = [];
-    const dw = new DenoWorker();
+    const dw = createTestWorker();
     const cb = (msg: any) => received.push(msg);
 
     dw.on("message", cb);
@@ -44,7 +45,7 @@ describe("DenoWorker on/off event adapters", () => {
 
   test("message listeners are not duplicated across multiple restarts", async () => {
     const hits: any[] = [];
-    const dw = new DenoWorker();
+    const dw = createTestWorker();
     const cb = (msg: any) => hits.push(msg);
     dw.on("message", cb);
 
@@ -61,7 +62,7 @@ describe("DenoWorker on/off event adapters", () => {
 
   test("off() before restart remains effective after restart", async () => {
     const hits: any[] = [];
-    const dw = new DenoWorker();
+    const dw = createTestWorker();
     const cb = (msg: any) => hits.push(msg);
     dw.on("message", cb);
     dw.off("message", cb);

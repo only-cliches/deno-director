@@ -1,5 +1,6 @@
 // src/worker/eval.rs
 use cpu_time::ProcessTime;
+use deno_core::url::Url;
 use deno_runtime::deno_core::{self, v8};
 use deno_runtime::worker::MainWorker;
 
@@ -12,7 +13,165 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::{
+    hash::{Hash, Hasher},
+    path::PathBuf,
+};
 use std::time::{Duration, Instant};
+
+fn transpile_ts_enabled(limits: &RuntimeLimits) -> bool {
+    limits
+        .module_loader
+        .as_ref()
+        .map(|m| m.transpile_ts)
+        .unwrap_or(false)
+}
+
+fn transpile_options_from_limits(limits: &RuntimeLimits) -> deno_ast::TranspileOptions {
+    let mut out = deno_ast::TranspileOptions::default();
+    let Some(cfg) = limits.module_loader.as_ref() else {
+        return out;
+    };
+    let Some(tc) = cfg.ts_compiler.as_ref() else {
+        return out;
+    };
+
+    let jsx_mode = tc.jsx.as_deref().unwrap_or("react");
+    out.jsx = match jsx_mode {
+        "preserve" => None,
+        "react-jsx" => Some(deno_ast::JsxRuntime::Automatic(
+            deno_ast::JsxAutomaticOptions {
+                development: false,
+                import_source: None,
+            },
+        )),
+        "react-jsxdev" => Some(deno_ast::JsxRuntime::Automatic(
+            deno_ast::JsxAutomaticOptions {
+                development: true,
+                import_source: None,
+            },
+        )),
+        _ => {
+            let mut classic = deno_ast::JsxClassicOptions::default();
+            if let Some(factory) = tc.jsx_factory.as_ref() {
+                classic.factory = factory.clone();
+            }
+            if let Some(fragment) = tc.jsx_fragment_factory.as_ref() {
+                classic.fragment_factory = fragment.clone();
+            }
+            Some(deno_ast::JsxRuntime::Classic(classic))
+        }
+    };
+
+    out
+}
+
+fn media_type_for_eval_filename(filename: &str) -> deno_ast::MediaType {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "tsx" => deno_ast::MediaType::Tsx,
+        "jsx" => deno_ast::MediaType::Jsx,
+        "ts" | "mts" | "cts" => deno_ast::MediaType::TypeScript,
+        _ => deno_ast::MediaType::TypeScript,
+    }
+}
+
+fn specifier_for_eval_filename(filename: &str, media: deno_ast::MediaType) -> Url {
+    if let Ok(u) = Url::parse(filename) {
+        return u;
+    }
+
+    let ext = match media {
+        deno_ast::MediaType::Tsx => "tsx",
+        deno_ast::MediaType::Jsx => "jsx",
+        _ => "ts",
+    };
+
+    Url::parse(&format!("denojs-worker://eval/virtual.{ext}"))
+        .expect("internal eval transpile specifier should parse")
+}
+
+fn maybe_transpile_eval_source(
+    limits: &RuntimeLimits,
+    filename: &str,
+    source: &str,
+) -> Result<String, JsValueBridge> {
+    if !transpile_ts_enabled(limits) {
+        return Ok(source.to_string());
+    }
+
+    let media = media_type_for_eval_filename(filename);
+    let maybe_cache_path = limits
+        .module_loader
+        .as_ref()
+        .and_then(|ml| ml.ts_compiler.as_ref())
+        .and_then(|tc| tc.cache_dir.as_ref())
+        .map(|cache_dir| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            filename.hash(&mut hasher);
+            source.hash(&mut hasher);
+            format!("{media:?}").hash(&mut hasher);
+            if let Some(tc) = limits
+                .module_loader
+                .as_ref()
+                .and_then(|ml| ml.ts_compiler.as_ref())
+            {
+                tc.jsx.hash(&mut hasher);
+                tc.jsx_factory.hash(&mut hasher);
+                tc.jsx_fragment_factory.hash(&mut hasher);
+            }
+            let h = hasher.finish();
+            PathBuf::from(cache_dir).join(format!("{h:016x}.js"))
+        });
+
+    let reload = limits
+        .module_loader
+        .as_ref()
+        .map(|ml| ml.reload)
+        .unwrap_or(false);
+    if !reload {
+        if let Some(cache_path) = maybe_cache_path.as_ref() {
+            if let Ok(hit) = std::fs::read_to_string(cache_path) {
+                return Ok(hit);
+            }
+        }
+    }
+
+    let parsed = deno_ast::parse_module(deno_ast::ParseParams {
+        specifier: specifier_for_eval_filename(filename, media),
+        text: source.to_string().into(),
+        media_type: media,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .map_err(|e| mk_err("TranspileError", e.to_string()))?;
+
+    let transpiled = parsed
+        .transpile(
+            &transpile_options_from_limits(limits),
+            &deno_ast::TranspileModuleOptions::default(),
+            &deno_ast::EmitOptions {
+                source_map: deno_ast::SourceMapOption::None,
+                ..Default::default()
+            },
+        )
+        .map(|v| v.into_source().text)
+        .map_err(|e| mk_err("TranspileError", e.to_string()))?;
+
+    if let Some(cache_path) = maybe_cache_path.as_ref() {
+        if let Some(parent) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(cache_path, transpiled.as_bytes());
+    }
+
+    Ok(transpiled)
+}
 
 fn mk_err(name: &str, message: String) -> JsValueBridge {
     JsValueBridge::Error {
@@ -168,6 +327,26 @@ pub async fn eval_in_runtime(
 ) -> EvalReply {
     let start_wall = Instant::now();
     let start_cpu = ProcessTime::now();
+    let filename = if options.filename.is_empty() {
+        if options.is_module {
+            "<evalModule>".to_string()
+        } else {
+            "<eval>".to_string()
+        }
+    } else {
+        options.filename.clone()
+    };
+
+    let transpiled_source = match maybe_transpile_eval_source(limits, &filename, source) {
+        Ok(s) => s,
+        Err(error) => {
+            let stats = ExecStats {
+                cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
+                eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
+            };
+            return EvalReply::Err { error, stats };
+        }
+    };
 
     let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -187,9 +366,9 @@ pub async fn eval_in_runtime(
     });
 
     let result = if options.is_module {
-        eval_module(worker, source).await
+        eval_module(worker, &transpiled_source).await
     } else {
-        eval_script_or_callable(worker, source, &options).await
+        eval_script_or_callable(worker, &transpiled_source, &options).await
     };
 
     cancel.store(true, Ordering::SeqCst);

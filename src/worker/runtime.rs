@@ -164,6 +164,21 @@ fn inspector_addr(host: &str, port: u16) -> std::net::SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
 }
 
+fn create_params_from_limits(limits: &RuntimeLimits) -> Option<deno_core::v8::CreateParams> {
+    let max_mem = limits.max_memory_bytes?;
+    let max_heap = usize::try_from(max_mem).unwrap_or(usize::MAX);
+    Some(deno_core::v8::Isolate::create_params().heap_limits(0, max_heap))
+}
+
+fn emit_startup_warning(worker: &mut MainWorker, message: &str) {
+    let msg_json = serde_json::to_string(message).unwrap_or_else(|_| "\"startup warning\"".into());
+    let script = format!(
+        "(function(){{ try {{ console.warn(\"[deno-director] \" + {msg_json}); }} catch {{}} }})()"
+    );
+    let _ = worker.js_runtime.execute_script("<startupWarning>", script);
+    eprintln!("[deno-director] {message}");
+}
+
 pub fn spawn_worker_thread(
     worker_id: usize,
     limits: RuntimeLimits,
@@ -305,6 +320,9 @@ pub fn spawn_worker_thread(
 
             let mut worker_opts = WorkerOptions::default();
             worker_opts.bootstrap = bootstrap;
+            if let Some(create_params) = create_params_from_limits(&limits) {
+                worker_opts.create_params = Some(create_params);
+            }
 
             if let Some(ins) = inspect_cfg.as_ref() {
                 worker_opts.should_break_on_first_statement = ins.break_on_first_statement;
@@ -369,6 +387,18 @@ pub fn spawn_worker_thread(
                 let _ = worker.js_runtime.execute_script("<consoleConfig>", script);
             }
 
+            if let Some(cfg) = limits.bridge.as_ref() {
+                let cfg_json = serde_json::to_string(cfg).unwrap_or_else(|_| "{}".into());
+                let script = format!(
+                    "globalThis.__globals[\"__denojs_worker_bridge\"] = {cfg_json}; globalThis.__applyGlobals();"
+                );
+                let _ = worker.js_runtime.execute_script("<bridgeConfig>", script);
+            }
+
+            for warning in limits.startup_warnings.iter() {
+                emit_startup_warning(&mut worker, warning);
+            }
+
             if let Some(url) = startup_url.as_ref() {
                 if worker.execute_side_module(url).await.is_err() {
                     if let Ok(map) = crate::WORKERS.lock() {
@@ -428,7 +458,7 @@ pub fn spawn_worker_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_perm_field, cfg_items, env_access_from_permissions, inspector_addr,
+        apply_perm_field, cfg_items, create_params_from_limits, env_access_from_permissions, inspector_addr,
         merge_env_snapshot,
     };
     use crate::worker::env::EnvAccess;
@@ -570,5 +600,17 @@ mod tests {
         let out = inspector_addr("not-a-valid-hostname", 9222);
         assert_eq!(out.ip().to_string(), "127.0.0.1");
         assert_eq!(out.port(), 9222);
+    }
+
+    #[test]
+    fn create_params_from_limits_only_when_max_memory_is_set() {
+        let none = RuntimeLimits::default();
+        assert!(create_params_from_limits(&none).is_none());
+
+        let with_mem = RuntimeLimits {
+            max_memory_bytes: Some(8 * 1024 * 1024),
+            ..RuntimeLimits::default()
+        };
+        assert!(create_params_from_limits(&with_mem).is_some());
     }
 }

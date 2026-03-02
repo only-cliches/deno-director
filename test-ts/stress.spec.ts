@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 import pLimit from "p-limit";
 
 function sleep(ms: number) {
@@ -32,7 +33,7 @@ describe("DenoWorker stress and backpressure", () => {
             const prevStrict = process.env.DENOJS_WORKER_STRICT_CHANNEL;
             delete process.env.DENOJS_WORKER_STRICT_CHANNEL;
 
-            const dw = new DenoWorker({ channelSize: 8, maxEvalMs: 500 } as any);
+            const dw = createTestWorker({ bridge: { channelSize: 8 }, maxEvalMs: 500 });
             try {
                 const busy = dw.eval(`
                     (() => {
@@ -70,7 +71,7 @@ describe("DenoWorker stress and backpressure", () => {
         "churn: create and close repeatedly without deadlock",
         async () => {
             for (let i = 0; i < 50; i++) {
-                const dw = new DenoWorker();
+                const dw = createTestWorker();
                 await dw.eval("1 + 1");
                 await dw.close();
                 await waitFor(() => dw.isClosed(), 1000);
@@ -82,7 +83,7 @@ describe("DenoWorker stress and backpressure", () => {
     test(
         "stress: backpressure triggers when concurrency exceeds channel capacity",
         async () => {
-            const dw = new DenoWorker({ channelSize: 32 });
+            const dw = createTestWorker({ bridge: { channelSize: 32 } });
 
             const tasks = Array.from({ length: 200 }, () => dw.eval("1 + 1"));
             const results = await Promise.allSettled(tasks);
@@ -102,9 +103,9 @@ describe("DenoWorker stress and backpressure", () => {
     test(
         "stress: many eval calls with bounded concurrency",
         async () => {
-            const dw = new DenoWorker({ channelSize: 512 });
+            const dw = createTestWorker({ bridge: { channelSize: 512 } });
 
-            const limit = pLimit(64); // below channelSize
+            const limit = pLimit(64); // below bridge.channelSize
             const tasks = Array.from({ length: 2000 }, (_, i) =>
                 limit(async () => {
                     const v = await dw.eval(`${i} + 1`);
@@ -120,7 +121,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("sustains many eval calls in parallel", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({ channelSize: 512 });
+        const dw = createTestWorker({ bridge: { channelSize: 512 } });
 
         try {
             const N = 200;
@@ -139,7 +140,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("handles large payload round-trip", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker();
+        const dw = createTestWorker();
 
         try {
             const input = makeBigObject(2 * 1024 * 1024); // ~2MB of strings
@@ -152,7 +153,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("stress: sync host function calls from Deno side", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({ channelSize: 512 });
+        const dw = createTestWorker({ bridge: { channelSize: 512 } });
 
         try {
             const double = jest.fn((x: number) => x * 2);
@@ -176,7 +177,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("stress: async host function calls from Deno side", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({ channelSize: 512 });
+        const dw = createTestWorker({ bridge: { channelSize: 512 } });
 
         try {
             const addAsync = jest.fn(async (x: number) => {
@@ -200,7 +201,7 @@ describe("DenoWorker stress and backpressure", () => {
 
     test("stress: bidirectional postMessage volume", async () => {
         jest.setTimeout(30_000);
-        const dw = new DenoWorker({ channelSize: 512 });
+        const dw = createTestWorker({ bridge: { channelSize: 512 } });
 
         try {
             const receivedFromDeno: any[] = [];
@@ -232,7 +233,7 @@ describe("DenoWorker stress and backpressure", () => {
         jest.setTimeout(30_000);
 
         for (let i = 0; i < 50; i++) {
-            const dw = new DenoWorker();
+            const dw = createTestWorker();
             await dw.eval("1 + 1");
             await dw.close();
             expect(dw.isClosed()).toBe(true);

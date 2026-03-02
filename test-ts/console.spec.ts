@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
@@ -38,7 +39,7 @@ function isDateLike(x: any): boolean {
 describe("console option", () => {
   test("console: false disables all methods", async () => {
     const received: any[][] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: false,
     });
 
@@ -60,9 +61,9 @@ describe("console option", () => {
       received.push(["log", ...args]);
     };
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: console,
-    } as any);
+    });
 
     try {
       await dw.eval('console.log("hello", 1);');
@@ -80,7 +81,7 @@ describe("console option", () => {
   test("console: per-method routing supports sync handlers", async () => {
     const received: any[][] = [];
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: (...args: any[]) => {
           received.push(args);
@@ -101,7 +102,7 @@ describe("console option", () => {
   test("console: per-method routing supports async handlers (fire-and-forget)", async () => {
     const received: any[][] = [];
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: async (...args: any[]) => {
           await sleep(10);
@@ -123,7 +124,7 @@ describe("console option", () => {
   test("console: Date argument round-trips (top-level)", async () => {
     const received: any[][] = [];
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: (...args: any[]) => {
           received.push(args);
@@ -146,7 +147,7 @@ describe("console option", () => {
 
   test("console: setting warn:false disables warn but keeps others", async () => {
     const received: any[][] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         warn: false,
         log: (...args: any[]) => received.push(args),
@@ -164,7 +165,7 @@ describe("console option", () => {
   });
 
   test("console callback errors are swallowed (sync)", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: () => {
           throw new Error("boom");
@@ -180,7 +181,7 @@ describe("console option", () => {
   });
 
   test("console callback errors are swallowed (async rejection)", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: async () => {
           await sleep(5);
@@ -198,7 +199,7 @@ describe("console option", () => {
 
   test("console argument dehydration: BigInt becomes string, symbol/function become null", async () => {
     const received: any[][] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: (...args: any[]) => {
           received.push(args);
@@ -221,7 +222,7 @@ describe("console option", () => {
 
   test("console argument dehydration: circular objects are truncated", async () => {
     const received: any[][] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: (...args: any[]) => {
           received.push(args);
@@ -242,7 +243,7 @@ describe("console option", () => {
 
   test("console argument dehydration: Uint8Array becomes Buffer in Node callback", async () => {
     const received: any[][] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: (...args: any[]) => {
           received.push(args);
@@ -265,7 +266,7 @@ describe("console option", () => {
 
   test("console argument dehydration: nested Date markers are not automatically rehydrated", async () => {
     const received: any[][] = [];
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       console: {
         log: (...args: any[]) => {
           received.push(args);

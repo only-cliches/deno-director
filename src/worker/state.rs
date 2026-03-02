@@ -74,15 +74,37 @@ pub struct TsCompilerConfig {
     pub jsx: Option<String>,
     pub jsx_factory: Option<String>,
     pub jsx_fragment_factory: Option<String>,
+    pub cache_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModuleLoaderConfig {
-    pub deno_remote: bool,
+    pub https_resolve: bool,
+    pub http_resolve: bool,
+    pub node_resolve: bool,
+    pub jsr_resolve: bool,
     pub transpile_ts: bool,
     pub ts_compiler: Option<TsCompilerConfig>,
     pub cache_dir: Option<String>,
     pub reload: bool,
+    pub max_payload_bytes: i64,
+}
+
+impl Default for ModuleLoaderConfig {
+    fn default() -> Self {
+        Self {
+            https_resolve: false,
+            http_resolve: false,
+            node_resolve: false,
+            jsr_resolve: false,
+            transpile_ts: false,
+            ts_compiler: None,
+            cache_dir: None,
+            reload: false,
+            // 10 MiB default cap for remote module payloads.
+            max_payload_bytes: 10 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,11 +125,20 @@ pub struct RuntimeLimits {
     pub console: Option<serde_json::Value>,
     pub inspect: Option<InspectConfig>,
     pub module_loader: Option<ModuleLoaderConfig>,
+    pub bridge: Option<BridgeConfig>,
+    pub startup_warnings: Vec<String>,
 
     /// env:
     /// - None: default Deno behavior
     /// - Some(Map): env vars to set (loaded from either string file path or object map in JS)
     pub env: Option<EnvConfig>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeConfig {
+    pub stream_window_bytes: Option<u64>,
+    pub stream_credit_flush_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -224,6 +255,63 @@ fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
     out
 }
 
+fn parse_ts_compiler_config<'a>(
+    cx: &mut FunctionContext<'a>,
+    tco: Handle<'a, JsObject>,
+) -> Option<TsCompilerConfig> {
+    let mut tc = TsCompilerConfig::default();
+
+    if let Ok(jv) = tco.get::<JsValue, _, _>(cx, "jsx") {
+        if let Ok(js) = jv.downcast::<JsString, _>(cx) {
+            let s = js.value(cx);
+            let t = s.trim();
+            if matches!(t, "react" | "react-jsx" | "react-jsxdev" | "preserve") {
+                tc.jsx = Some(t.to_string());
+            }
+        }
+    }
+
+    if let Ok(fv) = tco.get::<JsValue, _, _>(cx, "jsxFactory") {
+        if let Ok(fs) = fv.downcast::<JsString, _>(cx) {
+            let s = fs.value(cx);
+            let t = s.trim();
+            if !t.is_empty() {
+                tc.jsx_factory = Some(t.to_string());
+            }
+        }
+    }
+
+    if let Ok(ffv) = tco.get::<JsValue, _, _>(cx, "jsxFragmentFactory") {
+        if let Ok(ffs) = ffv.downcast::<JsString, _>(cx) {
+            let s = ffs.value(cx);
+            let t = s.trim();
+            if !t.is_empty() {
+                tc.jsx_fragment_factory = Some(t.to_string());
+            }
+        }
+    }
+
+    if let Ok(cv) = tco.get::<JsValue, _, _>(cx, "cacheDir") {
+        if let Ok(cs) = cv.downcast::<JsString, _>(cx) {
+            let s = cs.value(cx);
+            let t = s.trim();
+            if !t.is_empty() {
+                tc.cache_dir = Some(t.to_string());
+            }
+        }
+    }
+
+    if tc.jsx.is_some()
+        || tc.jsx_factory.is_some()
+        || tc.jsx_fragment_factory.is_some()
+        || tc.cache_dir.is_some()
+    {
+        Some(tc)
+    } else {
+        None
+    }
+}
+
 fn load_dotenv_file_strict(
     cx: &mut FunctionContext,
     path: &Path,
@@ -250,20 +338,61 @@ fn load_dotenv_file_strict(
 
 fn ensure_env_permission_enabled(
     permissions: Option<serde_json::Value>,
-    env_is_configured: bool,
-) -> Option<serde_json::Value> {
-    if !env_is_configured {
-        return permissions;
-    }
+    env_keys: Option<&HashMap<String, String>>,
+) -> (Option<serde_json::Value>, Vec<String>) {
+    let Some(env_keys) = env_keys else {
+        return (permissions, Vec::new());
+    };
 
-    // If custom env is configured, force env permission on to keep runtime access coherent.
+    let env_keys_set: std::collections::HashSet<String> = env_keys.keys().cloned().collect();
+    let mut warnings = Vec::new();
+
     let mut out = match permissions {
         Some(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    let env_keys_json = || {
+        let mut keys: Vec<String> = env_keys_set.iter().cloned().collect();
+        keys.sort();
+        serde_json::Value::Array(keys.into_iter().map(serde_json::Value::String).collect())
+    };
 
-    out.insert("env".to_string(), serde_json::Value::Bool(true));
-    Some(serde_json::Value::Object(out))
+    let effective_allow: Option<std::collections::HashSet<String>> = match out.get("env") {
+        None => {
+            out.insert("env".to_string(), env_keys_json());
+            Some(env_keys_set.clone())
+        }
+        Some(serde_json::Value::Array(arr)) if arr.is_empty() => {
+            out.insert("env".to_string(), env_keys_json());
+            Some(env_keys_set.clone())
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            let mut allow = std::collections::HashSet::new();
+            for k in arr.iter().filter_map(|v| v.as_str()) {
+                allow.insert(k.to_string());
+            }
+            Some(allow)
+        }
+        Some(serde_json::Value::Bool(true)) => None,
+        Some(_) => Some(std::collections::HashSet::new()),
+    };
+
+    if let Some(allow) = effective_allow {
+        let mut blocked: Vec<String> = env_keys_set
+            .iter()
+            .filter(|k| !allow.contains(*k))
+            .cloned()
+            .collect();
+        blocked.sort();
+        if !blocked.is_empty() {
+            warnings.push(format!(
+                "Some env keys are configured but not readable by permissions.env: {}",
+                blocked.join(", ")
+            ));
+        }
+    }
+
+    (Some(serde_json::Value::Object(out)), warnings)
 }
 
 impl WorkerCreateOptions {
@@ -305,13 +434,6 @@ impl WorkerCreateOptions {
             }
         }
 
-        // `nodeResolve`.
-        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeResolve") {
-            if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
-                out.runtime_options.node_resolve = b.value(cx);
-            }
-        }
-
         // `nodeCompat`.
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeCompat") {
             if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
@@ -330,12 +452,44 @@ impl WorkerCreateOptions {
             }
         }
 
-        // `channelSize`.
-        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "channelSize") {
-            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
-                let s = n.value(cx);
-                if s.is_finite() && s >= 1.0 {
-                    out.channel_size = s as usize;
+        // `bridge`: { channelSize?, streamWindowBytes?, streamCreditFlushBytes? }.
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "bridge") {
+            if let Ok(o) = v.downcast::<JsObject, _>(cx) {
+                let mut cfg = BridgeConfig::default();
+                let mut saw_bridge = false;
+
+                if let Ok(cv) = o.get::<JsValue, _, _>(cx, "channelSize") {
+                    if let Ok(cn) = cv.downcast::<JsNumber, _>(cx) {
+                        let n = cn.value(cx);
+                        if n.is_finite() && n >= 1.0 {
+                            out.channel_size = n as usize;
+                            saw_bridge = true;
+                        }
+                    }
+                }
+
+                if let Ok(sv) = o.get::<JsValue, _, _>(cx, "streamWindowBytes") {
+                    if let Ok(sn) = sv.downcast::<JsNumber, _>(cx) {
+                        let n = sn.value(cx);
+                        if n.is_finite() && n >= 1.0 {
+                            cfg.stream_window_bytes = Some(n as u64);
+                            saw_bridge = true;
+                        }
+                    }
+                }
+
+                if let Ok(fv) = o.get::<JsValue, _, _>(cx, "streamCreditFlushBytes") {
+                    if let Ok(fn_) = fv.downcast::<JsNumber, _>(cx) {
+                        let n = fn_.value(cx);
+                        if n.is_finite() && n >= 1.0 {
+                            cfg.stream_credit_flush_bytes = Some(n as u64);
+                            saw_bridge = true;
+                        }
+                    }
+                }
+
+                if saw_bridge {
+                    out.runtime_options.bridge = Some(cfg);
                 }
             }
         }
@@ -490,73 +644,40 @@ impl WorkerCreateOptions {
 
         // `moduleLoader`:
         // {
-        //   denoRemote?: boolean;
-        //   transpileTs?: boolean;
-        //   tsCompiler?: {
-        //     jsx?: "react" | "react-jsx" | "react-jsxdev" | "preserve";
-        //     jsxFactory?: string;
-        //     jsxFragmentFactory?: string;
-        //   };
+        //   httpsResolve?: boolean;
+        //   httpResolve?: boolean;
+        //   nodeResolve?: boolean;
+        //   jsrResolve?: boolean;
         //   cacheDir?: string;
         //   reload?: boolean;
+        //   maxPayloadBytes?: number;
         // }
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "moduleLoader") {
             if let Ok(o) = v.downcast::<JsObject, _>(cx) {
                 let mut cfg = ModuleLoaderConfig::default();
 
-                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "denoRemote") {
+                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "httpsResolve") {
                     if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
-                        cfg.deno_remote = rb.value(cx);
+                        cfg.https_resolve = rb.value(cx);
                     }
                 }
 
-                if let Ok(tv) = o.get::<JsValue, _, _>(cx, "transpileTs") {
-                    if let Ok(tb) = tv.downcast::<JsBoolean, _>(cx) {
-                        cfg.transpile_ts = tb.value(cx);
+                if let Ok(nv) = o.get::<JsValue, _, _>(cx, "nodeResolve") {
+                    if let Ok(nb) = nv.downcast::<JsBoolean, _>(cx) {
+                        cfg.node_resolve = nb.value(cx);
+                        out.runtime_options.node_resolve = cfg.node_resolve;
                     }
                 }
 
-                if let Ok(tcv) = o.get::<JsValue, _, _>(cx, "tsCompiler") {
-                    if let Ok(tco) = tcv.downcast::<JsObject, _>(cx) {
-                        let mut tc = TsCompilerConfig::default();
+                if let Ok(hv) = o.get::<JsValue, _, _>(cx, "httpResolve") {
+                    if let Ok(hb) = hv.downcast::<JsBoolean, _>(cx) {
+                        cfg.http_resolve = hb.value(cx);
+                    }
+                }
 
-                        if let Ok(jv) = tco.get::<JsValue, _, _>(cx, "jsx") {
-                            if let Ok(js) = jv.downcast::<JsString, _>(cx) {
-                                let s = js.value(cx);
-                                let t = s.trim();
-                                if matches!(t, "react" | "react-jsx" | "react-jsxdev" | "preserve")
-                                {
-                                    tc.jsx = Some(t.to_string());
-                                }
-                            }
-                        }
-
-                        if let Ok(fv) = tco.get::<JsValue, _, _>(cx, "jsxFactory") {
-                            if let Ok(fs) = fv.downcast::<JsString, _>(cx) {
-                                let s = fs.value(cx);
-                                let t = s.trim();
-                                if !t.is_empty() {
-                                    tc.jsx_factory = Some(t.to_string());
-                                }
-                            }
-                        }
-
-                        if let Ok(ffv) = tco.get::<JsValue, _, _>(cx, "jsxFragmentFactory") {
-                            if let Ok(ffs) = ffv.downcast::<JsString, _>(cx) {
-                                let s = ffs.value(cx);
-                                let t = s.trim();
-                                if !t.is_empty() {
-                                    tc.jsx_fragment_factory = Some(t.to_string());
-                                }
-                            }
-                        }
-
-                        if tc.jsx.is_some()
-                            || tc.jsx_factory.is_some()
-                            || tc.jsx_fragment_factory.is_some()
-                        {
-                            cfg.ts_compiler = Some(tc);
-                        }
+                if let Ok(jv) = o.get::<JsValue, _, _>(cx, "jsrResolve") {
+                    if let Ok(jb) = jv.downcast::<JsBoolean, _>(cx) {
+                        cfg.jsr_resolve = jb.value(cx);
                     }
                 }
 
@@ -576,14 +697,67 @@ impl WorkerCreateOptions {
                     }
                 }
 
+                if let Ok(mv) = o.get::<JsValue, _, _>(cx, "maxPayloadBytes") {
+                    if let Ok(mn) = mv.downcast::<JsNumber, _>(cx) {
+                        let n = mn.value(cx);
+                        if n.is_finite() {
+                            cfg.max_payload_bytes = n as i64;
+                        }
+                    }
+                }
+
                 out.runtime_options.module_loader = Some(cfg);
             }
         }
 
-        out.runtime_options.permissions = ensure_env_permission_enabled(
+        // Top-level `transpileTs`.
+        let mut top_level_transpile: Option<bool> = None;
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "transpileTs") {
+            if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
+                top_level_transpile = Some(b.value(cx));
+            }
+        }
+        if let Some(enabled) = top_level_transpile {
+            let cfg = out.runtime_options.module_loader.get_or_insert_with(Default::default);
+            cfg.transpile_ts = enabled;
+        }
+
+        // Top-level `tsCompiler` (preferred).
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "tsCompiler") {
+            if let Ok(tco) = v.downcast::<JsObject, _>(cx) {
+                if let Some(tc) = parse_ts_compiler_config(cx, tco) {
+                    let cfg = out.runtime_options.module_loader.get_or_insert_with(Default::default);
+                    cfg.ts_compiler = Some(tc);
+                }
+            }
+        }
+
+        let env_keys = out.runtime_options.env.as_ref().and_then(|cfg| match cfg {
+            EnvConfig::Map(map) => Some(map),
+        });
+        let (permissions, env_warnings) = ensure_env_permission_enabled(
             out.runtime_options.permissions.take(),
-            out.runtime_options.env.is_some(),
+            env_keys,
         );
+        out.runtime_options.permissions = permissions;
+        out.runtime_options.startup_warnings.extend(env_warnings);
+
+        if out
+            .runtime_options
+            .module_loader
+            .as_ref()
+            .map(|m| m.http_resolve)
+            .unwrap_or(false)
+        {
+            out.runtime_options.startup_warnings.push(
+                "moduleLoader.httpResolve is enabled; HTTP imports are insecure and can be tampered with in transit."
+                    .to_string(),
+            );
+        }
+
+        if out.runtime_options.max_stack_size_bytes.is_some() {
+            return cx.throw_error("maxStackSizeBytes is not supported yet");
+        }
 
         Ok(out)
     }
@@ -592,36 +766,61 @@ impl WorkerCreateOptions {
 #[cfg(test)]
 mod tests {
     use super::ensure_env_permission_enabled;
+    use std::collections::HashMap;
+
+    fn env_map(keys: &[&str]) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for k in keys {
+            out.insert((*k).to_string(), "v".to_string());
+        }
+        out
+    }
 
     #[test]
     fn ensure_env_permission_enabled_keeps_permissions_when_env_not_configured() {
         let original = Some(serde_json::json!({ "read": true, "env": false }));
-        let out = ensure_env_permission_enabled(original.clone(), false);
+        let (out, warnings) = ensure_env_permission_enabled(original.clone(), None);
         assert_eq!(out, original);
+        assert!(warnings.is_empty());
     }
 
     #[test]
-    fn ensure_env_permission_enabled_sets_env_true_when_missing() {
-        let out = ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), true);
-        assert_eq!(out, Some(serde_json::json!({ "read": true, "env": true })));
+    fn ensure_env_permission_enabled_sets_env_allow_list_when_missing() {
+        let env = env_map(&["A", "B"]);
+        let (out, warnings) =
+            ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), Some(&env));
+        let obj = out.expect("permissions");
+        let env_val = obj
+            .as_object()
+            .and_then(|o| o.get("env"))
+            .and_then(|v| v.as_array())
+            .expect("env list");
+        assert_eq!(env_val.len(), 2);
+        assert!(warnings.is_empty());
     }
 
     #[test]
-    fn ensure_env_permission_enabled_overrides_explicit_env_false() {
-        let out = ensure_env_permission_enabled(
-            Some(serde_json::json!({ "env": false, "write": ["./tmp"] })),
-            true,
+    fn ensure_env_permission_enabled_keeps_existing_env_allow_list() {
+        let env = env_map(&["A", "B"]);
+        let (out, warnings) = ensure_env_permission_enabled(
+            Some(serde_json::json!({ "env": ["A"], "write": ["./tmp"] })),
+            Some(&env),
         );
-        assert_eq!(out, Some(serde_json::json!({ "env": true, "write": ["./tmp"] })));
+        assert_eq!(
+            out,
+            Some(serde_json::json!({ "env": ["A"], "write": ["./tmp"] }))
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("B"));
     }
 
     #[test]
-    fn ensure_env_permission_enabled_handles_non_object_permissions() {
-        let out = ensure_env_permission_enabled(Some(serde_json::Value::Bool(true)), true);
-        assert_eq!(out, Some(serde_json::json!({ "env": true })));
-
-        let out_none = ensure_env_permission_enabled(None, true);
-        assert_eq!(out_none, Some(serde_json::json!({ "env": true })));
+    fn ensure_env_permission_enabled_keeps_env_false_and_warns() {
+        let env = env_map(&["A"]);
+        let (out, warnings) =
+            ensure_env_permission_enabled(Some(serde_json::json!({ "env": false })), Some(&env));
+        assert_eq!(out, Some(serde_json::json!({ "env": false })));
+        assert_eq!(warnings.len(), 1);
     }
 }
 

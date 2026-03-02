@@ -2,6 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -40,11 +41,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   it("does not resolve bare specifier when nodeResolve is disabled", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: false,
-    } as any);
+      moduleLoader: { nodeResolve: false },
+    });
 
     try {
       const code = `
@@ -58,11 +59,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   it("resolves bare specifier from node_modules when nodeResolve enabled", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: true,
-    } as any);
+      moduleLoader: { nodeResolve: true },
+    });
 
     try {
       const code = `
@@ -76,11 +77,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   it("nodeCompat behaves like nodeResolve (lightweight) for now", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
       nodeCompat: true,
-    } as any);
+    });
 
     try {
       const code = `
@@ -94,11 +95,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   it("resolves relative specifier from cwd when nodeResolve enabled", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: true,
-    } as any);
+      moduleLoader: { nodeResolve: true },
+    });
 
     try {
       const code = `
@@ -112,11 +113,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   test("nodeResolve: prefers .js over .ts when both exist for extensionless import", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: true,
-    } as any);
+      moduleLoader: { nodeResolve: true },
+    });
 
     try {
       writeFile(path.join(dir, "dep.js"), `export const v = "from-js";\n`);
@@ -134,11 +135,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   test("nodeResolve: package.json module field is preferred over main", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: true,
-    } as any);
+      moduleLoader: { nodeResolve: true },
+    });
 
     try {
       writeFile(
@@ -172,11 +173,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   test(
     "nodeResolve: supports package.json main without extension (falls back to .mjs/.js/.cjs)",
     async () => {
-      const dw = new DenoWorker({
+      const dw = createTestWorker({
         cwd: dir,
         imports: true,
-        nodeResolve: true,
-      } as any);
+        moduleLoader: { nodeResolve: true },
+      });
 
       try {
         writeFile(
@@ -201,11 +202,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   );
 
   test("nodeResolve: resolves scoped packages from node_modules", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: true,
-    } as any);
+      moduleLoader: { nodeResolve: true },
+    });
 
     try {
       writeFile(
@@ -229,11 +230,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   });
 
   test("nodeResolve: resolves bare package subpath with extension fallback", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeResolve: true,
-    } as any);
+      moduleLoader: { nodeResolve: true },
+    });
 
     try {
       writeFile(
@@ -257,11 +258,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   test(
     "nodeResolve: extensionless directory imports currently do not resolve to index.* (document current behavior)",
     async () => {
-      const dw = new DenoWorker({
+      const dw = createTestWorker({
         cwd: dir,
         imports: true,
-        nodeResolve: true,
-      } as any);
+        moduleLoader: { nodeResolve: true },
+      });
 
       try {
         writeFile(path.join(dir, "dir", "index.js"), `export const v = "index";\n`);
@@ -281,11 +282,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
   test(
     "nodeResolve: bare package directory subpath imports currently do not resolve to index.* (document current behavior)",
     async () => {
-      const dw = new DenoWorker({
+      const dw = createTestWorker({
         cwd: dir,
         imports: true,
-        nodeResolve: true,
-      } as any);
+        moduleLoader: { nodeResolve: true },
+      });
 
       try {
         writeFile(

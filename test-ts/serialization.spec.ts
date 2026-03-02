@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 import fc from "fast-check";
 import { isDateLike } from "./helpers.assertions";
 
@@ -21,7 +22,7 @@ describe("deno_worker: data serialization", () => {
   };
 
   it("round-trips JSON primitives and structures", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     await expect(dw.eval(identityFn, { args: ["Hello, 🌍!"] })).resolves.toBe("Hello, 🌍!");
     await expect(dw.eval(identityFn, { args: [42] })).resolves.toBe(42);
@@ -46,7 +47,7 @@ describe("deno_worker: data serialization", () => {
 
 
   it("round-trips NaN and Infinity as primitive numbers", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     const nan = await dw.eval("(x) => x", { args: [Number.NaN] });
     expect(Number.isNaN(nan)).toBe(true);
@@ -59,7 +60,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("preserves -0 as a primitive number and on return", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     const out = await dw.eval("(x) => x", { args: [-0] });
     expect(Object.is(out, -0)).toBe(true);
@@ -69,7 +70,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("round-trips Date instances", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const input = new Date("2020-01-01T00:00:00Z");
     const result = await dw.eval(identityFn, { args: [input] });
 
@@ -78,7 +79,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("round-trips Uint8Array / Buffer payloads", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const input = Buffer.from([1, 2, 3, 4]);
     const result = await dw.eval(identityFn, { args: [input] });
 
@@ -87,7 +88,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("preserves -0 across the bridge (args and return)", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     const out = await dw.eval(identityFn, { args: [-0] });
     expect(Object.is(out, -0)).toBe(true);
@@ -100,7 +101,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("converts small BigInt results to Number when lossless, rejects when too large", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     await expect(dw.eval("1n")).resolves.toBe(1);
 
@@ -108,7 +109,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("does not mutate the original arguments (copy semantics)", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
     const inputObj: any = { val: 1 };
 
     const script = "(x) => { x.val = 999; return x; }";
@@ -119,7 +120,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("preserves recursive object graphs (Node -> Deno args)", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     const a: any = { name: "a" };
     const b: any = { name: "b", a };
@@ -135,7 +136,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("preserves recursive object graphs (Deno -> Node result)", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     const out: any = await dw.eval(`
       (() => {
@@ -154,7 +155,7 @@ describe("deno_worker: data serialization", () => {
   });
 
   it("property-based: round-trips JSON-serializable values", async () => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
 
     await fc.assert(
       fc.asyncProperty(fc.jsonValue(), async (data) => {

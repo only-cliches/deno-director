@@ -6,6 +6,7 @@
 // Usage:
 //   npx tsx bench/bandwidth.ts
 //   npx tsx bench/bandwidth.ts --duration-ms 3000 --size 4192 --messages 200 --ack-every 25
+//   npx tsx bench/bandwidth.ts --size 262144 --messages 400 --graph-messages 60 --eval-iter 20 --duration-ms 3000 --warmup 3 --timeout-ms 60000 --stream-sweep --stream-sizes 4096,16384,65536,262144,1048576 --stream-sweep-total-mib 64
 //   npx tsx bench/bandwidth.ts --log-queue
 //
 // Notes:
@@ -30,6 +31,9 @@ type Args = {
   timeoutMs: number;
   logQueue: boolean;
   logEverySend: number;
+  streamSweep: boolean;
+  streamSweepSizes: number[];
+  streamSweepTotalMiB: number;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -48,6 +52,9 @@ function parseArgs(argv: string[]): Args {
     timeoutMs: 20_000,
     logQueue: false,
     logEverySend: 0,
+    streamSweep: false,
+    streamSweepSizes: [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024],
+    streamSweepTotalMiB: 1,
   };
 
   const take = (k: string) => {
@@ -66,6 +73,16 @@ function parseArgs(argv: string[]): Args {
     const n = Number(s);
     return Number.isFinite(n) ? n : fallback;
   };
+  const parseSizes = (s: string | undefined, fallback: number[]) => {
+    if (!s) return fallback;
+    const parts = s
+      .split(",")
+      .map((v) => Number(v.trim()))
+      .filter((v) => Number.isFinite(v) && v > 0)
+      .map((v) => Math.floor(v));
+    if (parts.length === 0) return fallback;
+    return [...new Set(parts)];
+  };
 
   out.size = toInt(take("--size"), out.size);
   out.messages = toInt(take("--messages"), out.messages);
@@ -79,9 +96,12 @@ function parseArgs(argv: string[]): Args {
   out.warmup = toInt(take("--warmup"), out.warmup);
   out.timeoutMs = toInt(take("--timeout-ms"), out.timeoutMs);
   out.logEverySend = toInt(take("--log-every-send"), out.logEverySend);
+  out.streamSweepSizes = parseSizes(take("--stream-sizes"), out.streamSweepSizes);
+  out.streamSweepTotalMiB = Math.max(0.01, toFloat(take("--stream-sweep-total-mib"), out.streamSweepTotalMiB));
 
   out.json = argv.includes("--json");
   out.logQueue = argv.includes("--log-queue");
+  out.streamSweep = argv.includes("--stream-sweep");
 
   return out;
 }
@@ -230,6 +250,14 @@ function safeJson(v: unknown): string {
   } catch {
     return String(v);
   }
+}
+
+function makeBenchKey(prefix: string): string {
+  const g = globalThis as any;
+  if (g?.crypto && typeof g.crypto.randomUUID === "function") {
+    return `${prefix}:${g.crypto.randomUUID()}`;
+  }
+  return `${prefix}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
 }
 
 /**
@@ -462,6 +490,41 @@ function buildWorkerBenchModuleSource(): string {
         const payload = new Uint8Array(size >>> 0);
         for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
         return Array.from(payload);
+      },
+
+      async workerToNodeStream(size, messages, key) {
+        const stream = hostStreams.create(key);
+        const payload = new Uint8Array(size >>> 0);
+        for (let i = 0; i < payload.length; i++) payload[i] = i & 0xff;
+
+        const n = messages >>> 0;
+        let sent = 0;
+        let bytes = 0;
+        for (let i = 0; i < n; i++) {
+          await stream.write(payload);
+          sent++;
+          bytes += payload.byteLength;
+        }
+        await stream.close();
+        postMessage({ __bench_done: true, kind: "workerToNodeStreamWriteDone", sent, bytes });
+        return { sent, bytes };
+      },
+
+      async nodeToWorkerStreamDrain(key) {
+        const stream = await hostStreams.accept(String(key || ""));
+        let receivedMsgs = 0;
+        let receivedBytes = 0;
+        for await (const chunk of stream) {
+          receivedMsgs++;
+          receivedBytes += chunk.byteLength;
+        }
+        postMessage({
+          __bench_done: true,
+          kind: "nodeToWorkerStream",
+          receivedMsgs,
+          receivedBytes,
+        });
+        return { receivedMsgs, receivedBytes };
       },
     };
 
@@ -988,6 +1051,132 @@ async function benchNodeToWorkerRecursiveGraph(
   };
 }
 
+async function benchNodeToWorkerStream(
+  dw: DenoWorker,
+  bus: MessageBus,
+  args: Args,
+  label?: string
+): Promise<BenchResult> {
+  const { size, messages, warmup, timeoutMs } = args;
+  const payload = makeBytes(size);
+  const warmSize = Math.max(1024, Math.min(16_384, size));
+  const warmPayload = makeBytes(warmSize);
+  const warmMessages = 4;
+
+  for (let i = 0; i < warmup; i++) {
+    const warmKey = makeBenchKey("bench:n2w-stream:warm");
+    void dw.evalModule(
+      `void globalThis.__bench.nodeToWorkerStreamDrain(${JSON.stringify(warmKey)}); export const __bench = true;`
+    );
+    const writer = dw.stream.create(warmKey);
+    for (let j = 0; j < warmMessages; j++) {
+      // eslint-disable-next-line no-await-in-loop
+      await writer.write(warmPayload);
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await writer.close();
+    // eslint-disable-next-line no-await-in-loop
+    await bus.waitFor(
+      (m) => m && m.__bench_done === true && m.kind === "nodeToWorkerStream",
+      timeoutMs,
+      "nodeToWorkerStream warmup done"
+    );
+  }
+
+  const key = makeBenchKey("bench:n2w-stream");
+  const start = nowNs();
+
+  void dw.evalModule(
+    `void globalThis.__bench.nodeToWorkerStreamDrain(${JSON.stringify(key)}); export const __bench = true;`
+  );
+
+  const writer = dw.stream.create(key);
+  for (let i = 0; i < messages; i++) {
+    // eslint-disable-next-line no-await-in-loop
+    await writer.write(payload);
+  }
+  await writer.close();
+
+  const done = await bus.waitFor(
+    (m) => m && m.__bench_done === true && m.kind === "nodeToWorkerStream",
+    timeoutMs,
+    "nodeToWorkerStream done"
+  );
+  const end = nowNs();
+
+  const receivedBytes =
+    typeof done.receivedBytes === "number" ? done.receivedBytes : messages * payload.byteLength;
+  const seconds = nsToSec(end - start);
+
+  return {
+    name: label || "Node -> Worker stream.create/write (Buffer -> Uint8Array)",
+    bytes: receivedBytes,
+    seconds,
+    mibPerSec: mibPerSec(receivedBytes, seconds),
+    extra: { receivedMsgs: done.receivedMsgs },
+  };
+}
+
+async function benchWorkerToNodeStream(
+  dw: DenoWorker,
+  bus: MessageBus,
+  args: Args,
+  label?: string
+): Promise<BenchResult> {
+  const { size, messages, warmup, timeoutMs } = args;
+  const warmSize = Math.max(1024, Math.min(16_384, size));
+  const warmMessages = 5;
+
+  for (let i = 0; i < warmup; i++) {
+    const warmKey = makeBenchKey("bench:w2n-stream:warm");
+    const warmReaderPromise = dw.stream.accept(warmKey);
+    void dw.evalModule(
+      `void globalThis.__bench.workerToNodeStream(${warmSize}, ${warmMessages}, ${JSON.stringify(warmKey)}); export const __bench = true;`
+    );
+    const warmReader = await warmReaderPromise;
+    for await (const _ of warmReader) {
+      // drain
+    }
+    await bus.waitFor(
+      (m) => m && m.__bench_done === true && m.kind === "workerToNodeStreamWriteDone",
+      timeoutMs,
+      "workerToNodeStream warmup done"
+    );
+  }
+
+  const key = makeBenchKey("bench:w2n-stream");
+  const readerPromise = dw.stream.accept(key);
+
+  const start = nowNs();
+  void dw.evalModule(
+    `void globalThis.__bench.workerToNodeStream(${size}, ${messages}, ${JSON.stringify(key)}); export const __bench = true;`
+  );
+  const reader = await readerPromise;
+
+  let receivedMsgs = 0;
+  let receivedBytes = 0;
+  for await (const chunk of reader) {
+    receivedMsgs++;
+    receivedBytes += chunk.byteLength;
+  }
+
+  await bus.waitFor(
+    (m) => m && m.__bench_done === true && m.kind === "workerToNodeStreamWriteDone",
+    timeoutMs,
+    "workerToNodeStream done"
+  );
+  const end = nowNs();
+  const seconds = nsToSec(end - start);
+
+  return {
+    name: label || "Worker -> Node hostStreams.create/write (Uint8Array stream)",
+    bytes: receivedBytes,
+    seconds,
+    mibPerSec: mibPerSec(receivedBytes, seconds),
+    extra: { receivedMsgs },
+  };
+}
+
 async function benchEvalReturnBytes(
   dw: DenoWorker,
   args: Args,
@@ -1035,7 +1224,7 @@ async function main() {
 
  
 
-  const dw = new DenoWorker({ imports: false, channelSize: 4096 });
+  const dw = new DenoWorker({ imports: false, bridge: { channelSize: 4096 } });
   const bus = new MessageBus(dw, { logQueue: args.logQueue });
 
   try {
@@ -1049,10 +1238,12 @@ async function main() {
     results.push(await benchNodeToWorkerPostMessage(dw, bus, args));
     results.push(await benchNodeToWorkerPostMessagesBatch(dw, bus, args));
     results.push(await benchNodeToWorkerRecursiveGraph(dw, bus, args));
+    results.push(await benchNodeToWorkerStream(dw, bus, args));
    
 
    
     results.push(await benchWorkerToNodePostMessage(dw, bus, args));
+    results.push(await benchWorkerToNodeStream(dw, bus, args));
    
 
    
@@ -1073,6 +1264,34 @@ async function main() {
      
     }
 
+    if (args.streamSweep) {
+      const targetBytes = Math.max(1, Math.floor(args.streamSweepTotalMiB * 1024 * 1024));
+      for (const chunkSize of args.streamSweepSizes) {
+        const sweepMessages = Math.max(1, Math.ceil(targetBytes / chunkSize));
+        const sweepArgs: Args = {
+          ...args,
+          size: chunkSize,
+          messages: sweepMessages,
+        };
+        results.push(
+          await benchNodeToWorkerStream(
+            dw,
+            bus,
+            sweepArgs,
+            `Node -> Worker stream sweep (${chunkSize} B chunks)`
+          )
+        );
+        results.push(
+          await benchWorkerToNodeStream(
+            dw,
+            bus,
+            sweepArgs,
+            `Worker -> Node stream sweep (${chunkSize} B chunks)`
+          )
+        );
+      }
+    }
+
     // eslint-disable-next-line no-console
     console.log(
       [
@@ -1084,6 +1303,9 @@ async function main() {
         `  worker->node duration: ${args.durationMs} ms`,
         `  eval iters: ${args.evalIter}`,
         `  timeout: ${args.timeoutMs} ms`,
+        `  stream sweep: ${args.streamSweep ? "on" : "off"}`,
+        `  stream sweep sizes: ${args.streamSweepSizes.join(", ")}`,
+        `  stream sweep total: ${fmt(args.streamSweepTotalMiB, 3)} MiB`,
         "",
       ].join("\n")
     );

@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -6,7 +7,7 @@ describe("deno_worker: promises and error propagation", () => {
   let dw: DenoWorker;
 
   beforeEach(() => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
   });
 
   afterEach(async () => {
@@ -37,7 +38,7 @@ describe("deno_worker: promises and error propagation", () => {
       throw new Error("SyncBoom");
     });
 
-    await dw.setGlobal("nodeFn", nodeFn as any);
+    await dw.setGlobal("nodeFn", nodeFn);
 
     const script = `
       (async () => {

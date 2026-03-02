@@ -1,11 +1,12 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 import { assertErrorLike, isDateLike } from "./helpers.assertions";
 
 describe("DenoWorker data and errors", () => {
   let dw: DenoWorker;
 
   beforeEach(() => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
   });
 
   afterEach(async () => {

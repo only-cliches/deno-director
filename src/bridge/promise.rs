@@ -70,14 +70,14 @@ impl PromiseSettler {
         self.deferred.take()
     }
 
-    fn try_send_task<F>(&self, deferred: neon::types::Deferred, f: F)
+    fn send_task<F>(&self, deferred: neon::types::Deferred, f: F)
     where
         F: for<'a> FnOnce(&mut TaskContext<'a>, neon::types::Deferred) + Send + 'static,
     {
         // Put deferred behind a guard so if enqueue fails, Drop leaks it.
         let mut guard = DeferredGuard::new(deferred);
 
-        let _ = self.channel.try_send(move |mut cx| {
+        let _ = self.channel.send(move |mut cx| {
             let d = guard.take();
             f(&mut cx, d);
             Ok(())
@@ -95,7 +95,7 @@ impl PromiseSettler {
 
         let message = message.into();
 
-        self.try_send_task(deferred, move |cx, deferred| {
+        self.send_task(deferred, move |cx, deferred| {
             let err_val: Handle<JsValue> = match cx.error(message) {
                 Ok(e) => e.upcast(),
                 Err(_) => cx.string("Promise rejected").upcast(),
@@ -110,7 +110,7 @@ impl PromiseSettler {
         };
         let date_ctor = self.date_ctor.clone();
 
-        self.try_send_task(deferred, move |cx, deferred| {
+        self.send_task(deferred, move |cx, deferred| {
             let v: Handle<JsValue> = match (&value, date_ctor.as_ref()) {
                 (JsValueBridge::DateMs(ms), Some(date_ctor)) => cx
                     .try_catch(|cx| {
@@ -137,7 +137,7 @@ impl PromiseSettler {
             return;
         };
 
-        self.try_send_task(deferred, move |cx, deferred| {
+        self.send_task(deferred, move |cx, deferred| {
             // IMPORTANT: run conversion inside try_catch so a Throw does not leave
             // a pending exception in this Channel callback.
             let v: Handle<JsValue> = cx
@@ -257,7 +257,7 @@ impl Drop for PromiseSettler {
         // Reject on drop. If we cannot enqueue, the guard leaks the Deferred.
         let mut guard = DeferredGuard::new(deferred);
 
-        let _ = self.channel.try_send(move |mut cx| {
+        let _ = self.channel.send(move |mut cx| {
             let deferred = guard.take();
             let err_handle: Handle<JsValue> = cx
                 .error("Internal error: promise was dropped without being settled")

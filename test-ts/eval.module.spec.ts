@@ -1,13 +1,12 @@
 // src/__tests__/eval_module.spec.ts
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 describe("evalModule: module namespace API", () => {
   jest.setTimeout(60_000);
 
   test("returns a module namespace object with named exports", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const mod = await dw.evalModule(`
         export const cfg = {
@@ -32,7 +31,7 @@ describe("evalModule: module namespace API", () => {
   });
 
   test("supports default export on the returned namespace", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const mod = await dw.evalModule(`
         export default function add(a, b) { return a + b; }
@@ -49,7 +48,7 @@ describe("evalModule: module namespace API", () => {
   });
 
   test("module evaluation can return expanded types via exports", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const mod = await dw.evalModule(`
         export const bi = 9007199254740993n;
@@ -95,9 +94,10 @@ describe("evalModule: module namespace API", () => {
       // expect(mod.err).toBeInstanceOf(Error);
       expect(mod.err.name).toBe("MyError");
       expect(mod.err.message).toBe("top");
-      if ((mod.err as any).cause != null) {
-        expect((mod.err as any).cause).toBeInstanceOf(Error);
-        expect(String((mod.err as any).cause.message)).toBe("root");
+      const errWithCause = mod.err as Error & { cause?: unknown };
+      if (errWithCause.cause != null) {
+        expect(errWithCause.cause).toBeInstanceOf(Error);
+        expect(String((errWithCause.cause as Error).message)).toBe("root");
       }
     } finally {
       await dw.close();
@@ -105,7 +105,7 @@ describe("evalModule: module namespace API", () => {
   });
 
   test("multiple evalModule calls return independent namespaces", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       const a = await dw.evalModule(`export const n = 1;`);
       const b = await dw.evalModule(`export const n = 2;`);
@@ -117,8 +117,26 @@ describe("evalModule: module namespace API", () => {
     }
   });
 
+  test("transpiles TypeScript in evalModule when top-level transpileTs is enabled", async () => {
+    const dw = createTestWorker({
+      transpileTs: true,
+      console: false,
+    });
+    try {
+      const mod = await dw.evalModule(`
+        export type User = { id: number };
+        const user: User = { id: 42 };
+        export const out: number = user.id;
+      `);
+
+      expect(mod.out).toBe(42);
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("async module exports do not deadlock when awaiting async host callbacks", async () => {
-    const dw = new DenoWorker({ console: false });
+    const dw = createTestWorker({ console: false });
     try {
       await dw.setGlobal("hostFetchData", async (userId: string) => {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -150,7 +168,7 @@ describe("evalModule: module namespace API", () => {
   test(
     "sync module exports that invoke host callbacks fail fast under evalSync path",
     async () => {
-      const dw = new DenoWorker({ console: false });
+      const dw = createTestWorker({ console: false });
       try {
         await dw.setGlobal("hostDouble", (x: number) => x * 2);
 

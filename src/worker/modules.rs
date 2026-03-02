@@ -11,6 +11,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -218,7 +219,17 @@ pub struct DynamicModuleLoader {
 
 impl DynamicModuleLoader {
     fn node_disk_resolve_enabled(&self) -> bool {
-        self.node_resolve || self.node_compat
+        self.node_resolve
+            || self.node_compat
+            || self
+                .module_loader
+                .as_ref()
+                .map(|m| m.node_resolve)
+                .unwrap_or(false)
+    }
+
+    fn jsr_resolve_enabled(&self) -> bool {
+        self.module_loader_cfg().jsr_resolve
     }
 
     pub fn is_internal_virtual_url(u: &Url) -> bool {
@@ -237,6 +248,22 @@ impl DynamicModuleLoader {
             return false;
         }
         true
+    }
+
+    fn map_jsr_specifier(specifier: &str) -> Option<String> {
+        if let Some(rest) = specifier.strip_prefix("jsr:") {
+            let rest = rest.trim().trim_start_matches('/');
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(format!("https://jsr.io/{rest}"));
+        }
+
+        if specifier.starts_with("@std/") {
+            return Some(format!("https://jsr.io/{specifier}"));
+        }
+
+        None
     }
 
     pub fn encode_resolve_url(&self, specifier: &str, referrer: &str) -> Url {
@@ -271,7 +298,8 @@ impl DynamicModuleLoader {
             return false;
         };
 
-        let cand_abs = std::fs::canonicalize(&path).unwrap_or(path);
+        let cand_abs = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(&path));
         cand_abs.starts_with(&root_abs)
     }
 
@@ -559,12 +587,42 @@ impl DynamicModuleLoader {
         Ok(())
     }
 
+    fn ensure_remote_load_allowed(&self, resolved: &Url) -> Result<(), JsErrorBox> {
+        if resolved.scheme() != "http" && resolved.scheme() != "https" {
+            return Ok(());
+        }
+
+        if resolved.scheme() == "https" && !self.https_resolve_enabled() {
+            return Err(JsErrorBox::generic(format!(
+                "Remote HTTPS import blocked (moduleLoader.httpsResolve disabled): {}",
+                resolved
+            )));
+        }
+
+        if resolved.scheme() == "http" && !self.http_resolve_enabled() {
+            return Err(JsErrorBox::generic(format!(
+                "Remote HTTP import blocked (moduleLoader.httpResolve disabled): {}",
+                resolved
+            )));
+        }
+
+        self.ensure_remote_permissions(resolved)
+    }
+
     fn module_loader_cfg(&self) -> crate::worker::state::ModuleLoaderConfig {
         self.module_loader.clone().unwrap_or_default()
     }
 
-    fn deno_remote_enabled(&self) -> bool {
-        self.module_loader_cfg().deno_remote
+    fn https_resolve_enabled(&self) -> bool {
+        self.module_loader_cfg().https_resolve
+    }
+
+    fn http_resolve_enabled(&self) -> bool {
+        self.module_loader_cfg().http_resolve
+    }
+
+    fn max_payload_bytes(&self) -> i64 {
+        self.module_loader_cfg().max_payload_bytes
     }
 
     fn transpile_ts_enabled(&self) -> bool {
@@ -603,24 +661,65 @@ impl DynamicModuleLoader {
         base.join(format!("{h:016x}.{ext}"))
     }
 
-    async fn fetch_remote_text(module_specifier: &Url) -> Result<String, JsErrorBox> {
-        let out = std::process::Command::new("curl")
-            .arg("--fail")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--location")
-            .arg(module_specifier.as_str())
-            .output()
+    async fn fetch_remote_text(
+        module_specifier: &Url,
+        max_payload_bytes: i64,
+    ) -> Result<String, JsErrorBox> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|e| JsErrorBox::generic(format!("Remote fetch client build failed: {e}")))?;
+
+        let mut resp = client
+            .get(module_specifier.clone())
+            .send()
+            .await
             .map_err(|e| JsErrorBox::generic(format!("Remote fetch failed: {e}")))?;
 
-        if !out.status.success() {
+        let status = resp.status();
+        if !status.is_success() {
             return Err(JsErrorBox::generic(format!(
                 "Remote fetch failed (status={}): {}",
-                out.status, module_specifier
+                status, module_specifier
             )));
         }
 
-        String::from_utf8(out.stdout)
+        let limit = if max_payload_bytes < 0 {
+            None
+        } else {
+            Some(max_payload_bytes as usize)
+        };
+
+        if let (Some(limit), Some(content_len)) = (limit, resp.content_length()) {
+            if content_len > limit as u64 {
+                return Err(JsErrorBox::generic(format!(
+                    "Remote payload too large: {} bytes exceeds limit {} for {}",
+                    content_len, limit, module_specifier
+                )));
+            }
+        }
+
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let next = resp
+                .chunk()
+                .await
+                .map_err(|e| JsErrorBox::generic(format!("Remote body read failed: {e}")))?;
+            let Some(chunk) = next else { break };
+            if let Some(limit) = limit {
+                let next_len = bytes.len().saturating_add(chunk.len());
+                if next_len > limit {
+                    return Err(JsErrorBox::generic(format!(
+                        "Remote payload too large: exceeds limit {} for {}",
+                        limit, module_specifier
+                    )));
+                }
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        String::from_utf8(bytes)
             .map_err(|e| JsErrorBox::generic(format!("Remote body decode failed: {e}")))
     }
 
@@ -668,6 +767,35 @@ impl DynamicModuleLoader {
         out
     }
 
+    fn compiler_cache_dir_from_cfg(
+        cfg: &crate::worker::state::ModuleLoaderConfig,
+    ) -> Option<PathBuf> {
+        cfg.ts_compiler
+            .as_ref()
+            .and_then(|tc| tc.cache_dir.as_ref())
+            .map(PathBuf::from)
+    }
+
+    fn transpile_cache_path(
+        cache_dir: &PathBuf,
+        module_specifier: &Url,
+        ext: &str,
+        code: &str,
+        cfg: &crate::worker::state::ModuleLoaderConfig,
+    ) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        module_specifier.as_str().hash(&mut hasher);
+        ext.hash(&mut hasher);
+        code.hash(&mut hasher);
+        if let Some(tc) = cfg.ts_compiler.as_ref() {
+            tc.jsx.hash(&mut hasher);
+            tc.jsx_factory.hash(&mut hasher);
+            tc.jsx_fragment_factory.hash(&mut hasher);
+        }
+        let h = hasher.finish();
+        cache_dir.join(format!("{h:016x}.js"))
+    }
+
     fn maybe_transpile_ts_like(
         &self,
         module_specifier: &Url,
@@ -681,12 +809,24 @@ impl DynamicModuleLoader {
         if !self.transpile_ts_enabled() {
             return Err(JsErrorBox::generic(format!(
                 "Import returned .{ext} source but TypeScript transpilation is disabled. \
-Enable it with moduleLoader: {{ transpileTs: true }}. Specifier: {}",
+Enable it with transpileTs: true. Specifier: {}",
                 module_specifier
             )));
         }
 
         let media_type = Self::media_type_for_ext(ext);
+        let cfg = self.module_loader_cfg();
+        let maybe_cache_path =
+            Self::compiler_cache_dir_from_cfg(&cfg)
+                .map(|dir| Self::transpile_cache_path(&dir, module_specifier, ext, &code, &cfg));
+        if !cfg.reload {
+            if let Some(cache_path) = maybe_cache_path.as_ref() {
+                if let Ok(hit) = std::fs::read_to_string(cache_path) {
+                    return Ok(hit);
+                }
+            }
+        }
+
         let parsed = deno_ast::parse_module(deno_ast::ParseParams {
             specifier: module_specifier.clone(),
             text: code.into(),
@@ -697,7 +837,6 @@ Enable it with moduleLoader: {{ transpileTs: true }}. Specifier: {}",
         })
         .map_err(|e| JsErrorBox::from_err(JsParseDiagnostic(e)))?;
 
-        let cfg = self.module_loader_cfg();
         let transpiled = parsed
             .transpile(
                 &Self::transpile_options_from_cfg(&cfg),
@@ -709,6 +848,13 @@ Enable it with moduleLoader: {{ transpileTs: true }}. Specifier: {}",
             )
             .map_err(|e| JsErrorBox::from_err(JsTranspileError(e)))?
             .into_source();
+
+        if let Some(cache_path) = maybe_cache_path.as_ref() {
+            if let Some(parent) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(cache_path, transpiled.text.as_bytes());
+        }
 
         Ok(transpiled.text)
     }
@@ -749,8 +895,22 @@ impl ModuleLoader for DynamicModuleLoader {
         }
 
         // Optional Deno-style remote imports.
-        if self.deno_remote_enabled()
-            && (specifier.starts_with("http://") || specifier.starts_with("https://"))
+        if self.jsr_resolve_enabled() {
+            if let Some(jsr_spec) = Self::map_jsr_specifier(specifier) {
+                return self.try_deno_resolve(&jsr_spec, referrer);
+            }
+        }
+
+        // Fast-fail unsupported bare specifiers so imports do not hang waiting
+        // on fallback resolvers when neither Node nor JSR resolution is enabled.
+        if Self::is_bare_specifier(specifier) && !self.node_disk_resolve_enabled() {
+            return Err(JsErrorBox::generic(format!(
+                "Bare import cannot be resolved without moduleLoader.nodeResolve or moduleLoader.jsrResolve: {specifier}"
+            )));
+        }
+
+        if (specifier.starts_with("http://") && self.http_resolve_enabled())
+            || (specifier.starts_with("https://") && self.https_resolve_enabled())
         {
             return self.try_deno_resolve(specifier, referrer);
         }
@@ -838,7 +998,16 @@ impl ModuleLoader for DynamicModuleLoader {
                     return Err(JsErrorBox::generic("Imports callback unavailable"));
                 }
 
-                let decision = rx.await.unwrap_or(ImportDecision::Block);
+                let decision = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                    Ok(Ok(decision)) => decision,
+                    Ok(Err(_)) => ImportDecision::Block,
+                    Err(_) => {
+                        return Err(JsErrorBox::generic(format!(
+                            "Import callback timed out: {}",
+                            orig_spec
+                        )));
+                    }
+                };
 
                 match decision {
                     ImportDecision::Block => Err(JsErrorBox::generic(format!(
@@ -850,6 +1019,13 @@ impl ModuleLoader for DynamicModuleLoader {
                         let resolved = this_loader
                             .try_node_resolve_disk(&orig_spec, &orig_referrer)
                             .or_else(|| {
+                                DynamicModuleLoader::map_jsr_specifier(&orig_spec).and_then(
+                                    |jsr_spec| {
+                                        this_loader.try_deno_resolve(&jsr_spec, &orig_referrer).ok()
+                                    },
+                                )
+                            })
+                            .or_else(|| {
                                 this_loader
                                     .try_deno_resolve(&orig_spec, &orig_referrer)
                                     .ok()
@@ -860,6 +1036,8 @@ impl ModuleLoader for DynamicModuleLoader {
                                     orig_spec
                                 ))
                             })?;
+
+                        this_loader.ensure_remote_load_allowed(&resolved)?;
 
                         if resolved.scheme() == "file" && !this_loader.within_sandbox(&resolved) {
                             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
@@ -897,6 +1075,11 @@ impl ModuleLoader for DynamicModuleLoader {
                         let resolved = Url::parse(ns)
                             .ok()
                             .or_else(|| this_loader.try_node_resolve_disk(ns, &orig_referrer))
+                            .or_else(|| {
+                                DynamicModuleLoader::map_jsr_specifier(ns).and_then(|jsr_spec| {
+                                    this_loader.try_deno_resolve(&jsr_spec, &orig_referrer).ok()
+                                })
+                            })
                             .or_else(|| this_loader.try_deno_resolve(ns, &orig_referrer).ok())
                             .ok_or_else(|| {
                                 JsErrorBox::generic(format!(
@@ -904,6 +1087,8 @@ impl ModuleLoader for DynamicModuleLoader {
                                     new_spec
                                 ))
                             })?;
+
+                        this_loader.ensure_remote_load_allowed(&resolved)?;
 
                         if resolved.scheme() == "file" && !this_loader.within_sandbox(&resolved) {
                             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
@@ -969,8 +1154,8 @@ impl ModuleLoader for DynamicModuleLoader {
         }
 
         // 5) Non-callback: allow disk loads directly
-        if (module_specifier.scheme() == "http" || module_specifier.scheme() == "https")
-            && self.deno_remote_enabled()
+        if (module_specifier.scheme() == "http" && self.http_resolve_enabled())
+            || (module_specifier.scheme() == "https" && self.https_resolve_enabled())
         {
             let this_loader = self.clone_for_async();
             let module_specifier = module_specifier.clone();
@@ -989,7 +1174,11 @@ impl ModuleLoader for DynamicModuleLoader {
                 let code = match maybe_cached {
                     Some(s) => s,
                     None => {
-                        let s = DynamicModuleLoader::fetch_remote_text(&module_specifier).await?;
+                        let s = DynamicModuleLoader::fetch_remote_text(
+                            &module_specifier,
+                            this_loader.max_payload_bytes(),
+                        )
+                        .await?;
                         if let Some(parent) = cache_path.parent() {
                             let _ = tokio::fs::create_dir_all(parent).await;
                         }
@@ -1028,12 +1217,35 @@ impl ModuleLoader for DynamicModuleLoader {
 
 #[cfg(test)]
 mod tests {
-    use super::ModuleRegistry;
+    use super::{DynamicModuleLoader, ModuleRegistry};
+    use crate::worker::state::{ImportsPolicy, ModuleLoaderConfig};
     use deno_core::url::Url;
+    use deno_runtime::deno_core;
     use deno_runtime::deno_core::ModuleType;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn test_registry(limit: usize) -> ModuleRegistry {
         ModuleRegistry::with_persistent_limit_for_test(limit)
+    }
+
+    fn test_loader(https_resolve: bool, permissions: serde_json::Value) -> DynamicModuleLoader {
+        let (node_tx, _node_rx) = mpsc::channel(1);
+        DynamicModuleLoader {
+            reg: ModuleRegistry::new(Url::parse("file:///tmp/").expect("url")),
+            node_tx,
+            imports_policy: ImportsPolicy::Callback,
+            node_resolve: false,
+            node_compat: false,
+            sandbox_root: PathBuf::from("/tmp"),
+            fs_loader: Arc::new(deno_core::FsModuleLoader),
+            module_loader: Some(ModuleLoaderConfig {
+                https_resolve,
+                ..ModuleLoaderConfig::default()
+            }),
+            permissions: Some(permissions),
+        }
     }
 
     #[test]
@@ -1076,5 +1288,37 @@ mod tests {
         let c = format!("{}/c.js", base.as_str().trim_end_matches('/'));
         reg.put_persistent(&c, "export const c = 1;", ModuleType::JavaScript);
         assert!(!reg.has(&a));
+    }
+
+    #[test]
+    fn remote_load_blocked_when_https_resolve_disabled() {
+        let loader = test_loader(false, serde_json::json!({ "import": true, "net": true }));
+        let url = Url::parse("https://example.com/mod.ts").expect("url");
+        assert!(loader.ensure_remote_load_allowed(&url).is_err());
+    }
+
+    #[test]
+    fn remote_load_requires_import_and_net_permissions() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": false }));
+        let url = Url::parse("https://example.com/mod.ts").expect("url");
+        assert!(loader.ensure_remote_load_allowed(&url).is_err());
+
+        let loader2 = test_loader(true, serde_json::json!({ "import": false, "net": true }));
+        assert!(loader2.ensure_remote_load_allowed(&url).is_err());
+
+        let ok = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        assert!(ok.ensure_remote_load_allowed(&url).is_ok());
+    }
+
+    #[test]
+    fn map_jsr_specifier_maps_jsr_and_std_forms() {
+        let a = DynamicModuleLoader::map_jsr_specifier("jsr:@std/assert");
+        assert_eq!(a.as_deref(), Some("https://jsr.io/@std/assert"));
+
+        let b = DynamicModuleLoader::map_jsr_specifier("@std/assert/equals");
+        assert_eq!(b.as_deref(), Some("https://jsr.io/@std/assert/equals"));
+
+        let c = DynamicModuleLoader::map_jsr_specifier("@scope/pkg");
+        assert!(c.is_none());
     }
 }

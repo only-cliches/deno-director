@@ -420,7 +420,7 @@ fn encode_set_global_value<'a>(
 }
 
 pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
-    let mut opts = worker::state::WorkerCreateOptions::from_neon(&mut cx, 0).unwrap_or_default();
+    let mut opts = worker::state::WorkerCreateOptions::from_neon(&mut cx, 0)?;
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let channel = cx.channel();
@@ -703,13 +703,23 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 .ok_or_else(|| cx.throw_error::<_, ()>("Runtime is closed").unwrap_err())?;
 
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.blocking_send(DenoMsg::Eval {
+            tx.try_send(DenoMsg::Eval {
                 source: src,
                 options,
                 deferred: None,
                 sync_reply: Some(reply_tx),
             })
-            .map_err(|e| cx.throw_error::<_, ()>(e.to_string()).unwrap_err())?;
+            .map_err(|e| {
+                let msg = match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        "Runtime request queue is full".to_string()
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        "Runtime is closed".to_string()
+                    }
+                };
+                cx.throw_error::<_, ()>(msg).unwrap_err()
+            })?;
 
             let result = reply_rx
                 .blocking_recv()

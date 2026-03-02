@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 describe("deno_worker: nodeCompat env parity", () => {
   const key = `TEST_ENV_NODE_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -12,7 +13,7 @@ describe("deno_worker: nodeCompat env parity", () => {
   });
 
   test("process.env and Deno.env share the same runtime-local namespace", async () => {
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       nodeCompat: true,
       permissions: { env: true },
     });
@@ -29,8 +30,8 @@ describe("deno_worker: nodeCompat env parity", () => {
   });
 
   test("process.env is isolated across workers", async () => {
-    const dw1 = new DenoWorker({ nodeCompat: true, permissions: { env: true } });
-    const dw2 = new DenoWorker({ nodeCompat: true, permissions: { env: true } });
+    const dw1 = createTestWorker({ nodeCompat: true, permissions: { env: true } });
+    const dw2 = createTestWorker({ nodeCompat: true, permissions: { env: true } });
     workers.push(dw1, dw2);
 
     await dw1.eval(`process.env["${key}"] = "worker-1"`);
@@ -43,7 +44,7 @@ describe("deno_worker: nodeCompat env parity", () => {
     const allowed = `${key}_ALLOWED`;
     const denied = `${key}_DENIED`;
 
-    const dw = new DenoWorker({
+    const dw = createTestWorker({
       nodeCompat: true,
       permissions: { env: [allowed] },
     });

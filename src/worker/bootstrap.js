@@ -519,6 +519,673 @@ try {
 
 globalThis.__nodeOnMessageHandlers = [];
 globalThis.__nodeMessageEventListeners = [];
+const STREAM_BRIDGE_TAG = "__denojs_worker_stream_v1";
+const STREAM_CHUNK_MAGIC = [0x44, 0x44, 0x53, 0x54, 0x52, 0x4d, 0x31, 0x00];
+const streamTextEncoder = new TextEncoder();
+const streamTextDecoder = new TextDecoder();
+const STREAM_FRAME_TYPE_TO_CODE = {
+  open: 1,
+  chunk: 2,
+  close: 3,
+  error: 4,
+  cancel: 5,
+  discard: 6,
+  credit: 7,
+};
+const STREAM_FRAME_CODE_TO_TYPE = {
+  1: "open",
+  2: "chunk",
+  3: "close",
+  4: "error",
+  5: "cancel",
+  6: "discard",
+  7: "credit",
+};
+const STREAM_DEFAULT_WINDOW_BYTES = 16 * 1024 * 1024;
+const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
+let nextWorkerStreamId = 1;
+globalThis.__nodeIncomingStreams = new Map();
+globalThis.__nodePendingStreamAccepts = new Map();
+globalThis.__nodeStreamBacklog = new Map();
+globalThis.__nodeStreamById = new Map();
+globalThis.__nodeStreamNameToId = new Map();
+globalThis.__nodeStreamWriterCredits = new Map();
+globalThis.__nodeStreamWriterWaiters = new Map();
+globalThis.__nodePendingStreamCredits = new Map();
+globalThis.__nodeStreamCreditFlushQueued = false;
+
+function streamBridgeConfig() {
+  const raw = globalThis.__denojs_worker_bridge;
+  const parsedWindow = raw && Number(raw.streamWindowBytes);
+  const parsedFlush = raw && Number(raw.streamCreditFlushBytes);
+  const streamWindowBytes =
+    Number.isFinite(parsedWindow) && parsedWindow >= 1
+      ? Math.trunc(parsedWindow)
+      : STREAM_DEFAULT_WINDOW_BYTES;
+  const streamCreditFlushBytes =
+    Number.isFinite(parsedFlush) && parsedFlush >= 1
+      ? Math.trunc(parsedFlush)
+      : STREAM_CREDIT_FLUSH_THRESHOLD;
+  return { streamWindowBytes, streamCreditFlushBytes };
+}
+
+function isStreamFrame(payload) {
+  return (
+    payload &&
+    typeof payload === "object" &&
+    payload[STREAM_BRIDGE_TAG] === true &&
+    typeof payload.t === "string" &&
+    typeof payload.id === "string"
+  );
+}
+
+function encodeStreamFrameEnvelope(frame) {
+  const typeCode = STREAM_FRAME_TYPE_TO_CODE[String(frame && frame.t || "")];
+  if (!typeCode) throw new Error("Invalid stream frame type");
+
+  const idBytes = streamTextEncoder.encode(String(frame && frame.id || ""));
+  if (!idBytes || idBytes.length === 0 || idBytes.length > 0xffff) {
+    throw new Error("Invalid stream id length");
+  }
+
+  let aux = "";
+  if (frame.t === "open") aux = frame.key == null ? "" : String(frame.key);
+  else if (frame.t === "error") aux = frame.error == null ? "" : String(frame.error);
+  else if (frame.t === "cancel") aux = frame.reason == null ? "" : String(frame.reason);
+  else if (frame.t === "credit") aux = String(Math.max(0, Math.trunc(frame.credit || 0)));
+  const auxBytes = streamTextEncoder.encode(aux);
+  if (auxBytes.length > 0xffff) throw new Error("Invalid stream frame aux length");
+
+  const chunk = frame.t === "chunk" ? toStreamChunk(frame.chunk) : null;
+  const chunkBytes = chunk || new Uint8Array(0);
+  const out = new Uint8Array(
+    STREAM_CHUNK_MAGIC.length + 1 + 2 + 2 + idBytes.length + auxBytes.length + chunkBytes.byteLength
+  );
+  out.set(STREAM_CHUNK_MAGIC, 0);
+  let off = STREAM_CHUNK_MAGIC.length;
+  out[off] = typeCode & 0xff;
+  off += 1;
+  out[off] = (idBytes.length >>> 8) & 0xff;
+  out[off + 1] = idBytes.length & 0xff;
+  off += 2;
+  out[off] = (auxBytes.length >>> 8) & 0xff;
+  out[off + 1] = auxBytes.length & 0xff;
+  off += 2;
+  out.set(idBytes, off);
+  off += idBytes.length;
+  out.set(auxBytes, off);
+  off += auxBytes.length;
+  out.set(chunkBytes, off);
+  return out;
+}
+
+function decodeStreamFrameEnvelope(payload) {
+  const u8 = toStreamChunk(payload);
+  if (!u8) return null;
+  const minLen = STREAM_CHUNK_MAGIC.length + 1 + 2 + 2 + 1;
+  if (u8.byteLength < minLen) return null;
+  for (let i = 0; i < STREAM_CHUNK_MAGIC.length; i += 1) {
+    if (u8[i] !== STREAM_CHUNK_MAGIC[i]) return null;
+  }
+  let off = STREAM_CHUNK_MAGIC.length;
+  const typeCode = u8[off] >>> 0;
+  off += 1;
+  const t = STREAM_FRAME_CODE_TO_TYPE[typeCode];
+  if (!t) return null;
+  const idLen = ((u8[off] << 8) | u8[off + 1]) >>> 0;
+  off += 2;
+  const auxLen = ((u8[off] << 8) | u8[off + 1]) >>> 0;
+  off += 2;
+  if (idLen === 0 || off + idLen + auxLen > u8.byteLength) return null;
+
+  const id = streamTextDecoder.decode(u8.subarray(off, off + idLen));
+  if (!id) return null;
+  off += idLen;
+  const aux = auxLen > 0 ? streamTextDecoder.decode(u8.subarray(off, off + auxLen)) : "";
+  off += auxLen;
+
+  const out = {
+    [STREAM_BRIDGE_TAG]: true,
+    t,
+    id,
+  };
+  if (t === "open" && aux) out.key = aux;
+  else if (t === "error" && aux) out.error = aux;
+  else if (t === "cancel" && aux) out.reason = aux;
+  else if (t === "credit") out.credit = Number(aux || "0");
+  else if (t === "chunk") out.chunk = u8.subarray(off);
+  return out;
+}
+
+function toStreamChunk(x) {
+  try {
+    if (typeof Uint8Array === "undefined") return null;
+    if (x instanceof Uint8Array) return x;
+    if (typeof ArrayBuffer !== "undefined" && x instanceof ArrayBuffer) return new Uint8Array(x);
+    if (
+      typeof ArrayBuffer !== "undefined" &&
+      typeof ArrayBuffer.isView === "function" &&
+      ArrayBuffer.isView(x)
+    ) {
+      return new Uint8Array(x.buffer, x.byteOffset, x.byteLength);
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function generateSecureRandomStreamKey() {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+      const bytes = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(bytes);
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    console.warn(
+      "[deno-director] hostStreams.create() crypto keygen unavailable; falling back to non-cryptographic key generation"
+    );
+  } catch {
+    // ignore
+  }
+  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function registerStream(name, id) {
+  if (globalThis.__nodeStreamById.has(id)) {
+    throw new Error(`Duplicate stream id: ${id}`);
+  }
+  if (globalThis.__nodeStreamNameToId.has(name)) {
+    throw new Error(`Stream key already in use: ${name}`);
+  }
+  globalThis.__nodeStreamById.set(id, { name, localDiscarded: false, remoteDiscarded: false });
+  globalThis.__nodeStreamNameToId.set(name, id);
+}
+
+function addWriterCredit(id, credit) {
+  if (!Number.isFinite(credit) || credit <= 0) return;
+  const next = (globalThis.__nodeStreamWriterCredits.get(id) || 0) + Math.trunc(credit);
+  globalThis.__nodeStreamWriterCredits.set(id, next);
+  const waiters = globalThis.__nodeStreamWriterWaiters.get(id);
+  if (!Array.isArray(waiters) || waiters.length === 0) return;
+  const remain = [];
+  for (const w of waiters) {
+    if (next >= w.minBytes) {
+      try {
+        w.resolve();
+      } catch {
+        // ignore
+      }
+    } else {
+      remain.push(w);
+    }
+  }
+  if (remain.length > 0) globalThis.__nodeStreamWriterWaiters.set(id, remain);
+  else globalThis.__nodeStreamWriterWaiters.delete(id);
+}
+
+function consumeWriterCredit(id, bytes) {
+  const have = globalThis.__nodeStreamWriterCredits.get(id) || 0;
+  const next = have - bytes;
+  globalThis.__nodeStreamWriterCredits.set(id, next > 0 ? next : 0);
+}
+
+function waitForWriterCredit(id, minBytes) {
+  if ((globalThis.__nodeStreamWriterCredits.get(id) || 0) >= minBytes) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const arr = globalThis.__nodeStreamWriterWaiters.get(id) || [];
+    arr.push({ minBytes, resolve, reject });
+    globalThis.__nodeStreamWriterWaiters.set(id, arr);
+  });
+}
+
+function flushStreamCredits() {
+  if (globalThis.__nodePendingStreamCredits.size === 0) return;
+  for (const [id, credit] of globalThis.__nodePendingStreamCredits.entries()) {
+    if (!(credit > 0)) continue;
+    hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "credit", id, credit }));
+  }
+  globalThis.__nodePendingStreamCredits.clear();
+}
+
+function queueStreamCredit(id, bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return;
+  const next = (globalThis.__nodePendingStreamCredits.get(id) || 0) + Math.trunc(bytes);
+  globalThis.__nodePendingStreamCredits.set(id, next);
+  if (next >= streamBridgeConfig().streamCreditFlushBytes) {
+    flushStreamCredits();
+    return;
+  }
+  if (globalThis.__nodeStreamCreditFlushQueued) return;
+  globalThis.__nodeStreamCreditFlushQueued = true;
+  queueMicrotask(() => {
+    globalThis.__nodeStreamCreditFlushQueued = false;
+    flushStreamCredits();
+  });
+}
+
+function tryReleaseStream(id) {
+  const meta = globalThis.__nodeStreamById.get(id);
+  if (!meta) return;
+  if (!meta.localDiscarded || !meta.remoteDiscarded) return;
+  globalThis.__nodeStreamById.delete(id);
+  globalThis.__nodeIncomingStreams.delete(id);
+  const activeId = globalThis.__nodeStreamNameToId.get(meta.name);
+  if (activeId === id) globalThis.__nodeStreamNameToId.delete(meta.name);
+  globalThis.__nodeStreamWriterCredits.delete(id);
+  globalThis.__nodePendingStreamCredits.delete(id);
+  const waiters = globalThis.__nodeStreamWriterWaiters.get(id);
+  if (Array.isArray(waiters) && waiters.length > 0) {
+    for (const waiter of waiters) {
+      try {
+        waiter.reject(new Error("stream released"));
+      } catch {
+        // ignore
+      }
+    }
+  }
+  globalThis.__nodeStreamWriterWaiters.delete(id);
+}
+
+function markLocalDiscard(id) {
+  const meta = globalThis.__nodeStreamById.get(id);
+  if (!meta || meta.localDiscarded) return;
+  meta.localDiscarded = true;
+  const sendDiscard = () => {
+    hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "discard", id }));
+  };
+  try {
+    sendDiscard();
+  } catch {
+    try {
+      setTimeout(() => {
+        try {
+          sendDiscard();
+        } catch {
+          // ignore
+        }
+      }, 0);
+    } catch {
+      // ignore
+    }
+  }
+  tryReleaseStream(id);
+}
+
+function markRemoteDiscard(id) {
+  const meta = globalThis.__nodeStreamById.get(id);
+  if (!meta || meta.remoteDiscarded) return;
+  meta.remoteDiscarded = true;
+  tryReleaseStream(id);
+}
+
+function rejectIncomingOpen(id, reason) {
+  hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "error", id, error: reason }));
+  hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "discard", id }));
+}
+
+function makeStreamReader(id) {
+  const queue = [];
+  const waiting = [];
+  let closed = false;
+  let done = false;
+  let discarded = false;
+  let onLocalDiscard = null;
+  let onChunkConsumed = null;
+
+  function markLocalDiscarded() {
+    if (discarded) return;
+    discarded = true;
+    try {
+      if (typeof onLocalDiscard === "function") onLocalDiscard();
+    } catch {
+      // ignore
+    }
+  }
+
+  function push(ev) {
+    if (waiting.length > 0) {
+      const w = waiting.shift();
+      if (ev.kind === "chunk") {
+        w.resolve({ done: false, value: ev.chunk });
+        try {
+          if (onChunkConsumed) onChunkConsumed(ev.chunk.byteLength);
+        } catch {
+          // ignore
+        }
+      }
+      else if (ev.kind === "close") w.resolve({ done: true, value: undefined });
+      else w.reject(ev.error);
+      return;
+    }
+    queue.push(ev);
+  }
+
+  const reader = {
+    pushChunk(chunk) {
+      if (closed || done) return;
+      push({ kind: "chunk", chunk });
+    },
+    closeRemote() {
+      if (closed) return;
+      closed = true;
+      markLocalDiscarded();
+      push({ kind: "close" });
+    },
+    errorRemote(error) {
+      if (closed) return;
+      closed = true;
+      markLocalDiscarded();
+      push({ kind: "error", error });
+    },
+    setOnLocalDiscard(fn) {
+      onLocalDiscard = typeof fn === "function" ? fn : null;
+    },
+    setOnChunkConsumed(fn) {
+      onChunkConsumed = typeof fn === "function" ? fn : null;
+    },
+    async read() {
+      if (done) return { done: true, value: undefined };
+      if (queue.length > 0) {
+        const ev = queue.shift();
+        if (ev.kind === "chunk") {
+          try {
+            if (onChunkConsumed) onChunkConsumed(ev.chunk.byteLength);
+          } catch {
+            // ignore
+          }
+          return { done: false, value: ev.chunk };
+        }
+        done = true;
+        if (ev.kind === "close") return { done: true, value: undefined };
+        throw ev.error;
+      }
+      return await new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+    },
+    async cancel(reason) {
+      if (done) return;
+      done = true;
+      closed = true;
+      queue.length = 0;
+      while (waiting.length > 0) {
+        const w = waiting.shift();
+        w.resolve({ done: true, value: undefined });
+      }
+      try {
+        hostPostMessageImpl(
+          encodeStreamFrameEnvelope({
+            t: "cancel",
+            id,
+            reason: reason == null ? undefined : String(reason),
+          })
+        );
+      } catch {
+        // ignore
+      }
+      markLocalDiscarded();
+    },
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => reader.read(),
+        return: async () => {
+          await reader.cancel("iterator return");
+          return { done: true, value: undefined };
+        },
+        throw: async (err) => {
+          await reader.cancel("iterator throw");
+          throw err;
+        },
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      };
+    },
+  };
+
+  return reader;
+}
+
+function queueAcceptedStream(name, reader) {
+  const pending = globalThis.__nodePendingStreamAccepts.get(name);
+  if (pending) {
+    globalThis.__nodePendingStreamAccepts.delete(name);
+    pending(reader);
+    return;
+  }
+
+  globalThis.__nodeStreamBacklog.set(name, reader);
+}
+
+function handleIncomingStreamFrame(frame) {
+  switch (frame.t) {
+    case "open": {
+      const key = typeof frame.key === "string" && frame.key ? frame.key : frame.id;
+      if (globalThis.__nodeStreamNameToId.has(key) || globalThis.__nodeStreamBacklog.has(key)) {
+        rejectIncomingOpen(frame.id, `Stream key already in use: ${key}`);
+        return true;
+      }
+      registerStream(key, frame.id);
+      const reader = makeStreamReader(frame.id);
+      reader.setOnLocalDiscard(() => markLocalDiscard(frame.id));
+      reader.setOnChunkConsumed((bytes) => queueStreamCredit(frame.id, bytes));
+      globalThis.__nodeIncomingStreams.set(frame.id, reader);
+      queueAcceptedStream(key, reader);
+      return true;
+    }
+    case "chunk": {
+      const stream = globalThis.__nodeIncomingStreams.get(frame.id);
+      if (!stream) return true;
+      const chunk = frame.chunk ? toStreamChunk(frame.chunk) : null;
+      if (!chunk) {
+        stream.errorRemote(new Error("Invalid stream chunk"));
+        return true;
+      }
+      stream.pushChunk(chunk);
+      return true;
+    }
+    case "close": {
+      const stream = globalThis.__nodeIncomingStreams.get(frame.id);
+      if (!stream) return true;
+      stream.closeRemote();
+      return true;
+    }
+    case "error": {
+      const stream = globalThis.__nodeIncomingStreams.get(frame.id);
+      if (!stream) return true;
+      stream.errorRemote(new Error(frame.error || "Remote stream error"));
+      return true;
+    }
+    case "cancel": {
+      const stream = globalThis.__nodeIncomingStreams.get(frame.id);
+      if (!stream) return true;
+      stream.errorRemote(new Error(frame.reason || "Remote stream cancelled"));
+      return true;
+    }
+    case "discard": {
+      markRemoteDiscard(frame.id);
+      return true;
+    }
+    case "credit": {
+      addWriterCredit(frame.id, Number(frame.credit || 0));
+      return true;
+    }
+    default:
+      return true;
+  }
+}
+
+const hostStreams = {
+  create(key) {
+    const provided = key != null;
+    const streamKey = provided ? String(key || "").trim() : "";
+    if (provided && !streamKey) throw new Error("hostStreams.create(key) requires a non-empty key when provided");
+
+    let finalKey = streamKey;
+    if (!finalKey) {
+      for (let i = 0; i < 16; i += 1) {
+        const candidate = generateSecureRandomStreamKey();
+        if (
+          !globalThis.__nodeStreamNameToId.has(candidate) &&
+          !globalThis.__nodePendingStreamAccepts.has(candidate) &&
+          !globalThis.__nodeStreamBacklog.has(candidate)
+        ) {
+          finalKey = candidate;
+          break;
+        }
+      }
+      if (!finalKey) throw new Error("Failed to generate a unique random stream key");
+    }
+
+    if (
+      globalThis.__nodeStreamNameToId.has(finalKey) ||
+      globalThis.__nodePendingStreamAccepts.has(finalKey) ||
+      globalThis.__nodeStreamBacklog.has(finalKey)
+    ) {
+      throw new Error(`Stream key already in use: ${finalKey}`);
+    }
+
+    const id = `w:${nextWorkerStreamId++}`;
+    registerStream(finalKey, id);
+    globalThis.__nodeStreamWriterCredits.set(id, streamBridgeConfig().streamWindowBytes);
+    let done = false;
+    const rejectWriterWaiters = (reason) => {
+      const waiters = globalThis.__nodeStreamWriterWaiters.get(id);
+      if (Array.isArray(waiters) && waiters.length > 0) {
+        for (const waiter of waiters) {
+          try {
+            waiter.reject(new Error(String(reason || "stream closed")));
+          } catch {
+            // ignore
+          }
+        }
+      }
+      globalThis.__nodeStreamWriterWaiters.delete(id);
+      globalThis.__nodeStreamWriterCredits.delete(id);
+    };
+
+    hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "open", id, key: finalKey }));
+
+    const ensureOpen = () => {
+      if (done) throw new Error(`Stream already closed: ${finalKey}`);
+    };
+
+    return {
+      getKey() {
+        return finalKey;
+      },
+      async ready(minBytes) {
+        ensureOpen();
+        const need = Math.max(1, Math.trunc(minBytes || 1));
+        await waitForWriterCredit(id, need);
+      },
+      async write(chunk) {
+        ensureOpen();
+        const u8 = toStreamChunk(chunk);
+        if (!u8) throw new Error("stream.write requires Uint8Array or ArrayBuffer");
+        await waitForWriterCredit(id, u8.byteLength);
+        hostPostMessageImpl(encodeStreamFrameEnvelope({
+          t: "chunk",
+          id,
+          chunk: u8,
+        }));
+        consumeWriterCredit(id, u8.byteLength);
+      },
+      async writeMany(chunks) {
+        ensureOpen();
+        if (!Array.isArray(chunks) || chunks.length === 0) return 0;
+        let sent = 0;
+        let batch = [];
+        let batchBytes = 0;
+        for (const chunk of chunks) {
+          const u8 = toStreamChunk(chunk);
+          if (!u8) throw new Error("stream.writeMany requires Uint8Array or ArrayBuffer chunks");
+          await waitForWriterCredit(id, u8.byteLength);
+          batch.push(encodeStreamFrameEnvelope({ t: "chunk", id, chunk: u8 }));
+          batchBytes += u8.byteLength;
+          sent += 1;
+          if (batch.length >= 64) {
+            for (const payload of batch) hostPostMessageImpl(payload);
+            consumeWriterCredit(id, batchBytes);
+            batch = [];
+            batchBytes = 0;
+          }
+        }
+        if (batch.length > 0) {
+          for (const payload of batch) hostPostMessageImpl(payload);
+          consumeWriterCredit(id, batchBytes);
+        }
+        return sent;
+      },
+      async close() {
+        if (done) return;
+        done = true;
+        hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "close", id }));
+        markRemoteDiscard(id);
+        markLocalDiscard(id);
+        rejectWriterWaiters(`Stream closed: ${finalKey}`);
+      },
+      async error(message) {
+        if (done) return;
+        done = true;
+        hostPostMessageImpl(encodeStreamFrameEnvelope({
+          t: "error",
+          id,
+          error: String(message || "stream error"),
+        }));
+        markRemoteDiscard(id);
+        markLocalDiscard(id);
+        rejectWriterWaiters(`Stream errored: ${finalKey}`);
+      },
+      async cancel(reason) {
+        if (done) return;
+        done = true;
+        hostPostMessageImpl(encodeStreamFrameEnvelope({
+          t: "cancel",
+          id,
+          reason: reason == null ? undefined : String(reason),
+        }));
+        markRemoteDiscard(id);
+        markLocalDiscard(id);
+        rejectWriterWaiters(`Stream cancelled: ${finalKey}`);
+      },
+    };
+  },
+
+  async accept(key) {
+    const streamName = String(key || "").trim();
+    if (!streamName) throw new Error("hostStreams.accept(key) requires a non-empty key");
+    if (globalThis.__nodePendingStreamAccepts.has(streamName)) {
+      throw new Error(`hostStreams.accept already pending for stream key: ${streamName}`);
+    }
+    const activeId = globalThis.__nodeStreamNameToId.get(streamName);
+    if (activeId && !globalThis.__nodeStreamBacklog.has(streamName)) {
+      throw new Error(`Stream key already in use: ${streamName}`);
+    }
+
+    const queued = globalThis.__nodeStreamBacklog.get(streamName);
+    if (queued) {
+      globalThis.__nodeStreamBacklog.delete(streamName);
+      return queued;
+    }
+
+    return await new Promise((resolve) => {
+      globalThis.__nodePendingStreamAccepts.set(streamName, resolve);
+    });
+  },
+};
+
+safeObjSet(globalThis, "hostStreams", hostStreams);
 
 const onImpl = (name, fn) => {
   if (name === "message" && typeof fn === "function") {
@@ -565,6 +1232,16 @@ try {
 }
 
 globalThis.__dispatchNodeMessage = (payload) => {
+  const frame = decodeStreamFrameEnvelope(payload);
+  if (frame) {
+    handleIncomingStreamFrame(frame);
+    return;
+  }
+  if (isStreamFrame(payload)) {
+    handleIncomingStreamFrame(payload);
+    return;
+  }
+
   // on('message'): payload
   for (const fn of globalThis.__nodeOnMessageHandlers) {
     try {

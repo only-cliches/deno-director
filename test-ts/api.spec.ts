@@ -1,4 +1,5 @@
 import { DenoWorker } from "../src/index";
+import { createTestWorker } from "./helpers.worker-harness";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -8,7 +9,7 @@ describe("DenoWorker API", () => {
   let dw: DenoWorker;
 
   beforeEach(() => {
-    dw = new DenoWorker();
+    dw = createTestWorker();
   });
 
   afterEach(async () => {
@@ -72,7 +73,7 @@ describe("DenoWorker API", () => {
 
     // If your native constructor does not yet accept options, instantiate via whatever
     // option path your JS wrapper supports. This assumes you will wire options later.
-    const limited = new DenoWorker({ maxEvalMs: 50 } as any);
+    const limited = createTestWorker({ maxEvalMs: 50 });
 
     try {
       await expect(limited.eval("while (true) {}")).rejects.toBeTruthy();
