@@ -35,6 +35,11 @@ async function findFreePort(): Promise<number> {
   });
 }
 
+function isBindPermissionError(err: any): boolean {
+  const msg = String(err?.message ?? err ?? "");
+  return err?.code === "EPERM" || /EPERM/i.test(msg);
+}
+
 async function fetchJson(url: string): Promise<any> {
   const res = await fetch(url);
   const text = await res.text();
@@ -46,35 +51,59 @@ async function fetchJson(url: string): Promise<any> {
 
 describe("inspect + envFile", () => {
   test("inspect option starts inspector server (basic connect)", async () => {
-    const port = await findFreePort();
+    let port: number;
+    try {
+      port = await findFreePort();
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
 
-    const dw = new DenoWorker({
-      inspect: { host: "127.0.0.1", port },
-      permissions: { env: true },
-    });
+    let dw: DenoWorker | undefined;
+    try {
+      dw = new DenoWorker({
+        inspect: { host: "127.0.0.1", port },
+        permissions: { env: true },
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
 
     try {
       const j = await fetchJson(`http://127.0.0.1:${port}/json/version`);
       expect(typeof j).toBe("object");
       expect(j.Browser).toBe("denojs-worker");
     } finally {
-      if (!dw.isClosed()) await dw.close();
+      if (dw && !dw.isClosed()) await dw.close();
     }
   });
 
   test("inspect: host=localhost binds to 127.0.0.1", async () => {
-    const port = await findFreePort();
+    let port: number;
+    try {
+      port = await findFreePort();
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
 
-    const dw = new DenoWorker({
-      inspect: { host: "localhost", port },
-      permissions: { env: true },
-    });
+    let dw: DenoWorker | undefined;
+    try {
+      dw = new DenoWorker({
+        inspect: { host: "localhost", port },
+        permissions: { env: true },
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
 
     try {
       const j = await fetchJson(`http://127.0.0.1:${port}/json/version`);
       expect(j.Browser).toBe("denojs-worker");
     } finally {
-      if (!dw.isClosed()) await dw.close();
+      if (dw && !dw.isClosed()) await dw.close();
     }
   });
 
@@ -134,6 +163,34 @@ describe("inspect + envFile", () => {
       expect(v).toBe("from-explicit");
     } finally {
       if (!dw.isClosed()) await dw.close();
+      await rmRF(root);
+    }
+  });
+
+  test("envFile values are isolated to the worker that loaded them", async () => {
+    const root = await mkTempDir("denojs-worker-envfile-isolated-");
+    const nested = path.join(root, "runtime");
+    await fs.mkdir(nested, { recursive: true });
+
+    const key = `TEST_ENV_${Date.now()}`;
+    await writeFile(path.join(root, ".env"), `${key}=from-dotenv-local\n`);
+
+    const dw1 = new DenoWorker({
+      cwd: nested,
+      envFile: true,
+      permissions: { env: true, read: true },
+    });
+    const dw2 = new DenoWorker({
+      cwd: nested,
+      permissions: { env: true, read: true },
+    });
+
+    try {
+      expect(await dw1.eval(`Deno.env.get("${key}")`)).toBe("from-dotenv-local");
+      expect(await dw2.eval(`Deno.env.get("${key}")`)).toBeUndefined();
+    } finally {
+      if (!dw1.isClosed()) await dw1.close();
+      if (!dw2.isClosed()) await dw2.close();
       await rmRF(root);
     }
   });

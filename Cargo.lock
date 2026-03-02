@@ -1215,9 +1215,10 @@ dependencies = [
 
 [[package]]
 name = "deno-core-vm"
-version = "0.2.0"
+version = "0.8.0"
 dependencies = [
  "cpu-time",
+ "deno_ast",
  "deno_core",
  "deno_error",
  "deno_fs",

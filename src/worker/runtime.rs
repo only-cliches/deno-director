@@ -10,20 +10,24 @@ use deno_resolver::npm::{DenoInNpmPackageChecker, NpmResolver};
 use sys_traits::impls::RealSys;
 
 use crate::worker::dispatch::{dispatch_node_msg, handle_deno_msg};
+use crate::worker::env::{EnvRuntimeState, env_access_from_permissions, merge_env_snapshot};
 use crate::worker::filesystem::{
     SandboxFs, dir_url_from_path, normalize_cwd, normalize_startup_url, sandboxed_path_list,
 };
 use crate::worker::messages::{DenoMsg, NodeMsg};
 use crate::worker::ops::{
-    op_denojs_worker_host_call_async, op_denojs_worker_host_call_sync,
-    op_denojs_worker_post_message,
+    op_denojs_worker_env_delete, op_denojs_worker_env_get, op_denojs_worker_env_set,
+    op_denojs_worker_env_to_object, op_denojs_worker_host_call_async,
+    op_denojs_worker_host_call_sync, op_denojs_worker_post_message,
 };
-use crate::worker::state::{EnvConfig, RuntimeLimits};
+use crate::worker::state::RuntimeLimits;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 
 use tokio::sync::mpsc;
@@ -40,21 +44,50 @@ extension!(
     ops = [
         op_denojs_worker_post_message,
         op_denojs_worker_host_call_sync,
-        op_denojs_worker_host_call_async
+        op_denojs_worker_host_call_async,
+        op_denojs_worker_env_get,
+        op_denojs_worker_env_set,
+        op_denojs_worker_env_delete,
+        op_denojs_worker_env_to_object
     ],
     esm_entry_point = "ext:deno_worker_extension/src/worker/bootstrap.js",
     esm = ["src/worker/bootstrap.js"],
 );
 
-fn apply_env_map(map: &HashMap<String, String>) {
-    for (k, v) in map.iter() {
-        if k.is_empty() || k.len() > 4096 || k.contains('\0') {
-            continue;
-        }
-        unsafe {
-            std::env::set_var(k, v);
-        }
+fn cfg_items(v: &serde_json::Value) -> Option<Vec<String>> {
+    v.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn apply_perm_field(
+    cfg: &serde_json::Value,
+    key: &str,
+    dst: &mut Option<Vec<String>>,
+    map_paths: Option<&dyn Fn(Vec<String>) -> Vec<String>>,
+) {
+    let Some(v) = cfg.get(key) else {
+        return;
+    };
+
+    if *v == serde_json::Value::Bool(true) {
+        *dst = Some(vec![]);
+        return;
     }
+    if *v == serde_json::Value::Bool(false) {
+        *dst = None;
+        return;
+    }
+
+    let Some(items) = cfg_items(v) else {
+        return;
+    };
+    *dst = Some(match map_paths {
+        Some(f) => f(items),
+        None => items,
+    });
 }
 
 fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsContainer {
@@ -65,153 +98,37 @@ fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsCo
     opts.prompt = false;
 
     if let Some(cfg) = &limits.permissions {
-        if let Some(v) = cfg.get("read") {
-            if v == true {
-                opts.allow_read = Some(vec![
-                    std::fs::canonicalize(root)
-                        .unwrap_or_else(|_| root.to_path_buf())
-                        .to_string_lossy()
-                        .to_string(),
-                ]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_read = Some(sandboxed_path_list(root, &items));
-            } else if v == false {
-                opts.allow_read = None;
-            }
+        let canon_root = std::fs::canonicalize(root)
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+
+        apply_perm_field(
+            cfg,
+            "read",
+            &mut opts.allow_read,
+            Some(&|items| sandboxed_path_list(root, &items)),
+        );
+        if cfg.get("read") == Some(&serde_json::Value::Bool(true)) {
+            opts.allow_read = Some(vec![canon_root.clone()]);
         }
 
-        if let Some(v) = cfg.get("write") {
-            if v == true {
-                opts.allow_write = Some(vec![
-                    std::fs::canonicalize(root)
-                        .unwrap_or_else(|_| root.to_path_buf())
-                        .to_string_lossy()
-                        .to_string(),
-                ]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_write = Some(sandboxed_path_list(root, &items));
-            } else if v == false {
-                opts.allow_write = None;
-            }
+        apply_perm_field(
+            cfg,
+            "write",
+            &mut opts.allow_write,
+            Some(&|items| sandboxed_path_list(root, &items)),
+        );
+        if cfg.get("write") == Some(&serde_json::Value::Bool(true)) {
+            opts.allow_write = Some(vec![canon_root]);
         }
 
-        if let Some(v) = cfg.get("net") {
-            if v == true {
-                opts.allow_net = Some(vec![]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_net = Some(items);
-            } else if v == false {
-                opts.allow_net = None;
-            }
-        }
-
-        if let Some(v) = cfg.get("env") {
-            if v == true {
-                opts.allow_env = Some(vec![]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_env = Some(items);
-            } else if v == false {
-                opts.allow_env = None;
-            }
-        }
-
-        if let Some(v) = cfg.get("run") {
-            if v == true {
-                opts.allow_run = Some(vec![]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_run = Some(items);
-            } else if v == false {
-                opts.allow_run = None;
-            }
-        }
-
-        if let Some(v) = cfg.get("ffi") {
-            if v == true {
-                opts.allow_ffi = Some(vec![]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_ffi = Some(items);
-            } else if v == false {
-                opts.allow_ffi = None;
-            }
-        }
-
-        if let Some(v) = cfg.get("sys") {
-            if v == true {
-                opts.allow_sys = Some(vec![]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_sys = Some(items);
-            } else if v == false {
-                opts.allow_sys = None;
-            }
-        }
-
-        if let Some(v) = cfg.get("import") {
-            if v == true {
-                opts.allow_import = Some(vec![]);
-            } else if let Some(arr) = v.as_array() {
-                let items = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>();
-                opts.allow_import = Some(items);
-            } else if v == false {
-                opts.allow_import = None;
-            }
-        }
-    }
-
-    let imports_enabled = !matches!(limits.imports, crate::worker::state::ImportsPolicy::DenyAll);
-
-    if imports_enabled {
-        if opts.allow_read.is_none() {
-            opts.allow_read = Some(vec![]);
-        }
-        if opts.allow_import.is_none() {
-            opts.allow_import = Some(vec![]);
-        }
-    }
-
-    if limits.node_resolve || limits.node_compat {
-        if opts.allow_import.is_none() {
-            opts.allow_import = Some(vec![]);
-        }
-    }
-
-    if limits.startup.is_some() && !imports_enabled {
-        if opts.allow_read.is_none() {
-            opts.allow_read = Some(vec![]);
-        }
-        if opts.allow_import.is_none() {
-            opts.allow_import = Some(vec![]);
-        }
+        apply_perm_field(cfg, "net", &mut opts.allow_net, None);
+        apply_perm_field(cfg, "env", &mut opts.allow_env, None);
+        apply_perm_field(cfg, "run", &mut opts.allow_run, None);
+        apply_perm_field(cfg, "ffi", &mut opts.allow_ffi, None);
+        apply_perm_field(cfg, "sys", &mut opts.allow_sys, None);
+        apply_perm_field(cfg, "import", &mut opts.allow_import, None);
     }
 
     let perms = Permissions::from_options(desc_parser.as_ref(), &opts)
@@ -294,13 +211,19 @@ pub fn spawn_worker_thread(
                                         "200 OK",
                                         r#"{"Browser":"denojs-worker","Protocol-Version":"1.3"}"#,
                                     );
-                                } else if method == "GET" && (path == "/json/list" || path == "/json") {
+                                } else if method == "GET"
+                                    && (path == "/json/list" || path == "/json")
+                                {
                                     let body = format!(
                                         r#"[{{"id":"denojs-worker","title":"denojs-worker","type":"node","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/ws"}}]"#
                                     );
                                     write_http(&stream, "200 OK", &body);
                                 } else {
-                                    write_http(&stream, "404 Not Found", r#"{"error":"not found"}"#);
+                                    write_http(
+                                        &stream,
+                                        "404 Not Found",
+                                        r#"{"error":"not found"}"#,
+                                    );
                                 }
 
                                 let _ = stream.shutdown(Shutdown::Both);
@@ -337,12 +260,8 @@ pub fn spawn_worker_thread(
 
             let cwd_path = normalize_cwd(limits.cwd.as_deref());
 
-            // env config: only supported mechanism besides default process env.
-            if let Some(cfg) = limits.env.as_ref() {
-                match cfg {
-                    EnvConfig::Map(map) => apply_env_map(map),
-                }
-            }
+            let env_snapshot = merge_env_snapshot(std::env::vars().collect(), limits.env.as_ref());
+            let env_access = env_access_from_permissions(limits.permissions.as_ref());
 
             let startup_url = normalize_startup_url(&cwd_path, limits.startup.as_deref());
             let base_url = dir_url_from_path(&cwd_path);
@@ -356,6 +275,8 @@ pub fn spawn_worker_thread(
                 node_compat: limits.node_compat,
                 sandbox_root: cwd_path.clone(),
                 fs_loader: Arc::new(deno_core::FsModuleLoader),
+                module_loader: limits.module_loader.clone(),
+                permissions: limits.permissions.clone(),
             });
 
             let permissions = permissions_from_limits(&limits, &cwd_path);
@@ -408,6 +329,10 @@ pub fn spawn_worker_thread(
                     node_tx: node_tx.clone(),
                 });
                 s.put(module_reg.clone());
+                s.put(EnvRuntimeState {
+                    vars: std::sync::Mutex::new(env_snapshot),
+                    access: env_access,
+                });
             }
 
             if worker.run_event_loop(false).await.is_err() {
@@ -481,4 +406,127 @@ pub fn spawn_worker_thread(
             let _ = h.join();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_perm_field, cfg_items, env_access_from_permissions, merge_env_snapshot};
+    use crate::worker::env::EnvAccess;
+    use crate::worker::state::{EnvConfig, RuntimeLimits};
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn env_access_defaults_to_deny() {
+        let limits = RuntimeLimits::default();
+        assert!(matches!(
+            env_access_from_permissions(limits.permissions.as_ref()),
+            EnvAccess::Deny
+        ));
+    }
+
+    #[test]
+    fn env_access_honors_true_and_false() {
+        let mut allow = RuntimeLimits::default();
+        allow.permissions = Some(serde_json::json!({ "env": true }));
+        assert!(matches!(
+            env_access_from_permissions(allow.permissions.as_ref()),
+            EnvAccess::AllowAll
+        ));
+
+        let mut deny = RuntimeLimits::default();
+        deny.permissions = Some(serde_json::json!({ "env": false }));
+        assert!(matches!(
+            env_access_from_permissions(deny.permissions.as_ref()),
+            EnvAccess::Deny
+        ));
+    }
+
+    #[test]
+    fn env_access_honors_allow_list() {
+        let mut limits = RuntimeLimits::default();
+        limits.permissions = Some(serde_json::json!({ "env": ["A", "B"] }));
+        let out = env_access_from_permissions(limits.permissions.as_ref());
+        match out {
+            EnvAccess::AllowKeys(keys) => {
+                let expected: HashSet<String> =
+                    ["A".to_string(), "B".to_string()].into_iter().collect();
+                assert_eq!(keys, expected);
+            }
+            other => panic!("expected allow list, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn merge_env_snapshot_overlays_and_filters_invalid_keys() {
+        let mut base = HashMap::new();
+        base.insert("A".to_string(), "1".to_string());
+        base.insert("B".to_string(), "2".to_string());
+
+        let mut overlay = HashMap::new();
+        overlay.insert("B".to_string(), "22".to_string());
+        overlay.insert("C".to_string(), "3".to_string());
+        overlay.insert("".to_string(), "bad".to_string());
+        overlay.insert("HAS\0NUL".to_string(), "bad".to_string());
+        overlay.insert("X".repeat(4097), "bad".to_string());
+
+        let out = merge_env_snapshot(base, Some(&EnvConfig::Map(overlay)));
+        assert_eq!(out.get("A").map(String::as_str), Some("1"));
+        assert_eq!(out.get("B").map(String::as_str), Some("22"));
+        assert_eq!(out.get("C").map(String::as_str), Some("3"));
+        assert!(!out.contains_key(""));
+        assert!(!out.contains_key("HAS\0NUL"));
+    }
+
+    #[test]
+    fn cfg_items_keeps_only_string_entries() {
+        let v = serde_json::json!(["a", 1, true, "b", null, {"x":1}]);
+        let out = cfg_items(&v).expect("array");
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn apply_perm_field_honors_bool_and_list_forms() {
+        let cfg = serde_json::json!({
+            "read": true,
+            "write": false,
+            "net": ["a:1", 1, "b:2"]
+        });
+
+        let mut read: Option<Vec<String>> = None;
+        let mut write: Option<Vec<String>> = Some(vec!["existing".to_string()]);
+        let mut net: Option<Vec<String>> = None;
+
+        apply_perm_field(&cfg, "read", &mut read, None);
+        apply_perm_field(&cfg, "write", &mut write, None);
+        apply_perm_field(
+            &cfg,
+            "net",
+            &mut net,
+            Some(&|items| items.into_iter().map(|x| format!("mapped:{x}")).collect()),
+        );
+
+        assert_eq!(read, Some(vec![]));
+        assert_eq!(write, None);
+        assert_eq!(
+            net,
+            Some(vec!["mapped:a:1".to_string(), "mapped:b:2".to_string()])
+        );
+    }
+
+    #[test]
+    fn apply_perm_field_ignores_missing_or_non_array_non_bool() {
+        let cfg = serde_json::json!({
+            "env": "invalid",
+            "sys": 123
+        });
+
+        let mut env_dst: Option<Vec<String>> = Some(vec!["keep".to_string()]);
+        let mut run_dst: Option<Vec<String>> = Some(vec!["keep2".to_string()]);
+
+        apply_perm_field(&cfg, "env", &mut env_dst, None);
+        apply_perm_field(&cfg, "run", &mut run_dst, None);
+
+        assert_eq!(env_dst, Some(vec!["keep".to_string()]));
+        assert_eq!(run_dst, Some(vec!["keep2".to_string()]));
+    }
 }

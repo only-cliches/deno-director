@@ -14,7 +14,7 @@ pub enum ImportDecision {
     AllowDisk,
 
     /// Virtual module source. `ext` controls how the runtime should parse it.
-    /// Supported: "js", "ts", "tsx"
+    /// Supported: "js", "ts", "tsx", "jsx"
     SourceTyped {
         ext: String,
         code: String,
@@ -85,6 +85,7 @@ pub enum NodeMsg {
     ImportRequest {
         specifier: String,
         referrer: String,
+        is_dynamic_import: bool,
         reply: tokio::sync::oneshot::Sender<ImportDecision>,
     },
 

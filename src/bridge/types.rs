@@ -13,7 +13,10 @@ pub enum JsValueBridge {
     BigInt(String), // decimal string
     DateMs(f64),
 
-    RegExp { source: String, flags: String },
+    RegExp {
+        source: String,
+        flags: String,
+    },
 
     // Binary values
     BufferView {
@@ -26,8 +29,12 @@ pub enum JsValueBridge {
     Map(Vec<(JsValueBridge, JsValueBridge)>), // primitive keys only
     Set(Vec<JsValueBridge>),
 
-    Url { href: String },
-    UrlSearchParams { query: String },
+    Url {
+        href: String,
+    },
+    UrlSearchParams {
+        query: String,
+    },
 
     Json(serde_json::Value),
     V8Serialized(Vec<u8>),

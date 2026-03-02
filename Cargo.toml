@@ -21,6 +21,7 @@ cpu-time = "1.0.0"
 
 # still referenced directly in your crate; ok to keep for now
 deno_runtime = { version = "=0.242.0", features = ["transpile", "snapshot" ] }
+deno_ast = { version = "=0.53.1", features = ["transpiling"] }
 deno_core = "=0.386.0"
 deno_node = { version="=0.172.0", features = ["sync_fs"]  }
 deno_snapshots = "=0.49.0"

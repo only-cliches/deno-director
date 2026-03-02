@@ -91,4 +91,95 @@ describe("DenoWorker API", () => {
     expect(events).toContain("close");
     expect(dw.isClosed()).toBe(true);
   });
+
+  test("restart recreates runtime and preserves wrapper listeners", async () => {
+    const messages: any[] = [];
+    dw.on("message", (m) => messages.push(m));
+
+    await expect(dw.eval("globalThis.__r = 7; __r")).resolves.toBe(7);
+    await dw.restart();
+
+    await expect(dw.eval("typeof globalThis.__r")).resolves.toBe("undefined");
+    await expect(dw.eval("postMessage({ ok: 1 })")).resolves.toBeUndefined();
+    await sleep(25);
+
+    expect(messages).toEqual([{ ok: 1 }]);
+    expect(dw.isClosed()).toBe(false);
+  });
+
+  test("concurrent restart calls settle to a single open runtime", async () => {
+    await expect(Promise.all([dw.restart(), dw.restart(), dw.restart()])).resolves.toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    await expect(dw.eval("40 + 2")).resolves.toBe(42);
+    expect(dw.isClosed()).toBe(false);
+  });
+
+  test("stale close events from prior runtime do not close the restarted runtime", async () => {
+    await dw.eval("1 + 1");
+    const p = dw.restart();
+    await p;
+    await sleep(40);
+    expect(dw.isClosed()).toBe(false);
+    await expect(dw.eval("2 + 2")).resolves.toBe(4);
+  });
+
+  test("close({ force: true }) rejects in-flight API promises promptly", async () => {
+    await dw.setGlobal(
+      "nodeDelay",
+      async () => {
+        await sleep(200);
+        return 1;
+      },
+    );
+
+    const pending = dw.eval(`
+      (async () => {
+        await nodeDelay();
+        return 42;
+      })()
+    `);
+    const observed = pending.then(
+      (value) => ({ status: "resolved" as const, value }),
+      (reason) => ({ status: "rejected" as const, reason }),
+    );
+
+    await sleep(15);
+    await dw.close({ force: true });
+
+    const out = await observed;
+    expect(out.status).toBe("rejected");
+    expect(dw.isClosed()).toBe(true);
+  });
+
+  test("restart({ force: true }) rejects in-flight work and boots a fresh runtime", async () => {
+    await dw.setGlobal(
+      "nodeDelay",
+      async () => {
+        await sleep(200);
+        return 1;
+      },
+    );
+
+    const pending = dw.eval(`
+      (async () => {
+        await nodeDelay();
+        return "old";
+      })()
+    `);
+    const observed = pending.then(
+      (value) => ({ status: "resolved" as const, value }),
+      (reason) => ({ status: "rejected" as const, reason }),
+    );
+
+    await sleep(15);
+    await dw.restart({ force: true });
+
+    const out = await observed;
+    expect(out.status).toBe("rejected");
+    await expect(dw.eval("21 * 2")).resolves.toBe(42);
+    expect(dw.isClosed()).toBe(false);
+  });
 });

@@ -1,27 +1,18 @@
-use deno_runtime::deno_core::{op2, OpState};
+use deno_runtime::deno_core::{OpState, op2};
 use tokio::sync::oneshot;
 
 use crate::bridge::types::JsValueBridge;
+use crate::worker::env::{EnvRuntimeState, valid_env_key};
 use crate::worker::messages::NodeMsg;
+use crate::worker::op_reply::{err_reply, err_wire, ok_reply, ok_wire};
 use crate::worker::runtime::WorkerOpContext;
-
-fn err_wire(name: &str, message: impl Into<String>) -> serde_json::Value {
-    let e = JsValueBridge::Error {
-        name: name.into(),
-        message: message.into(),
-        stack: None,
-        code: None,
-        cause: None,
-    };
-    crate::bridge::wire::to_wire_json(&e)
-}
-
-fn ok_wire(value: JsValueBridge) -> serde_json::Value {
-    crate::bridge::wire::to_wire_json(&value)
-}
 
 fn ctx_from_state(state: &OpState) -> Option<WorkerOpContext> {
     state.try_borrow::<WorkerOpContext>().cloned()
+}
+
+fn env_state_from_state(state: &OpState) -> Option<&EnvRuntimeState> {
+    state.try_borrow::<EnvRuntimeState>()
 }
 
 // Worker -> Node: hostPostMessage() op
@@ -145,5 +136,114 @@ pub async fn op_denojs_worker_host_call_async(
     match reply {
         Ok(v) => serde_json::json!({ "ok": true, "value": ok_wire(v) }),
         Err(e) => serde_json::json!({ "ok": false, "error": ok_wire(e) }),
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_denojs_worker_env_get(state: &mut OpState, #[string] key: String) -> serde_json::Value {
+    let Some(env_state) = env_state_from_state(state) else {
+        return err_reply("OpStateError", "EnvRuntimeState missing in OpState");
+    };
+
+    if !valid_env_key(&key) {
+        return err_reply("TypeError", "Invalid environment variable key");
+    }
+
+    if !env_state.access.allows(&key) {
+        return err_reply(
+            "PermissionDenied",
+            format!("Requires env access to \"{key}\""),
+        );
+    }
+
+    let v = env_state
+        .vars
+        .lock()
+        .ok()
+        .and_then(|vars| vars.get(&key).cloned());
+
+    match v {
+        Some(s) => ok_reply(JsValueBridge::String(s)),
+        None => ok_reply(JsValueBridge::Undefined),
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_denojs_worker_env_set(
+    state: &mut OpState,
+    #[string] key: String,
+    #[string] value: String,
+) -> serde_json::Value {
+    let Some(env_state) = env_state_from_state(state) else {
+        return err_reply("OpStateError", "EnvRuntimeState missing in OpState");
+    };
+
+    if !valid_env_key(&key) {
+        return err_reply("TypeError", "Invalid environment variable key");
+    }
+
+    if !env_state.access.allows(&key) {
+        return err_reply(
+            "PermissionDenied",
+            format!("Requires env access to \"{key}\""),
+        );
+    }
+
+    match env_state.vars.lock() {
+        Ok(mut vars) => {
+            vars.insert(key, value);
+            ok_reply(JsValueBridge::Null)
+        }
+        Err(_) => err_reply("Error", "Environment map lock poisoned"),
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_denojs_worker_env_delete(
+    state: &mut OpState,
+    #[string] key: String,
+) -> serde_json::Value {
+    let Some(env_state) = env_state_from_state(state) else {
+        return err_reply("OpStateError", "EnvRuntimeState missing in OpState");
+    };
+
+    if !valid_env_key(&key) {
+        return err_reply("TypeError", "Invalid environment variable key");
+    }
+
+    if !env_state.access.allows(&key) {
+        return err_reply(
+            "PermissionDenied",
+            format!("Requires env access to \"{key}\""),
+        );
+    }
+
+    match env_state.vars.lock() {
+        Ok(mut vars) => ok_reply(JsValueBridge::Bool(vars.remove(&key).is_some())),
+        Err(_) => err_reply("Error", "Environment map lock poisoned"),
+    }
+}
+
+#[op2]
+#[serde]
+pub fn op_denojs_worker_env_to_object(state: &mut OpState) -> serde_json::Value {
+    let Some(env_state) = env_state_from_state(state) else {
+        return err_reply("OpStateError", "EnvRuntimeState missing in OpState");
+    };
+
+    let mut out = serde_json::Map::new();
+    match env_state.vars.lock() {
+        Ok(vars) => {
+            for (k, v) in vars.iter() {
+                if env_state.access.allows(k) {
+                    out.insert(k.clone(), serde_json::Value::String(v.clone()));
+                }
+            }
+            ok_reply(JsValueBridge::Json(serde_json::Value::Object(out)))
+        }
+        Err(_) => err_reply("Error", "Environment map lock poisoned"),
     }
 }

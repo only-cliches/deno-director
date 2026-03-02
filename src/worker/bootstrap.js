@@ -78,11 +78,19 @@ async function callCapturedAwait(captured, name, ...args) {
 const OP_HOST_CALL_SYNC = "op_denojs_worker_host_call_sync";
 const OP_HOST_CALL_ASYNC = "op_denojs_worker_host_call_async";
 const OP_POST_MESSAGE = "op_denojs_worker_post_message";
+const OP_ENV_GET = "op_denojs_worker_env_get";
+const OP_ENV_SET = "op_denojs_worker_env_set";
+const OP_ENV_DELETE = "op_denojs_worker_env_delete";
+const OP_ENV_TO_OBJECT = "op_denojs_worker_env_to_object";
 
 // Capture stable references at bootstrap time.
 const CAP_HOST_CALL_SYNC = getOpEntry(OP_HOST_CALL_SYNC);
 const CAP_HOST_CALL_ASYNC = getOpEntry(OP_HOST_CALL_ASYNC);
 const CAP_POST_MESSAGE = getOpEntry(OP_POST_MESSAGE);
+const CAP_ENV_GET = getOpEntry(OP_ENV_GET);
+const CAP_ENV_SET = getOpEntry(OP_ENV_SET);
+const CAP_ENV_DELETE = getOpEntry(OP_ENV_DELETE);
+const CAP_ENV_TO_OBJECT = getOpEntry(OP_ENV_TO_OBJECT);
 
 // --------------------
 // Wire helpers
@@ -555,6 +563,71 @@ function hostCallSync(funcId, payloadArgs) {
   }
   return handleHostReply(out);
 }
+
+function envCallSync(captured, name, ...args) {
+  const out = callCapturedRaw(captured, name, ...args);
+  if (isThenable(out)) {
+    throw new Error(`${name} returned a Promise unexpectedly`);
+  }
+  return handleHostReply(out);
+}
+
+function installRuntimeEnvBridge() {
+  const denoObj = globalThis && globalThis.Deno;
+  const envObj = denoObj && denoObj.env;
+  if (!envObj || typeof envObj !== "object") return false;
+
+  safeObjSet(envObj, "get", (key) => {
+    const k = String(key);
+    return envCallSync(CAP_ENV_GET, OP_ENV_GET, k);
+  });
+
+  safeObjSet(envObj, "set", (key, value) => {
+    const k = String(key);
+    const v = String(value);
+    envCallSync(CAP_ENV_SET, OP_ENV_SET, k, v);
+  });
+
+  safeObjSet(envObj, "delete", (key) => {
+    const k = String(key);
+    const out = envCallSync(CAP_ENV_DELETE, OP_ENV_DELETE, k);
+    return !!out;
+  });
+
+  safeObjSet(envObj, "toObject", () => {
+    const out = envCallSync(CAP_ENV_TO_OBJECT, OP_ENV_TO_OBJECT);
+    return out && typeof out === "object" ? out : {};
+  });
+
+  return true;
+}
+
+function installRuntimeEnvBridgeEventually(attemptsLeft) {
+  if (installRuntimeEnvBridge()) return;
+  if (attemptsLeft <= 0) return;
+  try {
+    queueMicrotask(() => installRuntimeEnvBridgeEventually(attemptsLeft - 1));
+  } catch {
+    // ignore
+  }
+}
+
+try {
+  Object.defineProperty(globalThis, "__denojs_worker_install_runtime_env_bridge", {
+    value: installRuntimeEnvBridge,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+} catch {
+  try {
+    globalThis.__denojs_worker_install_runtime_env_bridge = installRuntimeEnvBridge;
+  } catch {
+    // ignore
+  }
+}
+
+installRuntimeEnvBridgeEventually(32);
 
 function bufferViewFromWire(obj) {
   const b = obj && obj.__buffer ? obj.__buffer : null;

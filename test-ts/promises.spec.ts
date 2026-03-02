@@ -118,4 +118,31 @@ describe("deno_worker: promises and error propagation", () => {
       code: "E_NODE",
     });
   });
+
+  it("in-flight eval from prior runtime always settles across restart", async () => {
+    await dw.setGlobal(
+      "nodeDelay",
+      async () => {
+        await sleep(200);
+        return 1;
+      },
+    );
+
+    const pending = dw.eval(`
+      (async () => {
+        await nodeDelay();
+        return 123;
+      })()
+    `);
+
+    await sleep(15);
+    await dw.restart();
+
+    const settled = await pending.then(
+      (value) => ({ status: "resolved" as const, value }),
+      (reason) => ({ status: "rejected" as const, reason }),
+    );
+    expect(settled.status === "resolved" || settled.status === "rejected").toBe(true);
+    await expect(dw.eval("100 + 23")).resolves.toBe(123);
+  });
 });

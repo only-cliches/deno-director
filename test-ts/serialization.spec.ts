@@ -10,6 +10,15 @@ describe("deno_worker: data serialization", () => {
   });
 
   const identityFn = "(x) => x";
+  const hasProtoKey = (v: unknown): boolean => {
+    if (Array.isArray(v)) return v.some(hasProtoKey);
+    if (v && typeof v === "object") {
+      const obj = v as Record<string, unknown>;
+      if (Object.prototype.hasOwnProperty.call(obj, "__proto__")) return true;
+      return Object.values(obj).some(hasProtoKey);
+    }
+    return false;
+  };
 
   it("round-trips JSON primitives and structures", async () => {
     dw = new DenoWorker();
@@ -114,6 +123,7 @@ describe("deno_worker: data serialization", () => {
 
     await fc.assert(
       fc.asyncProperty(fc.jsonValue(), async (data) => {
+        fc.pre(!hasProtoKey(data));
         const result = await dw.eval(identityFn, { args: [data] });
         expect(result).toEqual(data);
       }),

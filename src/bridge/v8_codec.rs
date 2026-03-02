@@ -1,7 +1,8 @@
 // src/bridge/v8_codec.rs
-use deno_runtime::deno_core::{serde_v8, v8};
 use deno_runtime::deno_core::v8::{ValueDeserializerHelper, ValueSerializerHelper};
+use deno_runtime::deno_core::{serde_v8, v8};
 
+use crate::bridge::tags::{TYPE_FUNCTION, TYPE_KEY};
 use crate::bridge::types::JsValueBridge;
 use crate::bridge::wire;
 
@@ -84,7 +85,8 @@ fn hydrate_via_global<'s, 'p>(
         return wire_value;
     };
 
-    h_fn.call(ps, global.into(), &[wire_value]).unwrap_or(wire_value)
+    h_fn.call(ps, global.into(), &[wire_value])
+        .unwrap_or(wire_value)
 }
 
 fn to_v8_via_wire<'s, 'p>(
@@ -133,17 +135,13 @@ pub fn to_v8<'s, 'p>(
             }
         }
 
-        JsValueBridge::String(s) => Ok(
-            v8::String::new(ps, s)
-                .ok_or_else(|| mk_err("alloc string failed"))?
-                .into(),
-        ),
+        JsValueBridge::String(s) => Ok(v8::String::new(ps, s)
+            .ok_or_else(|| mk_err("alloc string failed"))?
+            .into()),
 
-        JsValueBridge::DateMs(ms) => Ok(
-            v8::Date::new(ps, *ms)
-                .ok_or_else(|| mk_err("date create failed"))?
-                .into(),
-        ),
+        JsValueBridge::DateMs(ms) => Ok(v8::Date::new(ps, *ms)
+            .ok_or_else(|| mk_err("date create failed"))?
+            .into()),
 
         // Prefer wire hydration for these.
         JsValueBridge::BigInt(_)
@@ -161,7 +159,8 @@ pub fn to_v8<'s, 'p>(
             let d = v8::ValueDeserializer::new(ps, Box::new(D), bytes);
             let ctx = ps.get_current_context();
             let _ = d.read_header(ctx);
-            d.read_value(ctx).ok_or_else(|| mk_err("deserialize failed"))
+            d.read_value(ctx)
+                .ok_or_else(|| mk_err("deserialize failed"))
         }
 
         JsValueBridge::Error {
@@ -173,7 +172,9 @@ pub fn to_v8<'s, 'p>(
         } => {
             let msg = v8::String::new(ps, message).ok_or_else(|| mk_err("err msg alloc failed"))?;
             let ex = v8::Exception::error(ps, msg);
-            let obj = ex.to_object(ps).ok_or_else(|| mk_err("error object failed"))?;
+            let obj = ex
+                .to_object(ps)
+                .ok_or_else(|| mk_err("error object failed"))?;
 
             let set_opt_str = |ps: &mut v8::PinScope<'s, 'p>, key: &str, val: Option<&str>| {
                 if let Some(v) = val {
@@ -201,7 +202,7 @@ pub fn to_v8<'s, 'p>(
 
         JsValueBridge::HostFunction { id, is_async } => {
             let j = serde_json::json!({
-                "__denojs_worker_type": "function",
+                TYPE_KEY: TYPE_FUNCTION,
                 "id": *id,
                 "async": *is_async,
             });
@@ -302,7 +303,9 @@ pub fn from_v8<'s, 'p>(
     }
 
     if value.is_reg_exp() {
-        let obj = value.to_object(ps).ok_or_else(|| mk_err("regexp obj conv failed"))?;
+        let obj = value
+            .to_object(ps)
+            .ok_or_else(|| mk_err("regexp obj conv failed"))?;
         let source = get_string_prop(ps, obj, "source").unwrap_or_default();
         let flags = get_string_prop(ps, obj, "flags").unwrap_or_default();
         return Ok(JsValueBridge::RegExp { source, flags });
@@ -328,7 +331,9 @@ pub fn from_v8<'s, 'p>(
     // DataView
     if value.is_data_view() {
         let dv = value.cast::<v8::DataView>();
-        let ab = dv.buffer(ps).ok_or_else(|| mk_err("dataview buffer missing"))?;
+        let ab = dv
+            .buffer(ps)
+            .ok_or_else(|| mk_err("dataview buffer missing"))?;
         let byte_offset = dv.byte_offset();
         let byte_len = dv.byte_length();
 
@@ -349,7 +354,9 @@ pub fn from_v8<'s, 'p>(
     // Typed arrays and DataView
     if value.is_typed_array() {
         let ta = value.cast::<v8::TypedArray>();
-        let ab = ta.buffer(ps).ok_or_else(|| mk_err("typedarray buffer missing"))?;
+        let ab = ta
+            .buffer(ps)
+            .ok_or_else(|| mk_err("typedarray buffer missing"))?;
         let byte_offset = ta.byte_offset();
         let byte_len = ta.byte_length();
 
@@ -429,7 +436,9 @@ pub fn from_v8<'s, 'p>(
 
     // Native Error
     if value.is_native_error() {
-        let obj = value.to_object(ps).ok_or_else(|| mk_err("error obj conv failed"))?;
+        let obj = value
+            .to_object(ps)
+            .ok_or_else(|| mk_err("error obj conv failed"))?;
         let name = get_string_prop(ps, obj, "name").unwrap_or_else(|| "Error".into());
         let message = get_string_prop(ps, obj, "message").unwrap_or_default();
         let stack = get_string_prop(ps, obj, "stack");

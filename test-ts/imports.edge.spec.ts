@@ -179,4 +179,38 @@ describe("DenoWorker imports callback edge cases", () => {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("imports callback remains active after restart without duplicate per-import invocation", async () => {
+    const dir = await mkTempDir("denojs-worker-imports-restart-");
+    let count = 0;
+
+    const dw = new DenoWorker({
+      cwd: dir,
+      imports: async () => {
+        count += 1;
+        return true;
+      },
+    } as any);
+
+    try {
+      await writeFile(path.join(dir, "a.js"), "export default 9;\n");
+      const code = `
+        import a from "./a.js";
+        moduleReturn(a);
+      `;
+
+      await expect(dw.evalModule(code)).resolves.toBe(9);
+      const firstCount = count;
+      expect(firstCount).toBeGreaterThan(0);
+
+      await dw.restart();
+      await expect(dw.evalModule(code)).resolves.toBe(9);
+      const secondDelta = count - firstCount;
+
+      expect(secondDelta).toBe(firstCount);
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });

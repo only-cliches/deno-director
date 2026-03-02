@@ -1,0 +1,72 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::worker::state::EnvConfig;
+
+#[derive(Debug, Clone)]
+pub enum EnvAccess {
+    Deny,
+    AllowAll,
+    AllowKeys(std::collections::HashSet<String>),
+}
+
+impl EnvAccess {
+    pub fn allows(&self, key: &str) -> bool {
+        match self {
+            Self::Deny => false,
+            Self::AllowAll => true,
+            Self::AllowKeys(keys) => keys.contains(key),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EnvRuntimeState {
+    pub vars: Mutex<HashMap<String, String>>,
+    pub access: EnvAccess,
+}
+
+pub fn valid_env_key(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 4096 && !k.contains('\0')
+}
+
+pub fn env_access_from_permissions(permissions: Option<&serde_json::Value>) -> EnvAccess {
+    let Some(cfg) = permissions else {
+        return EnvAccess::Deny;
+    };
+
+    let Some(v) = cfg.get("env") else {
+        return EnvAccess::Deny;
+    };
+
+    if *v == serde_json::Value::Bool(true) {
+        return EnvAccess::AllowAll;
+    }
+
+    if let Some(arr) = v.as_array() {
+        let mut keys = std::collections::HashSet::new();
+        for it in arr.iter() {
+            if let Some(s) = it.as_str() {
+                keys.insert(s.to_string());
+            }
+        }
+        return EnvAccess::AllowKeys(keys);
+    }
+
+    EnvAccess::Deny
+}
+
+pub fn merge_env_snapshot(
+    mut snapshot: HashMap<String, String>,
+    cfg: Option<&EnvConfig>,
+) -> HashMap<String, String> {
+    if let Some(EnvConfig::Map(map)) = cfg {
+        for (k, v) in map.iter() {
+            if !valid_env_key(k) {
+                continue;
+            }
+            snapshot.insert(k.clone(), v.clone());
+        }
+    }
+    snapshot
+}

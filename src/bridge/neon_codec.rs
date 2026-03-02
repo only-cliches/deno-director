@@ -4,6 +4,10 @@ use neon::result::Throw;
 use neon::types::JsDate;
 
 use super::types::JsValueBridge;
+use crate::bridge::tags::{
+    BIGINT_KEY, BUFFER_KEY, DATE_KEY, MAP_KEY, NUMBER_NEG_ZERO_KEY, REGEXP_KEY, SET_KEY,
+    TYPE_ERROR, TYPE_KEY, URL_KEY, URL_SEARCH_PARAMS_KEY,
+};
 use crate::worker::messages::EvalReply;
 use neon::types::buffer::TypedArray;
 
@@ -119,7 +123,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                     if f == 0.0 && f.is_sign_negative() {
                         let marker = cx.empty_object();
                         let val = cx.string("-0");
-                        marker.set(&mut cx, "__denojs_worker_num", val)?;
+                        marker.set(&mut cx, NUMBER_NEG_ZERO_KEY, val)?;
                         return Ok(marker.upcast());
                     }
                 }
@@ -134,7 +138,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                     let marker = cx.empty_object();
                     let out_v = cx.string(out_s);
-                    marker.set(&mut cx, "__bigint", out_v)?;
+                    marker.set(&mut cx, BIGINT_KEY, out_v)?;
                     return Ok(marker.upcast());
                 }
 
@@ -143,7 +147,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                     let ms = d.value(&mut cx);
                     let marker = cx.empty_object();
                     let ms_v = cx.number(ms);
-                    marker.set(&mut cx, "__date", ms_v)?;
+                    marker.set(&mut cx, DATE_KEY, ms_v)?;
                     return Ok(marker.upcast());
                 }
 
@@ -161,8 +165,8 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                     let marker = cx.empty_object();
 
-                    let t_v = cx.string("error");
-                    marker.set(&mut cx, "__denojs_worker_type", t_v)?;
+                    let t_v = cx.string(TYPE_ERROR);
+                    marker.set(&mut cx, TYPE_KEY, t_v)?;
 
                     let name_v = cx.string(name);
                     marker.set(&mut cx, "name", name_v)?;
@@ -207,7 +211,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                     inner.set(&mut cx, "flags", flags_v)?;
 
                     let marker = cx.empty_object();
-                    marker.set(&mut cx, "__regexp", inner)?;
+                    marker.set(&mut cx, REGEXP_KEY, inner)?;
                     return Ok(marker.upcast());
                 }
 
@@ -216,7 +220,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                     if let Some(href) = get_string_prop(&mut cx, obj, "href") {
                         let marker = cx.empty_object();
                         let href_v = cx.string(href);
-                        marker.set(&mut cx, "__url", href_v)?;
+                        marker.set(&mut cx, URL_KEY, href_v)?;
                         return Ok(marker.upcast());
                     }
 
@@ -251,7 +255,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                                     let marker = cx.empty_object();
                                     let out_v = cx.string(out_s);
-                                    marker.set(&mut cx, "__urlSearchParams", out_v)?;
+                                    marker.set(&mut cx, URL_SEARCH_PARAMS_KEY, out_v)?;
                                     return Ok(marker.upcast());
                                 }
                             }
@@ -388,7 +392,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                                         inner.set(&mut cx, "length", len_v)?;
 
                                         let marker = cx.empty_object();
-                                        marker.set(&mut cx, "__buffer", inner)?;
+                                        marker.set(&mut cx, BUFFER_KEY, inner)?;
                                         return Ok(marker.upcast());
                                     }
                                 }
@@ -428,7 +432,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                                     .unwrap_or_else(|_| cx.undefined().upcast());
 
                                 let marker = cx.empty_object();
-                                marker.set(&mut cx, "__map", pairs_any)?;
+                                marker.set(&mut cx, MAP_KEY, pairs_any)?;
                                 return Ok(marker.upcast());
                             }
                         }
@@ -463,7 +467,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                                     .unwrap_or_else(|_| cx.undefined().upcast());
 
                                 let marker = cx.empty_object();
-                                marker.set(&mut cx, "__set", vals_any)?;
+                                marker.set(&mut cx, SET_KEY, vals_any)?;
                                 return Ok(marker.upcast());
                             }
                         }
@@ -754,11 +758,11 @@ fn json_to_neon<'a, C: Context<'a>>(
                 return Ok(b.upcast());
             }
 
-            if map.get("__denojs_worker_num").and_then(|x| x.as_str()) == Some("-0") {
+            if map.get(NUMBER_NEG_ZERO_KEY).and_then(|x| x.as_str()) == Some("-0") {
                 return Ok(cx.number(-0.0).upcast());
             }
 
-            if let Some(ms) = map.get("__date").and_then(|x| x.as_f64()) {
+            if let Some(ms) = map.get(DATE_KEY).and_then(|x| x.as_f64()) {
                 return cx
                     .date(ms)
                     .map(|d| d.upcast())
@@ -780,13 +784,13 @@ fn json_to_neon<'a, C: Context<'a>>(
                 .and_then(|x| x.as_f64())
             {
                 let o = cx.empty_object();
-                let key = cx.string("__date");
+                let key = cx.string(DATE_KEY);
                 let vv = cx.number(ms);
                 let _ = o.set(cx, key, vv);
                 return Ok(o.upcast());
             }
 
-            if let Some(s) = map.get("__bigint").and_then(|x| x.as_str()) {
+            if let Some(s) = map.get(BIGINT_KEY).and_then(|x| x.as_str()) {
                 let ctor = match cx.global::<JsFunction>("BigInt") {
                     Ok(f) => f,
                     Err(_) => return Ok(cx.string(s).upcast()),
@@ -798,7 +802,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 return Ok(out.unwrap_or_else(|| cx.string(s).upcast()));
             }
 
-            if let Some(re) = map.get("__regexp").and_then(|x| x.as_object()) {
+            if let Some(re) = map.get(REGEXP_KEY).and_then(|x| x.as_object()) {
                 let source = re.get("source").and_then(|x| x.as_str()).unwrap_or("");
                 let flags = re.get("flags").and_then(|x| x.as_str()).unwrap_or("");
 
@@ -824,7 +828,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 return Ok(out.unwrap_or_else(|| cx.undefined().upcast()));
             }
 
-            if let Some(s) = map.get("__url").and_then(|x| x.as_str()) {
+            if let Some(s) = map.get(URL_KEY).and_then(|x| x.as_str()) {
                 let ctor = cx.global::<JsFunction>("URL").ok();
                 if let Some(ctor) = ctor {
                     let ss = cx.string(s).upcast::<JsValue>();
@@ -834,7 +838,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 return Ok(cx.string(s).upcast());
             }
 
-            if let Some(s) = map.get("__urlSearchParams").and_then(|x| x.as_str()) {
+            if let Some(s) = map.get(URL_SEARCH_PARAMS_KEY).and_then(|x| x.as_str()) {
                 let ctor = cx.global::<JsFunction>("URLSearchParams").ok();
                 if let Some(ctor) = ctor {
                     let ss = cx.string(s).upcast::<JsValue>();
@@ -845,7 +849,7 @@ fn json_to_neon<'a, C: Context<'a>>(
             }
 
             // __buffer wire tag: { __buffer: { kind, bytes, byteOffset, length } }
-            if let Some(b) = map.get("__buffer").and_then(|x| x.as_object()) {
+            if let Some(b) = map.get(BUFFER_KEY).and_then(|x| x.as_object()) {
                 let kind = b
                     .get("kind")
                     .and_then(|x| x.as_str())
@@ -872,7 +876,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 return Ok(out);
             }
 
-            if let Some(pairs) = map.get("__map").and_then(|x| x.as_array()) {
+            if let Some(pairs) = map.get(MAP_KEY).and_then(|x| x.as_array()) {
                 let ctor = cx.global::<JsFunction>("Map").ok();
                 if let Some(ctor) = ctor {
                     let js_pairs = JsArray::new(cx, pairs.len());
@@ -888,7 +892,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 }
             }
 
-            if let Some(items) = map.get("__set").and_then(|x| x.as_array()) {
+            if let Some(items) = map.get(SET_KEY).and_then(|x| x.as_array()) {
                 let ctor = cx.global::<JsFunction>("Set").ok();
                 if let Some(ctor) = ctor {
                     let js_items = JsArray::new(cx, items.len());
@@ -904,7 +908,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 }
             }
 
-            if map.get("__denojs_worker_type").and_then(|x| x.as_str()) == Some("error") {
+            if map.get(TYPE_KEY).and_then(|x| x.as_str()) == Some(TYPE_ERROR) {
                 let name = map.get("name").and_then(|x| x.as_str()).unwrap_or("Error");
                 let message = map.get("message").and_then(|x| x.as_str()).unwrap_or("");
 
@@ -1002,12 +1006,10 @@ pub fn to_neon_value<'a, C: Context<'a>>(
         JsValueBridge::Bool(v) => Ok(cx.boolean(*v).upcast()),
         JsValueBridge::Number(v) => Ok(cx.number(*v).upcast()),
         JsValueBridge::String(v) => Ok(cx.string(v).upcast()),
-        JsValueBridge::DateMs(ms) => {
-            match JsDate::new(cx, *ms) {
-                Ok(d) => Ok(d.upcast()),
-                Err(_) => Ok(cx.undefined().upcast()),
-            }
-        }
+        JsValueBridge::DateMs(ms) => match JsDate::new(cx, *ms) {
+            Ok(d) => Ok(d.upcast()),
+            Err(_) => Ok(cx.undefined().upcast()),
+        },
 
         JsValueBridge::BigInt(s) => {
             let ctor = cx.global::<JsFunction>("BigInt").ok();

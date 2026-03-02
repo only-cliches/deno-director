@@ -1,9 +1,11 @@
 use deno_error::JsErrorBox;
 use deno_runtime::deno_core::{self, ModuleLoader, ModuleSource, ModuleType};
+use deno_runtime::transpile::{JsParseDiagnostic, JsTranspileError};
 
 use crate::worker::messages::NodeMsg;
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -33,6 +35,7 @@ fn dbg_imports(msg: impl AsRef<str>) {
 #[derive(Clone, Debug)]
 struct ModuleEntry {
     code: String,
+    module_type: ModuleType,
     persistent: bool,
     uses_left: Option<usize>,
 }
@@ -54,7 +57,7 @@ impl ModuleRegistry {
     pub fn next_virtual_specifier(&self, ext: &str) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let ext = match ext {
-            "js" | "ts" | "tsx" => ext,
+            "js" | "ts" | "tsx" | "jsx" => ext,
             _ => "js",
         };
         format!("denojs-worker://virtual/__vm_{n}.{ext}")
@@ -68,46 +71,49 @@ impl ModuleRegistry {
             .unwrap_or(false)
     }
 
-    pub fn put_ephemeral(&self, specifier: &str, code: &str) {
+    pub fn put_ephemeral(&self, specifier: &str, code: &str, module_type: ModuleType) {
         let mut map = self.modules.lock().expect("modules lock");
         map.insert(
             specifier.to_string(),
             ModuleEntry {
                 code: code.to_string(),
+                module_type,
                 persistent: false,
                 uses_left: Some(3),
             },
         );
     }
 
-    pub fn put_persistent(&self, specifier: &str, code: &str) {
+    pub fn put_persistent(&self, specifier: &str, code: &str, module_type: ModuleType) {
         let mut map = self.modules.lock().expect("modules lock");
         map.insert(
             specifier.to_string(),
             ModuleEntry {
                 code: code.to_string(),
+                module_type,
                 persistent: true,
                 uses_left: None,
             },
         );
     }
 
-    pub fn get_for_load(&self, specifier: &str) -> Option<String> {
+    pub fn get_for_load(&self, specifier: &str) -> Option<(String, ModuleType)> {
         let mut map = self.modules.lock().ok()?;
         let entry = map.get_mut(specifier)?;
 
         if entry.persistent {
-            return Some(entry.code.clone());
+            return Some((entry.code.clone(), entry.module_type.clone()));
         }
 
         match entry.uses_left.as_mut() {
             Some(n) if *n > 0 => {
                 *n -= 1;
                 let out = entry.code.clone();
+                let module_type = entry.module_type.clone();
                 if *n == 0 {
                     map.remove(specifier);
                 }
-                Some(out)
+                Some((out, module_type))
             }
             _ => {
                 map.remove(specifier);
@@ -125,6 +131,8 @@ pub struct DynamicModuleLoader {
     pub node_compat: bool,
     pub sandbox_root: PathBuf,
     pub fs_loader: Arc<deno_core::FsModuleLoader>,
+    pub module_loader: Option<crate::worker::state::ModuleLoaderConfig>,
+    pub permissions: Option<serde_json::Value>,
 }
 
 impl DynamicModuleLoader {
@@ -175,7 +183,15 @@ impl DynamicModuleLoader {
     }
 
     pub fn within_sandbox(&self, _file_url: &Url) -> bool {
-        true
+        let root_abs =
+            std::fs::canonicalize(&self.sandbox_root).unwrap_or_else(|_| self.sandbox_root.clone());
+
+        let Ok(path) = _file_url.to_file_path() else {
+            return false;
+        };
+
+        let cand_abs = std::fs::canonicalize(&path).unwrap_or(path);
+        cand_abs.starts_with(&root_abs)
     }
 
     pub fn try_node_resolve_disk(&self, specifier: &str, referrer: &str) -> Option<Url> {
@@ -331,7 +347,289 @@ impl DynamicModuleLoader {
             node_compat: self.node_compat,
             sandbox_root: self.sandbox_root.clone(),
             fs_loader: self.fs_loader.clone(),
+            module_loader: self.module_loader.clone(),
+            permissions: self.permissions.clone(),
         }
+    }
+
+    fn permissions_cfg(&self) -> Option<&serde_json::Value> {
+        self.permissions.as_ref()
+    }
+
+    fn match_host_port(allow: &str, host: &str, port: Option<u16>) -> bool {
+        let allow = allow.trim();
+        if allow.is_empty() {
+            return false;
+        }
+        if allow == "*" {
+            return true;
+        }
+
+        if allow.starts_with("http://") || allow.starts_with("https://") {
+            let Ok(u) = Url::parse(allow) else {
+                return false;
+            };
+            let Some(h) = u.host_str() else {
+                return false;
+            };
+            if !h.eq_ignore_ascii_case(host) {
+                return false;
+            }
+            let ap = u.port_or_known_default();
+            return ap.is_none() || ap == port;
+        }
+
+        if let Some((h, p)) = allow.rsplit_once(':') {
+            if h.contains(']') || h.contains('[') {
+                return h.eq_ignore_ascii_case(host);
+            }
+            let Ok(pp) = p.parse::<u16>() else {
+                return false;
+            };
+            return h.eq_ignore_ascii_case(host) && Some(pp) == port;
+        }
+
+        allow.eq_ignore_ascii_case(host)
+    }
+
+    fn allows_import_url(&self, u: &Url) -> bool {
+        let Some(cfg) = self.permissions_cfg() else {
+            return false;
+        };
+        let Some(v) = cfg.get("import") else {
+            return false;
+        };
+
+        if v == &serde_json::Value::Bool(true) {
+            return true;
+        }
+        if v != &serde_json::Value::Bool(false) {
+            if let Some(arr) = v.as_array() {
+                for item in arr.iter().filter_map(|x| x.as_str()) {
+                    let s = item.trim();
+                    if s == "*" {
+                        return true;
+                    }
+                    if s.starts_with("http://") || s.starts_with("https://") {
+                        if u.as_str().starts_with(s) {
+                            return true;
+                        }
+                        if let Ok(au) = Url::parse(s) {
+                            if let (Some(ah), Some(h)) = (au.host_str(), u.host_str()) {
+                                if ah.eq_ignore_ascii_case(h)
+                                    && (au.port_or_known_default().is_none()
+                                        || au.port_or_known_default() == u.port_or_known_default())
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(h) = u.host_str() {
+                        if Self::match_host_port(s, h, u.port_or_known_default()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn allows_net_url(&self, u: &Url) -> bool {
+        let Some(cfg) = self.permissions_cfg() else {
+            return false;
+        };
+        let Some(v) = cfg.get("net") else {
+            return false;
+        };
+
+        if v == &serde_json::Value::Bool(true) {
+            return true;
+        }
+        if v != &serde_json::Value::Bool(false) {
+            if let Some(arr) = v.as_array() {
+                for item in arr.iter().filter_map(|x| x.as_str()) {
+                    if let Some(h) = u.host_str() {
+                        if Self::match_host_port(item, h, u.port_or_known_default()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn ensure_remote_permissions(&self, module_specifier: &Url) -> Result<(), JsErrorBox> {
+        if !self.allows_import_url(module_specifier) {
+            return Err(JsErrorBox::generic(format!(
+                "Remote import denied by permissions.import: {}",
+                module_specifier
+            )));
+        }
+        if !self.allows_net_url(module_specifier) {
+            return Err(JsErrorBox::generic(format!(
+                "Remote import denied by permissions.net: {}",
+                module_specifier
+            )));
+        }
+        Ok(())
+    }
+
+    fn module_loader_cfg(&self) -> crate::worker::state::ModuleLoaderConfig {
+        self.module_loader.clone().unwrap_or_default()
+    }
+
+    fn deno_remote_enabled(&self) -> bool {
+        self.module_loader_cfg().deno_remote
+    }
+
+    fn transpile_ts_enabled(&self) -> bool {
+        self.module_loader_cfg().transpile_ts
+    }
+
+    fn module_ext(u: &Url) -> Option<String> {
+        let p = u.path().to_ascii_lowercase();
+        p.rsplit('.').next().map(|s| s.to_string())
+    }
+
+    fn is_ts_like_ext(ext: &str) -> bool {
+        matches!(ext, "ts" | "tsx" | "jsx")
+    }
+
+    fn media_type_for_ext(ext: &str) -> deno_ast::MediaType {
+        match ext {
+            "ts" => deno_ast::MediaType::TypeScript,
+            "tsx" => deno_ast::MediaType::Tsx,
+            "jsx" => deno_ast::MediaType::Jsx,
+            _ => deno_ast::MediaType::JavaScript,
+        }
+    }
+
+    fn remote_cache_path(&self, module_specifier: &Url) -> PathBuf {
+        let cfg = self.module_loader_cfg();
+        let base = cfg
+            .cache_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.sandbox_root.join(".deno_remote_cache"));
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        module_specifier.as_str().hash(&mut hasher);
+        let h = hasher.finish();
+        let ext = Self::module_ext(module_specifier).unwrap_or_else(|| "js".to_string());
+        base.join(format!("{h:016x}.{ext}"))
+    }
+
+    async fn fetch_remote_text(module_specifier: &Url) -> Result<String, JsErrorBox> {
+        let out = std::process::Command::new("curl")
+            .arg("--fail")
+            .arg("--silent")
+            .arg("--show-error")
+            .arg("--location")
+            .arg(module_specifier.as_str())
+            .output()
+            .map_err(|e| JsErrorBox::generic(format!("Remote fetch failed: {e}")))?;
+
+        if !out.status.success() {
+            return Err(JsErrorBox::generic(format!(
+                "Remote fetch failed (status={}): {}",
+                out.status, module_specifier
+            )));
+        }
+
+        String::from_utf8(out.stdout)
+            .map_err(|e| JsErrorBox::generic(format!("Remote body decode failed: {e}")))
+    }
+
+    fn module_type_for_url(module_specifier: &Url) -> ModuleType {
+        let ext = Self::module_ext(module_specifier).unwrap_or_default();
+        if ext == "json" {
+            ModuleType::Json
+        } else {
+            ModuleType::JavaScript
+        }
+    }
+
+    fn transpile_options_from_cfg(
+        cfg: &crate::worker::state::ModuleLoaderConfig,
+    ) -> deno_ast::TranspileOptions {
+        let mut out = deno_ast::TranspileOptions::default();
+        if let Some(tc) = cfg.ts_compiler.as_ref() {
+            let jsx_mode = tc.jsx.as_deref().unwrap_or("react");
+            out.jsx = match jsx_mode {
+                "preserve" => None,
+                "react-jsx" => Some(deno_ast::JsxRuntime::Automatic(
+                    deno_ast::JsxAutomaticOptions {
+                        development: false,
+                        import_source: None,
+                    },
+                )),
+                "react-jsxdev" => Some(deno_ast::JsxRuntime::Automatic(
+                    deno_ast::JsxAutomaticOptions {
+                        development: true,
+                        import_source: None,
+                    },
+                )),
+                _ => {
+                    let mut classic = deno_ast::JsxClassicOptions::default();
+                    if let Some(factory) = tc.jsx_factory.as_ref() {
+                        classic.factory = factory.clone();
+                    }
+                    if let Some(fragment) = tc.jsx_fragment_factory.as_ref() {
+                        classic.fragment_factory = fragment.clone();
+                    }
+                    Some(deno_ast::JsxRuntime::Classic(classic))
+                }
+            };
+        }
+        out
+    }
+
+    fn maybe_transpile_ts_like(
+        &self,
+        module_specifier: &Url,
+        ext: &str,
+        code: String,
+    ) -> Result<String, JsErrorBox> {
+        if !Self::is_ts_like_ext(ext) {
+            return Ok(code);
+        }
+
+        if !self.transpile_ts_enabled() {
+            return Err(JsErrorBox::generic(format!(
+                "Import returned .{ext} source but TypeScript transpilation is disabled. \
+Enable it with moduleLoader: {{ transpileTs: true }}. Specifier: {}",
+                module_specifier
+            )));
+        }
+
+        let media_type = Self::media_type_for_ext(ext);
+        let parsed = deno_ast::parse_module(deno_ast::ParseParams {
+            specifier: module_specifier.clone(),
+            text: code.into(),
+            media_type,
+            capture_tokens: false,
+            scope_analysis: false,
+            maybe_syntax: None,
+        })
+        .map_err(|e| JsErrorBox::from_err(JsParseDiagnostic(e)))?;
+
+        let cfg = self.module_loader_cfg();
+        let transpiled = parsed
+            .transpile(
+                &Self::transpile_options_from_cfg(&cfg),
+                &deno_ast::TranspileModuleOptions::default(),
+                &deno_ast::EmitOptions {
+                    source_map: deno_ast::SourceMapOption::None,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| JsErrorBox::from_err(JsTranspileError(e)))?
+            .into_source();
+
+        Ok(transpiled.text)
     }
 }
 
@@ -369,6 +667,13 @@ impl ModuleLoader for DynamicModuleLoader {
             return Ok(u);
         }
 
+        // Optional Deno-style remote imports.
+        if self.deno_remote_enabled()
+            && (specifier.starts_with("http://") || specifier.starts_with("https://"))
+        {
+            return self.try_deno_resolve(specifier, referrer);
+        }
+
         // Deno resolver, but normalize virtual referrers into file://<cwd>/ for relative imports.
         self.try_deno_resolve(specifier, referrer)
     }
@@ -394,9 +699,9 @@ impl ModuleLoader for DynamicModuleLoader {
             .unwrap_or_default();
 
         // 1) Serve in-memory modules first
-        if let Some(code) = self.reg.get_for_load(&spec) {
+        if let Some((code, module_type)) = self.reg.get_for_load(&spec) {
             let source = ModuleSource::new(
-                ModuleType::JavaScript,
+                module_type,
                 deno_core::ModuleSourceCode::String(code.into()),
                 module_specifier,
                 None,
@@ -443,6 +748,7 @@ impl ModuleLoader for DynamicModuleLoader {
                     .send(NodeMsg::ImportRequest {
                         specifier: orig_spec.clone(),
                         referrer: orig_referrer.clone(),
+                        is_dynamic_import: options.is_dynamic_import,
                         reply: tx,
                     })
                     .await
@@ -549,8 +855,19 @@ impl ModuleLoader for DynamicModuleLoader {
                     }
 
                     ImportDecision::SourceTyped { ext, code } => {
-                        let virt = this_loader.reg.next_virtual_specifier(&ext);
-                        this_loader.reg.put_persistent(&virt, &code);
+                        let mut final_code = code;
+                        if DynamicModuleLoader::is_ts_like_ext(&ext) {
+                            final_code = this_loader.maybe_transpile_ts_like(
+                                &requested_specifier,
+                                &ext,
+                                final_code,
+                            )?;
+                        }
+
+                        let virt = this_loader.reg.next_virtual_specifier("js");
+                        this_loader
+                            .reg
+                            .put_persistent(&virt, &final_code, ModuleType::JavaScript);
 
                         let wrapper = format!(
                             "export * from {v};\nexport {{ default }} from {v};\n",
@@ -571,6 +888,52 @@ impl ModuleLoader for DynamicModuleLoader {
         }
 
         // 5) Non-callback: allow disk loads directly
+        if (module_specifier.scheme() == "http" || module_specifier.scheme() == "https")
+            && self.deno_remote_enabled()
+        {
+            let this_loader = self.clone_for_async();
+            let module_specifier = module_specifier.clone();
+
+            return deno_core::ModuleLoadResponse::Async(Box::pin(async move {
+                this_loader.ensure_remote_permissions(&module_specifier)?;
+                let ext = DynamicModuleLoader::module_ext(&module_specifier).unwrap_or_default();
+
+                let cfg = this_loader.module_loader_cfg();
+                let cache_path = this_loader.remote_cache_path(&module_specifier);
+                let mut maybe_cached = None;
+                if !cfg.reload {
+                    maybe_cached = tokio::fs::read_to_string(&cache_path).await.ok();
+                }
+
+                let code = match maybe_cached {
+                    Some(s) => s,
+                    None => {
+                        let s = DynamicModuleLoader::fetch_remote_text(&module_specifier).await?;
+                        if let Some(parent) = cache_path.parent() {
+                            let _ = tokio::fs::create_dir_all(parent).await;
+                        }
+                        let _ = tokio::fs::write(&cache_path, s.as_bytes()).await;
+                        s
+                    }
+                };
+
+                let module_type = DynamicModuleLoader::module_type_for_url(&module_specifier);
+                let final_code =
+                    this_loader.maybe_transpile_ts_like(&module_specifier, &ext, code)?;
+                let final_module_type = if DynamicModuleLoader::is_ts_like_ext(&ext) {
+                    ModuleType::JavaScript
+                } else {
+                    module_type
+                };
+                Ok(ModuleSource::new(
+                    final_module_type,
+                    deno_core::ModuleSourceCode::String(final_code.into()),
+                    &module_specifier,
+                    None,
+                ))
+            }));
+        }
+
         if module_specifier.scheme() == "file" && !self.within_sandbox(module_specifier) {
             return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(
                 "Import blocked: outside sandbox",

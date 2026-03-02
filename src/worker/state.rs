@@ -67,6 +67,22 @@ pub struct InspectConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct TsCompilerConfig {
+    pub jsx: Option<String>,
+    pub jsx_factory: Option<String>,
+    pub jsx_fragment_factory: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModuleLoaderConfig {
+    pub deno_remote: bool,
+    pub transpile_ts: bool,
+    pub ts_compiler: Option<TsCompilerConfig>,
+    pub cache_dir: Option<String>,
+    pub reload: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeLimits {
     pub max_memory_bytes: Option<u64>,
     pub max_stack_size_bytes: Option<u64>,
@@ -83,6 +99,7 @@ pub struct RuntimeLimits {
 
     pub console: Option<serde_json::Value>,
     pub inspect: Option<InspectConfig>,
+    pub module_loader: Option<ModuleLoaderConfig>,
 
     /// env:
     /// - None: default Deno behavior
@@ -101,7 +118,9 @@ fn parse_dotenv_text_strict(text: &str) -> Vec<(String, String)> {
         let ss = s.trim();
         if ss.len() >= 2 {
             let b = ss.as_bytes();
-            if (b[0] == b'"' && b[ss.len() - 1] == b'"') || (b[0] == b'\'' && b[ss.len() - 1] == b'\'') {
+            if (b[0] == b'"' && b[ss.len() - 1] == b'"')
+                || (b[0] == b'\'' && b[ss.len() - 1] == b'\'')
+            {
                 return ss[1..ss.len() - 1].to_string();
             }
         }
@@ -171,22 +190,14 @@ fn find_dotenv_upwards(start_dir: &Path) -> Option<PathBuf> {
             return Some(cand);
         }
         let parent = cur.parent().map(|p| p.to_path_buf());
-        let Some(p) = parent else { return None; };
+        let Some(p) = parent else {
+            return None;
+        };
         if p == cur {
             return None;
         }
         cur = p;
     }
-}
-
-fn validate_env_key(k: &str) -> bool {
-    if k.is_empty() || k.len() > 4096 {
-        return false;
-    }
-    if k.contains('\0') {
-        return false;
-    }
-    true
 }
 
 fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
@@ -196,7 +207,7 @@ fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
     };
 
     for (k, v) in map.iter() {
-        if !validate_env_key(k) {
+        if !crate::worker::env::valid_env_key(k) {
             continue;
         }
         if let Some(s) = v.as_str() {
@@ -207,7 +218,10 @@ fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
     out
 }
 
-fn load_dotenv_file_strict(cx: &mut FunctionContext, path: &Path) -> Result<HashMap<String, String>, Throw> {
+fn load_dotenv_file_strict(
+    cx: &mut FunctionContext,
+    path: &Path,
+) -> Result<HashMap<String, String>, Throw> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         cx.throw_error::<_, Throw>(format!(
             "env file read failed: {} ({})",
@@ -220,7 +234,7 @@ fn load_dotenv_file_strict(cx: &mut FunctionContext, path: &Path) -> Result<Hash
     let pairs = parse_dotenv_text_strict(&text);
     let mut map = HashMap::new();
     for (k, vv) in pairs {
-        if !validate_env_key(&k) {
+        if !crate::worker::env::valid_env_key(&k) {
             continue;
         }
         map.insert(k, vv);
@@ -447,6 +461,98 @@ impl WorkerCreateOptions {
                     port,
                     break_on_first_statement: brk,
                 });
+            }
+        }
+
+        // moduleLoader:
+        // {
+        //   denoRemote?: boolean;
+        //   transpileTs?: boolean;
+        //   tsCompiler?: {
+        //     jsx?: "react" | "react-jsx" | "react-jsxdev" | "preserve";
+        //     jsxFactory?: string;
+        //     jsxFragmentFactory?: string;
+        //   };
+        //   cacheDir?: string;
+        //   reload?: boolean;
+        // }
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "moduleLoader") {
+            if let Ok(o) = v.downcast::<JsObject, _>(cx) {
+                let mut cfg = ModuleLoaderConfig::default();
+
+                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "denoRemote") {
+                    if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
+                        cfg.deno_remote = rb.value(cx);
+                    }
+                }
+
+                if let Ok(tv) = o.get::<JsValue, _, _>(cx, "transpileTs") {
+                    if let Ok(tb) = tv.downcast::<JsBoolean, _>(cx) {
+                        cfg.transpile_ts = tb.value(cx);
+                    }
+                }
+
+                if let Ok(tcv) = o.get::<JsValue, _, _>(cx, "tsCompiler") {
+                    if let Ok(tco) = tcv.downcast::<JsObject, _>(cx) {
+                        let mut tc = TsCompilerConfig::default();
+
+                        if let Ok(jv) = tco.get::<JsValue, _, _>(cx, "jsx") {
+                            if let Ok(js) = jv.downcast::<JsString, _>(cx) {
+                                let s = js.value(cx);
+                                let t = s.trim();
+                                if matches!(t, "react" | "react-jsx" | "react-jsxdev" | "preserve")
+                                {
+                                    tc.jsx = Some(t.to_string());
+                                }
+                            }
+                        }
+
+                        if let Ok(fv) = tco.get::<JsValue, _, _>(cx, "jsxFactory") {
+                            if let Ok(fs) = fv.downcast::<JsString, _>(cx) {
+                                let s = fs.value(cx);
+                                let t = s.trim();
+                                if !t.is_empty() {
+                                    tc.jsx_factory = Some(t.to_string());
+                                }
+                            }
+                        }
+
+                        if let Ok(ffv) = tco.get::<JsValue, _, _>(cx, "jsxFragmentFactory") {
+                            if let Ok(ffs) = ffv.downcast::<JsString, _>(cx) {
+                                let s = ffs.value(cx);
+                                let t = s.trim();
+                                if !t.is_empty() {
+                                    tc.jsx_fragment_factory = Some(t.to_string());
+                                }
+                            }
+                        }
+
+                        if tc.jsx.is_some()
+                            || tc.jsx_factory.is_some()
+                            || tc.jsx_fragment_factory.is_some()
+                        {
+                            cfg.ts_compiler = Some(tc);
+                        }
+                    }
+                }
+
+                if let Ok(cv) = o.get::<JsValue, _, _>(cx, "cacheDir") {
+                    if let Ok(cs) = cv.downcast::<JsString, _>(cx) {
+                        let s = cs.value(cx);
+                        let t = s.trim();
+                        if !t.is_empty() {
+                            cfg.cache_dir = Some(t.to_string());
+                        }
+                    }
+                }
+
+                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "reload") {
+                    if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
+                        cfg.reload = rb.value(cx);
+                    }
+                }
+
+                out.runtime_options.module_loader = Some(cfg);
             }
         }
 

@@ -9,8 +9,8 @@ use crate::worker::messages::{EvalReply, ExecStats};
 use crate::worker::state::RuntimeLimits;
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -104,7 +104,10 @@ fn execute_script_catching(
 }})()"#
     );
 
-    let out = match worker.js_runtime.execute_script(filename.to_string(), wrapper) {
+    let out = match worker
+        .js_runtime
+        .execute_script(filename.to_string(), wrapper)
+    {
         Ok(v) => v,
         Err(e) => {
             deno_core::scope!(scope, &mut worker.js_runtime);
@@ -143,6 +146,18 @@ fn execute_script_catching(
         .get(scope, v_key.into())
         .unwrap_or_else(|| v8::undefined(scope).into());
     Ok(v8::Global::new(scope, v_val))
+}
+
+fn ensure_runtime_env_bridge(worker: &mut MainWorker) {
+    let _ = worker.js_runtime.execute_script(
+        "<runtime_env_bridge>",
+        r#"(function(){
+  try {
+    const f = globalThis.__denojs_worker_install_runtime_env_bridge;
+    if (typeof f === "function") f();
+  } catch {}
+})()"#,
+    );
 }
 
 pub async fn eval_in_runtime(
@@ -200,6 +215,8 @@ async fn eval_script_or_callable(
     source: &str,
     options: &EvalOptions,
 ) -> Result<JsValueBridge, JsValueBridge> {
+    ensure_runtime_env_bridge(worker);
+
     let filename = if options.filename.is_empty() {
         "<eval>".to_string()
     } else {
@@ -228,7 +245,12 @@ async fn eval_script_or_callable(
     settle_until_non_promise(worker, global).await
 }
 
-async fn eval_module(worker: &mut MainWorker, source: &str) -> Result<JsValueBridge, JsValueBridge> {
+async fn eval_module(
+    worker: &mut MainWorker,
+    source: &str,
+) -> Result<JsValueBridge, JsValueBridge> {
+    ensure_runtime_env_bridge(worker);
+
     let reg = {
         let state = worker.js_runtime.op_state();
         state
@@ -281,9 +303,10 @@ function moduleReturn(v) {{
         user = source
     );
 
-    reg.put_ephemeral(&spec, &wrapped);
+    reg.put_ephemeral(&spec, &wrapped, deno_core::ModuleType::JavaScript);
 
-    let url = deno_core::url::Url::parse(&spec).map_err(|e| mk_err("ModuleError", e.to_string()))?;
+    let url =
+        deno_core::url::Url::parse(&spec).map_err(|e| mk_err("ModuleError", e.to_string()))?;
 
     worker
         .execute_side_module(&url)
@@ -295,7 +318,7 @@ function moduleReturn(v) {{
         .await
         .map_err(|e| JsValueBridge::any_error_to_bridge(e.into()))?;
 
-            let decide_script = format!(
+    let decide_script = format!(
         r#"(async () => {{
   const spec = {spec_json};
   const st = globalThis.__denojs_worker_module_returns && globalThis.__denojs_worker_module_returns[spec];
@@ -387,8 +410,8 @@ async fn settle_until_non_promise(
                         if res.is_promise() {
                             (false, Some(v8::Global::new(scope, res)), None)
                         } else {
-                            let bridged = v8_codec::from_v8(scope, res)
-                                .map_err(|e| mk_err("BridgeError", e));
+                            let bridged =
+                                v8_codec::from_v8(scope, res).map_err(|e| mk_err("BridgeError", e));
                             (false, None, Some(bridged))
                         }
                     }
