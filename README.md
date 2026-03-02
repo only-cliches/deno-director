@@ -50,15 +50,7 @@ const worker = new DenoWorker({
   permissions: { read: false, net: false, env: false },
 });
 
-// Evaluate TypeScript directly in the sandbox!
-const result = await worker.eval(`
-  const x: number = 42;
-  nodeLogger("Calculating universe secrets...");
-  x * 2;
-`);
-
-console.log(result); // 84
-await worker.close();
+// Evaluate directly in the sandbox!
 const result = await worker.eval(`
   const x = 42;
   nodeLogger("Calculating universe secrets...");
