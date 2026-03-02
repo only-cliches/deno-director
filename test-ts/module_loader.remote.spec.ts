@@ -60,7 +60,7 @@ describe("moduleLoader.denoRemote MVP", () => {
     try {
       const src = `
         import { Application } from "${srv.base}/oak/mod.ts";
-        moduleReturn(typeof Application);
+        export const out = typeof Application;
       `;
       await expect(dw.evalModule(src)).rejects.toBeTruthy();
     } finally {
@@ -94,9 +94,9 @@ describe("moduleLoader.denoRemote MVP", () => {
     try {
       const src = `
         import { Application } from "${srv.base}/oak/mod.ts";
-        moduleReturn(Application.kind);
+        export const out = Application.kind;
       `;
-      await expect(dw.evalModule(src)).resolves.toBe("oak");
+      await expect(dw.evalModule(src)).resolves.toMatchObject({ out: "oak" });
     } finally {
       if (!dw.isClosed()) await dw.close();
       await srv.close();
@@ -124,9 +124,9 @@ describe("moduleLoader.denoRemote MVP", () => {
     try {
       const src = `
         import { ok } from "${srv.base}/oak/mod.ts";
-        moduleReturn(ok);
+        export const out = ok;
       `;
-      await expect(dw.evalModule(src)).resolves.toBe("yes");
+      await expect(dw.evalModule(src)).resolves.toMatchObject({ out: "yes" });
     } finally {
       if (!dw.isClosed()) await dw.close();
       await srv.close();
@@ -155,7 +155,7 @@ describe("moduleLoader.denoRemote MVP", () => {
     try {
       const src = `
         import { v } from "${srv.base}/oak/mod.ts";
-        moduleReturn(v);
+        export const out = v;
       `;
       await expect(dw.evalModule(src)).rejects.toBeTruthy();
     } finally {

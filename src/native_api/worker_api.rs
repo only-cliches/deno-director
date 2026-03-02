@@ -12,6 +12,8 @@ use crate::worker;
 use crate::worker::messages::{DenoMsg, EvalReply};
 use crate::worker::state::WorkerHandle;
 use crate::{NEXT_ID, WORKERS, deno_tx_for_worker, mk_err, parse_eval_options};
+use neon::result::Throw;
+use neon::types::JsDate;
 
 fn get_string_prop<'a, C: Context<'a>>(
     cx: &mut C,
@@ -228,6 +230,191 @@ fn strict_channel() -> bool {
         .unwrap_or(false)
 }
 
+fn object_to_string_tag<'a>(
+    cx: &mut FunctionContext<'a>,
+    value: Handle<'a, JsValue>,
+) -> Option<String> {
+    let object_ctor: Handle<JsFunction> = cx.global("Object").ok()?;
+    let proto_any = object_ctor.get_value(cx, "prototype").ok()?;
+    let proto = proto_any.downcast::<JsObject, _>(cx).ok()?;
+    let to_string_any = proto.get_value(cx, "toString").ok()?;
+    let to_string = to_string_any.downcast::<JsFunction, _>(cx).ok()?;
+    let s = to_string
+        .call_with(cx)
+        .this(value)
+        .apply::<JsString, _>(cx)
+        .ok()?;
+    Some(s.value(cx))
+}
+
+fn is_arraybuffer_view<'a>(cx: &mut FunctionContext<'a>, value: Handle<'a, JsValue>) -> bool {
+    cx.try_catch(|cx| {
+        let ab_ctor: Handle<JsFunction> = cx.global("ArrayBuffer")?;
+        let is_view = ab_ctor.get::<JsFunction, _, _>(cx, "isView")?;
+        let out = is_view
+            .call_with(cx)
+            .this(ab_ctor)
+            .arg(value)
+            .apply::<JsBoolean, _>(cx)?
+            .value(cx);
+        Ok(out)
+    })
+    .unwrap_or(false)
+}
+
+fn should_expand_object<'a>(
+    cx: &mut FunctionContext<'a>,
+    value: Handle<'a, JsValue>,
+    obj: Handle<'a, JsObject>,
+) -> bool {
+    if value.is_a::<JsDate, _>(cx)
+        || value.is_a::<JsBuffer, _>(cx)
+        || value.is_a::<JsError, _>(cx)
+        || value.is_a::<JsArray, _>(cx)
+    {
+        return false;
+    }
+
+    if is_arraybuffer_view(cx, value) {
+        return false;
+    }
+
+    if let Some(tag) = object_to_string_tag(cx, value) {
+        match tag.as_str() {
+            "[object Date]"
+            | "[object RegExp]"
+            | "[object Map]"
+            | "[object Set]"
+            | "[object URL]"
+            | "[object URLSearchParams]"
+            | "[object ArrayBuffer]"
+            | "[object SharedArrayBuffer]"
+            | "[object DataView]"
+            | "[object Promise]" => return false,
+            _ => {}
+        }
+    }
+
+    // For plain objects, module namespace objects, and other enumerable property
+    // containers (e.g. Node core module objects), walk keys recursively so nested
+    // functions become host-callable wrappers.
+    !own_enumerable_string_keys(cx, obj).is_empty()
+}
+
+fn is_special_wire_json_object(v: &serde_json::Value) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+
+    if let Some(t) = obj
+        .get("__denojs_worker_type")
+        .and_then(|x| x.as_str())
+        .filter(|x| *x == "error" || *x == "function")
+    {
+        let _ = t;
+        return true;
+    }
+
+    const SPECIAL_KEYS: [&str; 11] = [
+        "__buffer",
+        "__map",
+        "__set",
+        "__url",
+        "__urlSearchParams",
+        "__date",
+        "__bigint",
+        "__regexp",
+        "__num",
+        "__denojs_worker_num",
+        "__undef",
+    ];
+
+    SPECIAL_KEYS.iter().any(|k| obj.contains_key(*k))
+}
+
+fn own_enumerable_string_keys<'a>(
+    cx: &mut FunctionContext<'a>,
+    obj: Handle<'a, JsObject>,
+) -> Vec<String> {
+    cx.try_catch(|cx| {
+        let object_ctor: Handle<JsFunction> = cx.global("Object")?;
+        let keys_fn = object_ctor.get::<JsFunction, _, _>(cx, "keys")?;
+        let keys_arr = keys_fn
+            .call_with(cx)
+            .this(object_ctor)
+            .arg(obj)
+            .apply::<JsArray, _>(cx)?;
+
+        let mut out = Vec::with_capacity(keys_arr.len(cx) as usize);
+        for i in 0..keys_arr.len(cx) {
+            let v = keys_arr.get_value(cx, i)?;
+            if let Ok(s) = v.downcast::<JsString, _>(cx) {
+                out.push(s.value(cx));
+            }
+        }
+        Ok(out)
+    })
+    .unwrap_or_default()
+}
+
+fn encode_set_global_value<'a>(
+    cx: &mut FunctionContext<'a>,
+    worker: &mut WorkerHandle,
+    value: Handle<'a, JsValue>,
+    depth: usize,
+) -> Result<JsValueBridge, Throw> {
+    if depth > 32 {
+        return Ok(JsValueBridge::Undefined);
+    }
+
+    if let Ok(func) = value.downcast::<JsFunction, _>(cx) {
+        let is_async = is_async_like(cx, func);
+        let callback_id = worker.register_global_fn(func.root(cx));
+        return Ok(JsValueBridge::HostFunction {
+            id: callback_id,
+            is_async,
+        });
+    }
+
+    if let Ok(arr) = value.downcast::<JsArray, _>(cx) {
+        let mut out = Vec::with_capacity(arr.len(cx) as usize);
+        for i in 0..arr.len(cx) {
+            let item = arr
+                .get_value(cx, i)
+                .unwrap_or_else(|_| cx.undefined().upcast::<JsValue>());
+            let bridged = encode_set_global_value(cx, worker, item, depth + 1)?;
+            out.push(crate::bridge::wire::to_wire_json(&bridged));
+        }
+        return Ok(JsValueBridge::Json(serde_json::Value::Array(out)));
+    }
+
+    if let Ok(obj) = value.downcast::<JsObject, _>(cx) {
+        let baseline = crate::bridge::neon_codec::from_neon_value(cx, value)?;
+        if let JsValueBridge::Json(j) = &baseline {
+            if is_special_wire_json_object(j) {
+                return Ok(baseline);
+            }
+        }
+
+        if should_expand_object(cx, value, obj) {
+            let keys = own_enumerable_string_keys(cx, obj);
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                let vv = obj
+                    .get_value(cx, key.as_str())
+                    .unwrap_or_else(|_| cx.undefined().upcast::<JsValue>());
+                let bridged = encode_set_global_value(cx, worker, vv, depth + 1)?;
+                out.insert(key, crate::bridge::wire::to_wire_json(&bridged));
+            }
+            return Ok(JsValueBridge::Json(serde_json::Value::Object(out)));
+        }
+
+        return Ok(baseline);
+    }
+
+    crate::bridge::neon_codec::from_neon_value(cx, value)
+}
+
 pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     let mut opts = worker::state::WorkerCreateOptions::from_neon(&mut cx, 0).unwrap_or_default();
 
@@ -383,7 +570,6 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let f = JsFunction::new(&mut cx, move |mut cx| {
             let key = cx.argument::<JsString>(0)?.value(&mut cx);
             let js = cx.argument::<JsValue>(1)?;
-            let bridged = crate::bridge::neon_codec::from_neon_value(&mut cx, js)?;
 
             let (deferred, promise) = cx.promise();
             let settler = PromiseSettler::new(deferred, cx.channel());
@@ -396,17 +582,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                     .get_mut(&id2)
                     .ok_or_else(|| cx.throw_error::<_, ()>("Runtime is closed").unwrap_err())?;
 
-                let value = if let Ok(func) = js.downcast::<JsFunction, _>(&mut cx) {
-                    let is_async = is_async_like(&mut cx, func);
-
-                    let callback_id = worker.register_global_fn(func.root(&mut cx));
-                    JsValueBridge::HostFunction {
-                        id: callback_id,
-                        is_async,
-                    }
-                } else {
-                    bridged
-                };
+                let value = encode_set_global_value(&mut cx, worker, js, 0)?;
 
                 Some((worker.deno_tx.clone(), value))
             };

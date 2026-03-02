@@ -262,48 +262,8 @@ async fn eval_module(
     // Use internal virtual scheme so the loader serves it from memory.
     let spec = reg.next_virtual_specifier("js");
 
-    // Inject moduleReturn into module scope and also register per-module state on globalThis.
-    // If moduleReturn is called, evalModule resolves to that value.
-    // Otherwise, it resolves to a namespace-like object (plain object copy of exports).
     let spec_json = serde_json::to_string(&spec).unwrap_or_else(|_| "\"\"".into());
-
-    let wrapped = format!(
-        r#"
-const __spec = {spec_json};
-const __g = globalThis;
-if (!__g.__denojs_worker_module_returns) {{
-  Object.defineProperty(__g, "__denojs_worker_module_returns", {{
-    value: Object.create(null),
-    writable: true,
-    configurable: true,
-    enumerable: false
-  }});
-}}
-if (!__g.__denojs_worker_module_returns[__spec]) {{
-  let __resolve, __reject;
-  const __p = new Promise((res, rej) => {{ __resolve = res; __reject = rej; }});
-  __g.__denojs_worker_module_returns[__spec] = {{
-    called: false,
-    promise: __p,
-    resolve: __resolve,
-    reject: __reject,
-  }};
-}}
-const __st = __g.__denojs_worker_module_returns[__spec];
-
-function moduleReturn(v) {{
-  if (__st.called) return;
-  __st.called = true;
-  try {{ __st.resolve(v); }} catch (e) {{ try {{ __st.reject(e); }} catch {{}} }}
-}}
-
-{user}
-"#,
-        spec_json = spec_json,
-        user = source
-    );
-
-    reg.put_ephemeral(&spec, &wrapped, deno_core::ModuleType::JavaScript);
+    reg.put_ephemeral(&spec, source, deno_core::ModuleType::JavaScript);
 
     let url =
         deno_core::url::Url::parse(&spec).map_err(|e| mk_err("ModuleError", e.to_string()))?;
@@ -321,10 +281,6 @@ function moduleReturn(v) {{
     let decide_script = format!(
         r#"(async () => {{
   const spec = {spec_json};
-  const st = globalThis.__denojs_worker_module_returns && globalThis.__denojs_worker_module_returns[spec];
-  if (st && st.called) {{
-    return await st.promise;
-  }}
   const m = await import(spec);
   const o = Object.create(null);
   const moduleFnKeys = [];

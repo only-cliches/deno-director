@@ -66,6 +66,13 @@ export type ImportsCallback = (
 	isDynamicImport?: boolean,
 ) => ImportsCallbackResult | Promise<ImportsCallbackResult>;
 
+/**
+ * Permission field value shape.
+ *
+ * - `true`: allow all for that capability.
+ * - `false`: deny all for that capability.
+ * - `string[]`: allow-list for that capability.
+ */
 export type DenoPermissionValue = boolean | string[];
 /**
  * Deno permission model passed to runtime creation.
@@ -104,13 +111,29 @@ export type DenoPermissions = {
 };
 
 export type DenoConsoleMethod = "log" | "info" | "warn" | "error" | "debug" | "trace";
-export type DenoConsoleHandler = false | undefined | ((...args: any[]) => any);
+/**
+ * Console callback type used by {@link DenoWorkerConsoleOption}.
+ *
+ * Async handlers are supported but are invoked in fire-and-forget mode.
+ * Their returned Promise is not awaited by worker `console.*` calls.
+ */
+export type DenoConsoleHandler = false | undefined | ((...args: any[]) => any) | Promise<((...args: any[]) => any)>;
 /**
  * Console routing configuration for the runtime.
  *
- * - `false`: disable console methods
- * - `Console`: pass host console object
- * - partial object: selectively override methods
+ * Supported forms:
+ *
+ * - `undefined`: keep runtime defaults (pass console to stdout/stderr)
+ * - `false`: disable all `console.log/info/warn/error/debug/trace` calls.
+ * - `Console`: pass host console object (`console: console`).
+ * - partial object: selectively override/disable methods.
+ *   - function: route method to host callback
+ *   - `false`: disable that specific method
+ *   - `undefined`/missing: keep runtime default for that method
+ *
+ * Behavior note:
+ * - async callback Promises are not awaited by runtime `console.*` calls.
+ * - prefer sync callbacks for low-latency streaming logs.
  *
  * @example
  * ```ts
@@ -144,10 +167,15 @@ export type DenoWorkerInspectOption =
 	  };
 
 /**
- * env config:
- * - undefined: default Deno behavior
- * - string: dotenv file path to load (throws if missing or unreadable)
- * - Record<string,string>: explicit env map
+ * Runtime environment config.
+ *
+ * - `undefined`: default runtime env behavior.
+ * - `string`: dotenv file path to load (throws if missing/unreadable).
+ * - `Record<string,string>`: explicit env map.
+ *
+ * Notes:
+ * - `env` overrides `envFile` when both are provided.
+ * - runtime code still needs `permissions.env` to read env values via `Deno.env.*`.
  */
 export type DenoWorkerEnvOption = undefined | string | Record<string, string>;
 
@@ -220,16 +248,30 @@ export type DenoWorkerLifecycleHandler = (ctx: DenoWorkerLifecycleContext) => vo
  * ```
  */
 export type DenoWorkerOptions = {
-	/** Per-evaluation timeout in milliseconds. */
+	/**
+	 * Default per-evaluation timeout (milliseconds).
+	 *
+	 * Can be overridden per call with `eval(..., { maxEvalMs })`.
+	 */
 	maxEvalMs?: number;
 	/** Maximum V8 heap size in bytes. */
 	maxMemoryBytes?: number;
 	/** Maximum stack size in bytes. */
 	maxStackSizeBytes?: number;
-	/** Internal command channel capacity. */
+	/**
+	 * Internal command queue capacity.
+	 *
+	 * Smaller values trigger backpressure sooner; larger values buffer more in-flight work.
+	 */
 	channelSize?: number;
 
-	/** Import policy: boolean gate or callback-based policy. */
+	/**
+	 * Import policy.
+	 *
+	 * - `false`: block imports
+	 * - `true`: allow default disk/module resolution
+	 * - callback: decide per import (allow/block/virtual source/rewrite)
+	 */
 	imports?: boolean | ImportsCallback;
 
 	/** Runtime working directory used for relative path resolution. */
@@ -237,7 +279,11 @@ export type DenoWorkerOptions = {
 	/** Startup script evaluated before user code runs. */
 	startup?: string;
 
-	/** Deno permissions configuration for this runtime. */
+	/**
+	 * Runtime permissions configuration.
+	 *
+	 * Use `true` for allow-all, `false` for deny-all, or `string[]` allow-lists.
+	 */
 	permissions?: DenoPermissions;
 
 	/** Enable Node-style disk/module resolution behavior. */
@@ -245,23 +291,49 @@ export type DenoWorkerOptions = {
 	/** Enable broader Node compatibility helpers. */
 	nodeCompat?: boolean;
 
-	/** Console routing behavior for runtime `console.*`. */
+	/**
+	 * Console routing behavior for runtime `console.*`.
+	 *
+	 * See {@link DenoWorkerConsoleOption}.
+	 */
 	console?: DenoWorkerConsoleOption;
 
-	/** Runtime environment variable configuration. */
+	/**
+	 * Runtime environment variable configuration.
+	 *
+	 * See {@link DenoWorkerEnvOption}.
+	 */
 	env?: DenoWorkerEnvOption;
 
 	/**
 	 * Convenience dotenv loader:
-	 * - true: search ".env" upwards from cwd
-	 * - string: load explicit dotenv path
+	 * - `true`: search `.env` upwards from `cwd`
+	 * - `string`: load explicit dotenv path
+	 *
+	 * Ignored when `env` is explicitly provided.
 	 */
 	envFile?: boolean | string;
 
-	/** Inspector enable/configuration options. */
+	/**
+	 * Inspector enable/configuration.
+	 *
+	 * - `true`: enable with defaults (`127.0.0.1:9229`, no break)
+	 * - `false`/`undefined`: disabled
+	 * - object: custom host/port/break settings
+	 */
 	inspect?: DenoWorkerInspectOption;
-	/** Extended module loading behavior (remote loading, TS transpile, caching). */
+	/**
+	 * Extended module loading behavior.
+	 *
+	 * Use for remote imports, TS/TSX/JSX transpilation, and cache tuning.
+	 */
 	moduleLoader?: DenoWorkerModuleLoaderOption;
+	/**
+	 * Globals injected during worker startup (`globalThis[key] = value`).
+	 *
+	 * Supports values, objects, and functions (including nested object functions).
+	 */
+	globals?: Record<string, any>;
 	/** Lifecycle hooks invoked around start/stop/crash transitions. */
 	lifecycle?: DenoWorkerLifecycleHooks;
 };

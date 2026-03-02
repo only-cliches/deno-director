@@ -29,7 +29,7 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
       await expect(dw.evalModule(code)).rejects.toBeTruthy();
@@ -52,7 +52,7 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
       await expect(dw.evalModule(code)).rejects.toBeTruthy();
@@ -75,7 +75,7 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
       await expect(dw.evalModule(code)).rejects.toBeTruthy();
@@ -98,10 +98,10 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe(7);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 7 });
     } finally {
       if (!dw.isClosed()) await dw.close();
       await fs.rm(dir, { recursive: true, force: true });
@@ -121,7 +121,7 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
       await expect(dw.evalModule(code)).rejects.toBeTruthy();
@@ -147,10 +147,10 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./alias";
-        moduleReturn(a);
+        export const out = a;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe(123);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 123 });
     } finally {
       if (!dw.isClosed()) await dw.close();
       await fs.rm(dir, { recursive: true, force: true });
@@ -170,7 +170,7 @@ describe("DenoWorker imports callback edge cases", () => {
 
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
       await expect(dw.evalModule(code)).rejects.toBeTruthy();
@@ -196,15 +196,15 @@ describe("DenoWorker imports callback edge cases", () => {
       await writeFile(path.join(dir, "a.js"), "export default 9;\n");
       const code = `
         import a from "./a.js";
-        moduleReturn(a);
+        export const out = a;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe(9);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 9 });
       const firstCount = count;
       expect(firstCount).toBeGreaterThan(0);
 
       await dw.restart();
-      await expect(dw.evalModule(code)).resolves.toBe(9);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 9 });
       const secondDelta = count - firstCount;
 
       expect(secondDelta).toBe(firstCount);

@@ -559,3 +559,129 @@ pub fn sandboxed_path_list(root: &Path, items: &[String]) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{dir_url_from_path, normalize_cwd, normalize_startup_url, sandboxed_path_list};
+    use std::path::{Path, PathBuf};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    #[test]
+    fn normalize_cwd_handles_file_urls_and_relative_paths() {
+        let fallback = std::env::current_dir().expect("cwd");
+        assert_eq!(normalize_cwd(None), fallback);
+        assert_eq!(normalize_cwd(Some("   ")), fallback);
+
+        let root = unique_temp_dir("normalize-cwd");
+        let as_url = deno_core::url::Url::from_directory_path(&root)
+            .expect("url")
+            .to_string();
+        assert_eq!(normalize_cwd(Some(&as_url)), root);
+
+        let rel = normalize_cwd(Some("subdir"));
+        assert_eq!(rel, fallback.join("subdir"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalize_startup_url_allows_in_sandbox_and_blocks_outside() {
+        let root = unique_temp_dir("startup-root");
+        let inside = root.join("main.js");
+        std::fs::write(&inside, "console.log('ok');").expect("write inside");
+
+        let outside_root = unique_temp_dir("startup-outside");
+        let outside = outside_root.join("outside.js");
+        std::fs::write(&outside, "console.log('outside');").expect("write outside");
+
+        let in_url = normalize_startup_url(&root, Some("main.js"));
+        assert!(in_url.is_some(), "expected startup inside sandbox to be allowed");
+
+        let out_url = normalize_startup_url(&root, outside.to_str());
+        assert!(out_url.is_none(), "expected startup outside sandbox to be blocked");
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside_root);
+    }
+
+    #[test]
+    fn sandboxed_path_list_filters_outside_and_invalid_inputs() {
+        let root = unique_temp_dir("sandbox-list-root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let inside_file = nested.join("a.txt");
+        std::fs::write(&inside_file, "x").expect("write inside file");
+
+        let outside_root = unique_temp_dir("sandbox-list-outside");
+        let outside_file = outside_root.join("b.txt");
+        std::fs::write(&outside_file, "y").expect("write outside file");
+
+        let inside_rel = Path::new("nested").join("a.txt").to_string_lossy().to_string();
+        let outside_abs = outside_file.to_string_lossy().to_string();
+        let items = vec![" ".to_string(), inside_rel, outside_abs];
+
+        let out = sandboxed_path_list(&root, &items);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("a.txt"));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside_root);
+    }
+
+    #[test]
+    fn dir_url_from_path_returns_file_scheme() {
+        let root = unique_temp_dir("dir-url");
+        let url = dir_url_from_path(&root);
+        assert_eq!(url.scheme(), "file");
+        assert!(url.as_str().starts_with("file://"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalize_startup_url_rejects_directory_and_accepts_file_url_inside() {
+        let root = unique_temp_dir("startup-file-url");
+        let file = root.join("entry.ts");
+        std::fs::write(&file, "export {};").expect("write file");
+
+        let dir_attempt = normalize_startup_url(&root, Some("."));
+        assert!(dir_attempt.is_none(), "directory should not be accepted as startup");
+
+        let file_url = deno_core::url::Url::from_file_path(&file)
+            .expect("file url")
+            .to_string();
+        let ok = normalize_startup_url(&root, Some(&file_url));
+        assert!(ok.is_some(), "file:// URL inside sandbox should be accepted");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sandboxed_path_list_accepts_file_url_inside_and_blocks_file_url_outside() {
+        let root = unique_temp_dir("sandbox-file-url-root");
+        let inside = root.join("inside.js");
+        std::fs::write(&inside, "1").expect("write inside");
+
+        let outside_root = unique_temp_dir("sandbox-file-url-outside");
+        let outside = outside_root.join("outside.js");
+        std::fs::write(&outside, "1").expect("write outside");
+
+        let inside_url = deno_core::url::Url::from_file_path(&inside)
+            .expect("inside url")
+            .to_string();
+        let outside_url = deno_core::url::Url::from_file_path(&outside)
+            .expect("outside url")
+            .to_string();
+
+        let out = sandboxed_path_list(&root, &[inside_url, outside_url]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("inside.js"));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside_root);
+    }
+}

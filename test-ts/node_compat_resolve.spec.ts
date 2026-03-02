@@ -49,7 +49,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     try {
       const code = `
         import { y } from "my_pkg";
-        moduleReturn(y);
+        export const out = y;
       `;
       await expect(dw.evalModule(code)).rejects.toBeTruthy();
     } finally {
@@ -67,9 +67,9 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     try {
       const code = `
         import { y } from "my_pkg";
-        moduleReturn(y);
+        export const out = y;
       `;
-      await expect(dw.evalModule(code)).resolves.toBe(456);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 456 });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -85,9 +85,9 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     try {
       const code = `
         import { y } from "my_pkg";
-        moduleReturn(y);
+        export const out = y;
       `;
-      await expect(dw.evalModule(code)).resolves.toBe(456);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 456 });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -103,9 +103,9 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     try {
       const code = `
         import { x } from "./local.js";
-        moduleReturn(x);
+        export const out = x;
       `;
-      await expect(dw.evalModule(code)).resolves.toBe(123);
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 123 });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -124,10 +124,10 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
       const code = `
         import { v } from "./dep";
-        moduleReturn(v);
+        export const out = v;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe("from-js");
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: "from-js" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -160,10 +160,10 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
       const code = `
         import { which } from "pkgm";
-        moduleReturn(which);
+        export const out = which;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe("module");
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: "module" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -190,10 +190,10 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
         const code = `
         import { v } from "pkgx";
-        moduleReturn(v);
+        export const out = v;
       `;
 
-        await expect(dw.evalModule(code)).resolves.toBe("index-mjs");
+        await expect(dw.evalModule(code)).resolves.toMatchObject({ out: "index-mjs" });
       } finally {
         if (!dw.isClosed()) await dw.close();
       }
@@ -219,10 +219,10 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
       const code = `
         import { scoped } from "@scope/pkg";
-        moduleReturn(scoped);
+        export const out = scoped;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe("ok");
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: "ok" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -245,10 +245,10 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
       const code = `
         import sub from "pkgs/sub";
-        moduleReturn(sub);
+        export const out = sub;
       `;
 
-      await expect(dw.evalModule(code)).resolves.toBe("sub-ts");
+      await expect(dw.evalModule(code)).resolves.toMatchObject({ out: "sub-ts" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -268,7 +268,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
         const code = `
         import { v } from "./dir";
-        moduleReturn(v);
+        export const out = v;
       `;
 
         await expect(dw.evalModule(code)).rejects.toBeTruthy();
@@ -300,7 +300,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
 
         const code = `
         import { z } from "pkgdir/dir";
-        moduleReturn(z);
+        export const out = z;
       `;
 
         await expect(dw.evalModule(code)).rejects.toBeTruthy();

@@ -98,7 +98,7 @@ describe("console option", () => {
     }
   });
 
-  test("console: per-method routing supports async handlers (awaited by wrapper)", async () => {
+  test("console: per-method routing supports async handlers (fire-and-forget)", async () => {
     const received: any[][] = [];
 
     const dw = new DenoWorker({

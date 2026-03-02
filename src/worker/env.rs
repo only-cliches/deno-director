@@ -70,3 +70,52 @@ pub fn merge_env_snapshot(
     }
     snapshot
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvAccess, env_access_from_permissions, valid_env_key};
+
+    #[test]
+    fn valid_env_key_enforces_empty_nul_and_length_limits() {
+        assert!(!valid_env_key(""));
+        assert!(!valid_env_key("BAD\0KEY"));
+        assert!(valid_env_key(&"A".repeat(4096)));
+        assert!(!valid_env_key(&"A".repeat(4097)));
+    }
+
+    #[test]
+    fn env_access_allows_helper_matches_mode() {
+        assert!(!EnvAccess::Deny.allows("A"));
+        assert!(EnvAccess::AllowAll.allows("A"));
+
+        let allow_list = env_access_from_permissions(Some(&serde_json::json!({
+            "env": ["A", "B"]
+        })));
+        assert!(allow_list.allows("A"));
+        assert!(!allow_list.allows("C"));
+    }
+
+    #[test]
+    fn env_access_invalid_or_false_config_denies() {
+        let false_cfg = env_access_from_permissions(Some(&serde_json::json!({ "env": false })));
+        assert!(matches!(false_cfg, EnvAccess::Deny));
+
+        let invalid_cfg = env_access_from_permissions(Some(&serde_json::json!({ "env": 123 })));
+        assert!(matches!(invalid_cfg, EnvAccess::Deny));
+    }
+
+    #[test]
+    fn env_access_array_ignores_non_strings_and_deduplicates() {
+        let cfg = env_access_from_permissions(Some(&serde_json::json!({
+            "env": ["A", "A", 1, null, true, "B"]
+        })));
+        match cfg {
+            EnvAccess::AllowKeys(keys) => {
+                assert_eq!(keys.len(), 2);
+                assert!(keys.contains("A"));
+                assert!(keys.contains("B"));
+            }
+            other => panic!("expected allow keys, got {:?}", other),
+        }
+    }
+}

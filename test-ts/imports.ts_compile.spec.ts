@@ -25,11 +25,11 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
       const out = await dw.evalModule(`
         import s from "virtual:static";
         const d = await import("virtual:dynamic");
-        moduleReturn([s, d.default]);
+        export const result = [s, d.default];
       `);
 
-      const first = (out as any)?.[0] ?? (out as any)?.["0"];
-      const second = (out as any)?.[1] ?? (out as any)?.["1"];
+      const first = (out as any)?.result?.[0];
+      const second = (out as any)?.result?.[1];
       expect([first, second]).toEqual([1, 2]);
 
       const staticCall = seen.find((x) => x.specifier === "virtual:static");
@@ -63,9 +63,9 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
       await expect(
         dw.evalModule(`
           import v from "virtual:typed-ts";
-          moduleReturn(v);
+          export const out = v;
         `),
-      ).resolves.toBe(42);
+      ).resolves.toMatchObject({ out: 42 });
     } finally {
       await dw.close();
     }
@@ -90,7 +90,7 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
       await expect(
         dw.evalModule(`
           import v from "virtual:typed-ts-disabled";
-          moduleReturn(v);
+          export const out = v;
         `),
       ).rejects.toThrow(/moduleLoader:\s*\{\s*transpileTs:\s*true\s*\}/i);
     } finally {
@@ -136,9 +136,9 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
       await expect(
         dw.evalModule(`
           import v from "virtual:typed-tsx";
-          moduleReturn(v);
+          export const out = v;
         `),
-      ).resolves.toBe("div:ok");
+      ).resolves.toMatchObject({ out: "div:ok" });
     } finally {
       await dw.close();
     }
@@ -174,9 +174,9 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
       await expect(
         dw.evalModule(`
           import v from "virtual:typed-jsx";
-          moduleReturn(v);
+          export const out = v;
         `),
-      ).resolves.toBe("div:ok-jsx");
+      ).resolves.toMatchObject({ out: "div:ok-jsx" });
     } finally {
       await dw.close();
     }

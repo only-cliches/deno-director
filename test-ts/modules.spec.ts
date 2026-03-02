@@ -19,23 +19,23 @@ describe("deno_worker: modules", () => {
     if (dw && !dw.isClosed()) await dw.close();
   });
 
-  it("evaluates ES modules and returns via moduleReturn", async () => {
+  it("evaluates ES modules and returns namespace exports", async () => {
     dw = new DenoWorker();
     const code = `
       export const x = 10;
       export const y = 10;
-      moduleReturn(x + y);
+      export const out = x + y;
     `;
-    await expect(dw.evalModule(code)).resolves.toBe(20);
+    await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 20 });
   });
 
-  it("supports top-level await in modules (when returning via moduleReturn)", async () => {
+  it("supports top-level await in modules", async () => {
     dw = new DenoWorker();
     const code = `
       const v = await Promise.resolve(42);
-      moduleReturn(v);
+      export const out = v;
     `;
-    await expect(dw.evalModule(code)).resolves.toBe(42);
+    await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 42 });
   });
 
   it(
@@ -52,10 +52,10 @@ describe("deno_worker: modules", () => {
 
         const code = `
           import { x, add } from "./dep.js";
-          moduleReturn(add(x, 1));
+          export const out = add(x, 1);
         `;
 
-        await expect(dw.evalModule(code)).resolves.toBe(4);
+        await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 4 });
       });
     },
     20_000
@@ -69,7 +69,7 @@ describe("deno_worker: modules", () => {
 
         const code = `
           import "./does_not_exist.js";
-          moduleReturn(1);
+          export const out = 1;
         `;
 
         await expect(dw.evalModule(code)).rejects.toBeDefined();

@@ -7,8 +7,14 @@ import type { DenoWorkerTemplateCreateOptions, DenoWorkerTemplateOptions } from 
 /**
  * Reusable runtime template.
  *
- * A template captures common worker options, globals, bootstrap scripts/modules,
- * and setup hooks, then applies them each time you call {@link create}.
+ * A template captures shared runtime defaults and applies them per instance.
+ *
+ * Application order in {@link create}:
+ * 1. create worker from merged `workerOptions`
+ * 2. apply merged `globals`
+ * 3. run merged `bootstrapScripts`
+ * 4. run merged `bootstrapModules`
+ * 5. run `setup` hooks (template first, then per-create override)
  */
 export class DenoWorkerTemplate {
 	private readonly options: DenoWorkerTemplateOptions;
@@ -30,7 +36,13 @@ export class DenoWorkerTemplate {
 	/**
 	 * Create a new runtime instance from this template.
 	 *
-	 * `createOptions` are merged on top of template defaults.
+	 * Merge semantics:
+	 * - `workerOptions`: `createOptions.workerOptions` override template values.
+	 * - `globals`: shallow merge with per-create values overriding by key.
+	 * - `bootstrapScripts`/`bootstrapModules`: concatenated template-first then per-create.
+	 *
+	 * Failure behavior:
+	 * - if any setup step fails, the worker is closed before error is re-thrown.
 	 *
 	 * @example
 	 * ```ts

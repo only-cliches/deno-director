@@ -441,7 +441,7 @@ function buildWorkerBenchModuleSource(): string {
       }
     });
 
-    moduleReturn(true);
+    export const __benchReady = true;
   `;
 }
 
@@ -456,10 +456,10 @@ async function benchWorkerToNodePostMessage(
   for (let i = 0; i < warmup; i++) {
     // eslint-disable-next-line no-await-in-loop
     await dw.evalModule(
-      `moduleReturn(await globalThis.__bench.workerToNodePostMessage(${Math.max(
+      `await globalThis.__bench.workerToNodePostMessage(${Math.max(
         1024,
         Math.min(16_384, size)
-      )}, 5, 0));`
+      )}, 5, 0);`
     );
     // eslint-disable-next-line no-await-in-loop
     await bus.waitFor(
@@ -474,9 +474,7 @@ async function benchWorkerToNodePostMessage(
   const start = nowNs();
 
  
-  void dw.evalModule(
-    `moduleReturn(await globalThis.__bench.workerToNodePostMessage(${size}, ${messages}, ${durationMs}));`
-  );
+  void dw.evalModule(`await globalThis.__bench.workerToNodePostMessage(${size}, ${messages}, ${durationMs});`);
 
  
   const done = await bus.waitFor(
@@ -515,10 +513,10 @@ async function benchHostCallSync(dw: DenoWorker, bus: MessageBus, args: Args): P
   for (let i = 0; i < warmup; i++) {
     // eslint-disable-next-line no-await-in-loop
     await dw.evalModule(
-      `moduleReturn(await globalThis.__bench.hostCallSyncSink(${Math.max(
+      `await globalThis.__bench.hostCallSyncSink(${Math.max(
         1024,
         Math.min(16_384, size)
-      )}, 50, 0));`
+      )}, 50, 0);`
     );
     // eslint-disable-next-line no-await-in-loop
     await bus.waitFor(
@@ -531,7 +529,7 @@ async function benchHostCallSync(dw: DenoWorker, bus: MessageBus, args: Args): P
  
   const start = nowNs();
 
-  void dw.evalModule(`moduleReturn(await globalThis.__bench.hostCallSyncSink(${size}, 0, ${durationMs}));`);
+  void dw.evalModule(`await globalThis.__bench.hostCallSyncSink(${size}, 0, ${durationMs});`);
 
  
   const done = await bus.waitFor(
@@ -570,10 +568,10 @@ async function benchHostCallAsync(dw: DenoWorker, bus: MessageBus, args: Args): 
   for (let i = 0; i < warmup; i++) {
     // eslint-disable-next-line no-await-in-loop
     await dw.evalModule(
-      `moduleReturn(await globalThis.__bench.hostCallAsyncSink(${Math.max(
+      `await globalThis.__bench.hostCallAsyncSink(${Math.max(
         1024,
         Math.min(16_384, size)
-      )}, 20, 0));`
+      )}, 20, 0);`
     );
     // eslint-disable-next-line no-await-in-loop
     await bus.waitFor(
@@ -586,7 +584,7 @@ async function benchHostCallAsync(dw: DenoWorker, bus: MessageBus, args: Args): 
  
   const start = nowNs();
 
-  void dw.evalModule(`moduleReturn(await globalThis.__bench.hostCallAsyncSink(${size}, 0, ${durationMs}));`);
+  void dw.evalModule(`await globalThis.__bench.hostCallAsyncSink(${size}, 0, ${durationMs});`);
 
  
   const done = await bus.waitFor(
@@ -686,7 +684,7 @@ async function benchEvalReturnBytes(
 
   for (let i = 0; i < warmup; i++) {
     // eslint-disable-next-line no-await-in-loop
-    await dw.evalModule(`moduleReturn(await globalThis.__bench.${fnName}(${size}));`);
+    await dw.evalModule(`export const out = await globalThis.__bench.${fnName}(${size});`);
   }
 
   const start = nowNs();
@@ -694,7 +692,8 @@ async function benchEvalReturnBytes(
 
   for (let i = 0; i < evalIter; i++) {
     // eslint-disable-next-line no-await-in-loop
-    const v = await dw.evalModule(`moduleReturn(await globalThis.__bench.${fnName}(${size}));`);
+    const mod = await dw.evalModule(`export const out = await globalThis.__bench.${fnName}(${size});`);
+    const v = (mod as any).out;
     if (jsonMode) {
       if (Array.isArray(v)) totalBytes += v.length;
     } else {

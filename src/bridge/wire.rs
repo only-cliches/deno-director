@@ -291,6 +291,10 @@ pub fn from_wire_json(v: serde_json::Value) -> JsValueBridge {
 #[cfg(test)]
 mod tests {
     use super::{from_wire_json, to_wire_json};
+    use crate::bridge::tags::{
+        BUFFER_KEY, MAP_KEY, NUMBER_KEY, REGEXP_KEY, SET_KEY, TYPE_ERROR, TYPE_FUNCTION,
+        TYPE_KEY, V8_KEY,
+    };
     use crate::bridge::types::JsValueBridge;
 
     fn assert_number_eq(actual: f64, expected: f64) {
@@ -487,5 +491,160 @@ mod tests {
         });
         let out = from_wire_json(j.clone());
         assert_bridge_eq(out, JsValueBridge::Json(j));
+    }
+
+    #[test]
+    fn invalid_number_tag_decodes_to_undefined() {
+        let out = from_wire_json(serde_json::json!({ NUMBER_KEY: "not-supported" }));
+        assert_bridge_eq(out, JsValueBridge::Undefined);
+    }
+
+    #[test]
+    fn malformed_buffer_falls_back_to_json() {
+        let raw = serde_json::json!({
+            BUFFER_KEY: {
+                "kind": "Uint8Array",
+                "bytes": [1, "bad", 3],
+                "byteOffset": 0,
+                "length": 3
+            }
+        });
+        let out = from_wire_json(raw.clone());
+        assert_bridge_eq(out, JsValueBridge::Json(raw));
+    }
+
+    #[test]
+    fn malformed_host_function_falls_back_to_json() {
+        let raw = serde_json::json!({
+            TYPE_KEY: TYPE_FUNCTION,
+            "async": true
+        });
+        let out = from_wire_json(raw.clone());
+        assert_bridge_eq(out, JsValueBridge::Json(raw));
+    }
+
+    #[test]
+    fn map_decoder_ignores_non_pair_entries() {
+        let raw = serde_json::json!({
+            MAP_KEY: [
+                ["k1", 1],
+                ["missing_value_only"],
+                "not-an-array",
+                [true, false, "extra"]
+            ]
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Map(vec![(
+                JsValueBridge::String("k1".into()),
+                JsValueBridge::Number(1.0),
+            )]),
+        );
+    }
+
+    #[test]
+    fn set_decoder_preserves_item_order_and_types() {
+        let raw = serde_json::json!({
+            SET_KEY: [null, true, "x", { NUMBER_KEY: "Infinity" }]
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Set(vec![
+                JsValueBridge::Null,
+                JsValueBridge::Bool(true),
+                JsValueBridge::String("x".into()),
+                JsValueBridge::Number(f64::INFINITY),
+            ]),
+        );
+    }
+
+    #[test]
+    fn error_decoder_applies_defaults_when_optional_fields_missing() {
+        let raw = serde_json::json!({
+            TYPE_KEY: TYPE_ERROR
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Error {
+                name: "Error".into(),
+                message: "".into(),
+                stack: None,
+                code: None,
+                cause: None,
+            },
+        );
+    }
+
+    #[test]
+    fn malformed_v8_payload_falls_back_to_json() {
+        let raw = serde_json::json!({
+            V8_KEY: [1, 2, "bad", 4]
+        });
+        let out = from_wire_json(raw.clone());
+        assert_bridge_eq(out, JsValueBridge::Json(raw));
+    }
+
+    #[test]
+    fn host_function_defaults_async_to_false_when_omitted() {
+        let raw = serde_json::json!({
+            TYPE_KEY: TYPE_FUNCTION,
+            "id": 7
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::HostFunction {
+                id: 7,
+                is_async: false,
+            },
+        );
+    }
+
+    #[test]
+    fn error_decoder_treats_null_cause_as_none() {
+        let raw = serde_json::json!({
+            TYPE_KEY: TYPE_ERROR,
+            "name": "TypeError",
+            "message": "boom",
+            "cause": null
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Error {
+                name: "TypeError".into(),
+                message: "boom".into(),
+                stack: None,
+                code: None,
+                cause: None,
+            },
+        );
+    }
+
+    #[test]
+    fn regexp_decoder_defaults_missing_source_and_flags() {
+        let raw = serde_json::json!({
+            REGEXP_KEY: {}
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::RegExp {
+                source: "".into(),
+                flags: "".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn v8_decoder_masks_values_to_u8() {
+        let raw = serde_json::json!({
+            V8_KEY: [0, 255, 256, 511]
+        });
+        let out = from_wire_json(raw);
+        assert_bridge_eq(out, JsValueBridge::V8Serialized(vec![0, 255, 0, 255]));
     }
 }

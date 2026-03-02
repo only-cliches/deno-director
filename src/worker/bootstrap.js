@@ -354,20 +354,17 @@ function isHostFnWrapper(fn) {
 
 function callHostFromConsole(fn, args) {
   const id = fn.__denojs_worker_host_id;
-  const isAsync = !!fn.__denojs_worker_host_async;
   const payloadArgs = dehydrateConsoleArgs(args);
 
-  if (isAsync) return hostCallAsync(id, payloadArgs);
-
-  // Sync wrapper: keep the same Promise fallback behavior as __hydrate\u2019s sync wrapper
   try {
     return hostCallSync(id, payloadArgs);
   } catch (e) {
-    // If sync op indicates Promise, use async
+    // Keep console routing low-latency by preferring sync dispatch.
+    // If the callback returns a Promise, treat it as fire-and-forget.
     try {
       const msg = e && typeof e.message === "string" ? e.message : String(e);
       if (msg.includes("Sync host function returned a Promise")) {
-        return hostCallAsync(id, payloadArgs);
+        return undefined;
       }
     } catch {
       // ignore

@@ -410,7 +410,10 @@ pub fn spawn_worker_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_perm_field, cfg_items, env_access_from_permissions, merge_env_snapshot};
+    use super::{
+        apply_perm_field, cfg_items, env_access_from_permissions, inspector_addr,
+        merge_env_snapshot,
+    };
     use crate::worker::env::EnvAccess;
     use crate::worker::state::{EnvConfig, RuntimeLimits};
     use std::collections::{HashMap, HashSet};
@@ -528,5 +531,27 @@ mod tests {
 
         assert_eq!(env_dst, Some(vec!["keep".to_string()]));
         assert_eq!(run_dst, Some(vec!["keep2".to_string()]));
+    }
+
+    #[test]
+    fn inspector_addr_accepts_ip_and_normalizes_localhost() {
+        let ipv4 = inspector_addr("127.0.0.1", 9229);
+        assert_eq!(ipv4.ip().to_string(), "127.0.0.1");
+        assert_eq!(ipv4.port(), 9229);
+
+        let ipv6 = inspector_addr("::1", 9333);
+        assert_eq!(ipv6.ip().to_string(), "::1");
+        assert_eq!(ipv6.port(), 9333);
+
+        let localhost = inspector_addr(" localhost ", 9444);
+        assert_eq!(localhost.ip().to_string(), "127.0.0.1");
+        assert_eq!(localhost.port(), 9444);
+    }
+
+    #[test]
+    fn inspector_addr_falls_back_to_loopback_for_invalid_host() {
+        let out = inspector_addr("not-a-valid-hostname", 9222);
+        assert_eq!(out.ip().to_string(), "127.0.0.1");
+        assert_eq!(out.port(), 9222);
     }
 }

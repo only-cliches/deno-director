@@ -39,7 +39,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "file:///does_not_matter.js";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -54,7 +54,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("file:///does_not_matter.js");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -78,7 +78,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from ${JSON.stringify(toFileUrl(modPath))};
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe(42);
@@ -102,7 +102,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import(${JSON.stringify(toFileUrl(modPath))});
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe(99);
@@ -124,7 +124,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:sync-static";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("OK_SYNC_STATIC");
@@ -146,7 +146,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("virtual:sync-dynamic");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("OK_SYNC_DYNAMIC");
@@ -168,7 +168,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:async-static";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("OK_ASYNC_STATIC");
@@ -190,7 +190,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("virtual:async-dynamic");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("OK_ASYNC_DYNAMIC");
@@ -210,7 +210,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:block";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -230,7 +230,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("virtual:block-async");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -251,7 +251,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from ${JSON.stringify(toFileUrl(modPath))};
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("DISK_OK_STATIC");
@@ -272,7 +272,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import(${JSON.stringify(toFileUrl(modPath))});
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("DISK_OK_DYNAMIC");
@@ -295,7 +295,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:referrer";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe(1);
@@ -318,7 +318,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "./dep.js";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("FROM_CWD");
@@ -338,7 +338,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("./dep.js");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("FROM_CWD_DYNAMIC");
@@ -356,7 +356,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "./dep.js";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("FROM_CWD_OPT");
@@ -374,7 +374,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("./dep.js");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("FROM_CWD_OPT_DYNAMIC");
@@ -394,7 +394,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "./dep.js";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("FROM_FILE_URL");
@@ -418,7 +418,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:promise-static";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("OK_PROMISE_STATIC");
@@ -438,7 +438,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("virtual:promise-dynamic");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("OK_PROMISE_DYNAMIC");
@@ -458,7 +458,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:reject";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -478,7 +478,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:throw";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -502,7 +502,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:resolve-static";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("RESOLVED_STATIC");
@@ -526,7 +526,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       const m = await import("virtual:resolve-dynamic");
-  //       moduleReturn(m.default);
+  //       export const out = m.default;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("RESOLVED_DYNAMIC");
@@ -546,7 +546,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:resolve-empty";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();
@@ -577,7 +577,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import r from "virtual:root";
-  //       moduleReturn(r);
+  //       export const out = r;
   //     `;
 
   //     await expect(dw.evalModule(src)).resolves.toBe("ROOT:DEP");
@@ -597,7 +597,7 @@ describe("deno_worker: imports/module loader combinations", () => {
 
   //     const src = `
   //       import x from "virtual:weird";
-  //       moduleReturn(x);
+  //       export const out = x;
   //     `;
 
   //     await expect(dw.evalModule(src)).rejects.toBeTruthy();

@@ -137,6 +137,7 @@ function normalizeModuleLoaderOption(x: unknown): unknown {
 export function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerWorkerOptions {
 	const o: any = { ...(options ?? {}) };
 	delete o.lifecycle;
+	delete o.globals;
 
 	if (typeof o.nodeResolve !== "boolean") delete o.nodeResolve;
 	if (typeof o.nodeCompat !== "boolean") delete o.nodeCompat;

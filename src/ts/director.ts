@@ -46,6 +46,11 @@ function getRuntimeMeta(runtime: DenoDirectedRuntime): DenoRuntimeMeta {
  * Each started runtime is tracked with metadata (`runtime.meta`) and can be
  * queried by id, label, or tag.
  *
+ * Director responsibilities:
+ * - assign and enforce unique runtime ids
+ * - maintain label/tag indexes
+ * - keep indexes in sync across `close`, `restart`, and explicit stop APIs
+ *
  * @example
  * ```ts
  * const dd = new DenoDirector({
@@ -117,6 +122,10 @@ export class DenoDirector {
 	 * Start a managed runtime.
 	 *
 	 * The returned runtime includes immutable `runtime.meta` for orchestration.
+	 *
+	 * ID behavior:
+	 * - `options.id` provided: must be unique
+	 * - no `options.id`: auto-generated id is assigned
 	 */
 	async start(options?: DenoDirectorStartOptions): Promise<DenoDirectedRuntime> {
 		const id = normalizeLabel(options?.id) ?? randomId();
@@ -173,6 +182,8 @@ export class DenoDirector {
 
 	/**
 	 * Lookup runtime by id.
+	 *
+	 * Returns `undefined` when id is unknown or runtime has been unregistered.
 	 */
 	get(id: string): DenoDirectedRuntime | undefined {
 		return this.byId.get(id)?.runtime;
@@ -180,6 +191,8 @@ export class DenoDirector {
 
 	/**
 	 * Lookup runtimes by label.
+	 *
+	 * Returns an empty array when label is blank/unknown.
 	 */
 	getByLabel(label: string): DenoDirectedRuntime[] {
 		const v = normalizeLabel(label);
@@ -196,6 +209,8 @@ export class DenoDirector {
 
 	/**
 	 * List runtimes, optionally filtered by label and/or tag.
+	 *
+	 * Filters are AND-combined when both are provided.
 	 */
 	list(filter?: DenoDirectorListOptions): DenoDirectedRuntime[] {
 		let runtimes = [...this.byId.values()].map((r) => r.runtime);
@@ -212,6 +227,8 @@ export class DenoDirector {
 
 	/**
 	 * Update runtime label.
+	 *
+	 * Returns `false` when runtime is unknown.
 	 */
 	setLabel(runtimeOrId: DenoDirectedRuntime | string, label?: string): boolean {
 		const runtime = this.coerceRuntime(runtimeOrId);
@@ -227,6 +244,8 @@ export class DenoDirector {
 
 	/**
 	 * Replace all runtime tags.
+	 *
+	 * Returns `false` when runtime is unknown.
 	 */
 	setTags(runtimeOrId: DenoDirectedRuntime | string, tags: string[]): boolean {
 		const runtime = this.coerceRuntime(runtimeOrId);
@@ -238,6 +257,8 @@ export class DenoDirector {
 
 	/**
 	 * Add a tag if not present.
+	 *
+	 * Returns `false` when runtime is unknown.
 	 */
 	addTag(runtimeOrId: DenoDirectedRuntime | string, tag: string): boolean {
 		const runtime = this.coerceRuntime(runtimeOrId);
@@ -251,6 +272,8 @@ export class DenoDirector {
 
 	/**
 	 * Remove a tag if present.
+	 *
+	 * Returns `false` when runtime is unknown.
 	 */
 	removeTag(runtimeOrId: DenoDirectedRuntime | string, tag: string): boolean {
 		const runtime = this.coerceRuntime(runtimeOrId);
@@ -264,6 +287,8 @@ export class DenoDirector {
 
 	/**
 	 * Stop one runtime by id or instance.
+	 *
+	 * Returns `false` when runtime is unknown.
 	 */
 	async stop(runtimeOrId: DenoDirectedRuntime | string): Promise<boolean> {
 		const runtime = this.coerceRuntime(runtimeOrId);
@@ -278,6 +303,8 @@ export class DenoDirector {
 
 	/**
 	 * Stop all runtimes matching a label.
+	 *
+	 * Returns number of runtimes that were stopped.
 	 */
 	async stopByLabel(label: string): Promise<number> {
 		const runtimes = this.getByLabel(label);
@@ -290,6 +317,8 @@ export class DenoDirector {
 
 	/**
 	 * Stop all managed runtimes.
+	 *
+	 * Returns number of runtimes that were stopped.
 	 */
 	async stopAll(): Promise<number> {
 		const runtimes = this.list();

@@ -33,6 +33,81 @@ export class DenoWorker {
 	private readonly lifecycleHandlers = new Set<DenoWorkerLifecycleHandler>();
 	private readonly inFlightRejectors = new Set<(reason: unknown) => void>();
 	private nativeEpoch = 0;
+	private startupPromise: Promise<void> = Promise.resolve();
+	private startupReady = true;
+	private startupError: unknown = null;
+
+	private serializeGlobalValue(value: any, seen?: WeakSet<object>): any {
+		if (value === undefined) return null;
+		if (value === null) return null;
+
+		const t = typeof value;
+		if (t === "function") return value;
+		if (t !== "object") return value;
+
+		const ws = seen ?? new WeakSet<object>();
+		if (ws.has(value)) return null;
+		ws.add(value);
+
+		const isSpecial =
+			value instanceof Date ||
+			value instanceof RegExp ||
+			(typeof URL !== "undefined" && value instanceof URL) ||
+			(typeof URLSearchParams !== "undefined" && value instanceof URLSearchParams) ||
+			(typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) ||
+			(typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) ||
+			(typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value)) ||
+			value instanceof Map ||
+			value instanceof Set ||
+			value instanceof Error ||
+			(typeof Buffer !== "undefined" && Buffer.isBuffer(value));
+
+		if (isSpecial) return dehydrateForWire(value);
+
+		if (Array.isArray(value)) return value.map((x) => this.serializeGlobalValue(x, ws));
+
+		const out: Record<string, any> = {};
+		for (const [k, v] of Object.entries(value)) {
+			out[k] = this.serializeGlobalValue(v, ws);
+		}
+		return out;
+	}
+
+	private async setGlobalInternal(key: string, value: any): Promise<void> {
+		try {
+			const payload = this.serializeGlobalValue(value);
+			await this.trackInFlight(this.native.setGlobal(key, payload));
+		} catch (e) {
+			throw hydrateFromWire(e);
+		}
+	}
+
+	private initializeStartup(globals?: Record<string, any>): void {
+		const entries = globals && typeof globals === "object" ? Object.entries(globals) : [];
+		if (entries.length === 0) {
+			this.startupReady = true;
+			this.startupError = null;
+			this.startupPromise = Promise.resolve();
+			return;
+		}
+
+		this.startupReady = false;
+		this.startupError = null;
+		this.startupPromise = (async () => {
+			for (const [k, v] of entries) {
+				await this.setGlobalInternal(k, v);
+			}
+		})()
+			.then(() => {
+				this.startupReady = true;
+				this.startupError = null;
+			})
+			.catch((e) => {
+				this.startupReady = true;
+				this.startupError = e;
+				throw e;
+			});
+	}
 
 	private invokeHook(phase: DenoWorkerLifecyclePhase, extra?: Partial<DenoWorkerLifecycleContext>): void {
 		const ctx: DenoWorkerLifecycleContext = {
@@ -168,6 +243,12 @@ export class DenoWorker {
 		}
 	}
 
+	/**
+	 * Create a runtime-backed worker.
+	 *
+	 * Constructor `options.globals` are applied asynchronously right after startup.
+	 * Async APIs wait for that startup phase; `evalSync` throws until startup globals finish.
+	 */
 	constructor(options?: DenoWorkerOptions) {
 		this.lifecycleHooks = options?.lifecycle;
 		this.creationOptions = options;
@@ -175,11 +256,17 @@ export class DenoWorker {
 		this.native = this.createNative(false);
 		this.nativeEpoch += 1;
 		this.bindNativeEvents(this.native, this.nativeEpoch);
+		this.initializeStartup(options?.globals);
 		this.invokeHook("afterStart");
 	}
 
 	/**
 	 * Subscribe to runtime events.
+	 *
+	 * Event semantics:
+	 * - `message`: receives payloads posted from runtime `postMessage(...)`.
+	 * - `close`: emitted once runtime closes.
+	 * - `lifecycle`: emits lifecycle transitions and crash/requested flags.
 	 *
 	 * @example
 	 * ```ts
@@ -207,7 +294,7 @@ export class DenoWorker {
 	/**
 	 * Unsubscribe runtime event listeners.
 	 *
-	 * If `cb` is omitted, all listeners for that event are removed.
+	 * If `cb` is omitted, all listeners for `event` are removed.
 	 *
 	 * @example
 	 * ```ts
@@ -237,6 +324,7 @@ export class DenoWorker {
 
 	/**
 	 * Post a message into the runtime event channel.
+	 *
 	 * Throws when queue is full or runtime is closed.
 	 */
 	postMessage(msg: any): void {
@@ -252,6 +340,7 @@ export class DenoWorker {
 
 	/**
 	 * Best-effort message enqueue variant of {@link postMessage}.
+	 *
 	 * Returns `false` instead of throwing when enqueue fails.
 	 */
 	tryPostMessage(msg: any): boolean {
@@ -260,7 +349,7 @@ export class DenoWorker {
 	}
 
 	/**
-	 * Returns true when runtime is closed or closing.
+	 * Returns `true` when runtime is closed or closing.
 	 */
 	isClosed(): boolean {
 		if (this.closed) return true;
@@ -274,6 +363,8 @@ export class DenoWorker {
 
 	/**
 	 * Last known execution stats from the native runtime.
+	 *
+	 * Values are updated after successful/failed eval operations.
 	 */
 	get lastExecutionStats(): ExecStats {
 		const v: any = (this.native as any).lastExecutionStats;
@@ -290,6 +381,10 @@ export class DenoWorker {
 
 	/**
 	 * Gracefully close runtime.
+	 *
+	 * - default close waits for close command to be processed.
+	 * - `force: true` rejects in-flight wrapper promises immediately and
+	 *   performs best-effort background native close.
 	 */
 	async close(options?: DenoWorkerCloseOptions): Promise<void> {
 		const force = options?.force === true;
@@ -324,10 +419,16 @@ export class DenoWorker {
 				this.closed = true;
 				this.invokeHook("afterStop", { requested: true });
 			})
-			.catch((e: any) => {
+			.catch(async (e: any) => {
 				this.closePromise = null;
-				this.invokeHook("onCrash", { reason: e, requested: true });
-				throw hydrateFromWire(e);
+				const err = hydrateFromWire(e);
+				const msg = String((err as any)?.message ?? err ?? "");
+				if (/queue is full|request queue is full/i.test(msg)) {
+					await this.close({ force: true });
+					return;
+				}
+				this.invokeHook("onCrash", { reason: err, requested: true });
+				throw err;
 			});
 
 		await this.closePromise;
@@ -337,6 +438,7 @@ export class DenoWorker {
 	 * Restart runtime in-place using the original creation options.
 	 *
 	 * Existing event listeners remain attached to this wrapper.
+	 * Constructor globals are re-applied after restart.
 	 */
 	async restart(options?: DenoWorkerRestartOptions): Promise<void> {
 		if (!this.isClosed()) {
@@ -351,19 +453,29 @@ export class DenoWorker {
 		this.native = this.createNative(true);
 		this.nativeEpoch += 1;
 		this.bindNativeEvents(this.native, this.nativeEpoch);
+		this.initializeStartup(this.creationOptions?.globals);
+		await this.startupPromise;
 		this.invokeHook("afterStart");
 	}
 
 	/**
 	 * Query V8 heap memory stats for the runtime.
+	 *
+	 * Waits for constructor globals startup to finish before querying memory.
 	 */
 	async memory(): Promise<DenoWorkerMemory> {
+		await this.startupPromise;
 		const raw = await this.trackInFlight(this.native.memory());
 		return coerceMemoryPayload(raw);
 	}
 
 	/**
 	 * Set a global value inside the runtime (`globalThis[key] = value`).
+	 *
+	 * Serialization behavior:
+	 * - functions are bridged as host-callable functions
+	 * - special runtime values (Date/Map/Set/TypedArrays/URL/Error/etc) preserve type via wire tags
+	 * - nested object functions are preserved (e.g. `fs.readFileSync`)
 	 *
 	 * @example
 	 * ```ts
@@ -372,18 +484,17 @@ export class DenoWorker {
 	 * ```
 	 */
 	async setGlobal(key: string, value: any): Promise<void> {
-		try {
-			const payload = value === undefined ? null : typeof value === "function" ? value : dehydrateForWire(value);
-			await this.trackInFlight(this.native.setGlobal(key, payload));
-		} catch (e) {
-			throw hydrateFromWire(e);
-		}
+		await this.startupPromise;
+		await this.setGlobalInternal(key, value);
 	}
 
 	/**
 	 * Evaluate script source in the runtime.
+	 *
+	 * If evaluated source resolves to a Promise, this method waits until fulfillment/rejection.
 	 */
 	async eval(src: string, options?: EvalOptions): Promise<any> {
+		await this.startupPromise;
 		try {
 			const raw = await this.trackInFlight(this.native.eval(src, normalizeEvalOptions(options)));
 			return hydrateFromWire(raw);
@@ -394,8 +505,18 @@ export class DenoWorker {
 
 	/**
 	 * Synchronous script evaluation in the runtime.
+	 *
+	 * Throws while constructor globals are still initializing.
 	 */
 	evalSync(src: string, options?: EvalOptions): any {
+		if (!this.startupReady) {
+			throw new Error(
+				"DenoWorker.evalSync cannot run while constructor globals are still initializing; use eval(...) or await startup completion",
+			);
+		}
+		if (this.startupError) {
+			throw this.startupError;
+		}
 		try {
 			const raw = this.native.evalSync(src, normalizeEvalOptions(options));
 			return hydrateFromWire(raw);
@@ -407,6 +528,9 @@ export class DenoWorker {
 	/**
 	 * Evaluate ES module source and return a callable namespace proxy.
 	 *
+	 * Function exports are wrapped as Node-callable host functions.
+	 * Non-function exports are hydrated to equivalent host-side values.
+	 *
 	 * @example
 	 * ```ts
 	 * const mod = await dw.evalModule(`export const x = 1; export function add(a,b){return a+b}`);
@@ -417,6 +541,7 @@ export class DenoWorker {
 		source: string,
 		options?: Omit<EvalOptions, "type">,
 	): Promise<T> {
+		await this.startupPromise;
 		let raw: any;
 		try {
 			if (typeof this.native.evalModule === "function") {

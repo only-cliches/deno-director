@@ -1,5 +1,9 @@
 // test-ts/globals.spec.ts
 import { DenoWorker } from "../src/index";
+import * as nodeFs from "node:fs";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -85,5 +89,42 @@ describe("deno_worker: globals", () => {
 
     await expect(dw.eval("addAsync(10)")).resolves.toBe(11);
     expect(addAsync).toHaveBeenCalledWith(10);
+  });
+
+  it("supports constructor globals for values, objects, and functions", async () => {
+    dw = new DenoWorker({
+      globals: {
+        someFn: (x: number) => x + 1,
+        anotherFn: async (x: number) => x + 2,
+        value: 22,
+        nested: { key: true },
+      },
+    } as any);
+
+    await expect(dw.eval("value")).resolves.toBe(22);
+    await expect(dw.eval("nested.key")).resolves.toBe(true);
+    await expect(dw.eval("someFn(41)")).resolves.toBe(42);
+    await expect(dw.eval("(async () => await anotherFn(40))()")).resolves.toBe(42);
+  });
+
+  it("injects Node module objects with callable methods (e.g. fs)", async () => {
+    dw = new DenoWorker();
+
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "deno-director-fs-"));
+    const filePath = path.join(dir, "hello.txt");
+
+    try {
+      await fs.writeFile(filePath, "hello from node fs", "utf8");
+
+      await dw.setGlobal("fs", nodeFs);
+      await dw.setGlobal("filePath", filePath);
+
+      await expect(dw.eval(`fs.readFileSync(filePath, "utf8")`)).resolves.toBe("hello from node fs");
+      await expect(dw.eval(`(async () => await fs.promises.readFile(filePath, "utf8"))()`)).resolves.toBe(
+        "hello from node fs",
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

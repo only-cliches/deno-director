@@ -62,9 +62,9 @@ describe("DenoWorker API", () => {
   test("module evaluation works (evalModule)", async () => {
     const code = `
       export function add(a, b) { return a + b; }
-      moduleReturn(add(10, 10));
+      export const out = add(10, 10);
     `;
-    await expect(dw.evalModule(code)).resolves.toBe(20);
+    await expect(dw.evalModule(code)).resolves.toMatchObject({ out: 20 });
   });
 
   test("timeout limits: long-running script rejects", async () => {
