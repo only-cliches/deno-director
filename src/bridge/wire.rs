@@ -5,6 +5,136 @@ use crate::bridge::tags::{
 };
 use crate::bridge::types::JsValueBridge;
 
+fn decode_special_number_tag(tag: &str) -> Option<f64> {
+    match tag {
+        "NaN" => Some(f64::NAN),
+        "Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
+}
+
+fn parse_u8_array(items: &[serde_json::Value]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let n = item.as_u64()?;
+        out.push((n & 0xFF) as u8);
+    }
+    Some(out)
+}
+
+fn decode_error_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<JsValueBridge> {
+    if map.get(TYPE_KEY).and_then(|v| v.as_str()) != Some(TYPE_ERROR) {
+        return None;
+    }
+
+    let name = map
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Error")
+        .to_string();
+    let message = map
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stack = map
+        .get("stack")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let code = map
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cause = map.get("cause").cloned().and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            Some(Box::new(from_wire_json(v)))
+        }
+    });
+
+    Some(JsValueBridge::Error {
+        name,
+        message,
+        stack,
+        code,
+        cause,
+    })
+}
+
+fn decode_host_function_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<JsValueBridge> {
+    if map.get(TYPE_KEY).and_then(|v| v.as_str()) != Some(TYPE_FUNCTION) {
+        return None;
+    }
+    let id = map.get("id").and_then(|v| v.as_u64())?;
+    let is_async = map.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(JsValueBridge::HostFunction {
+        id: id as usize,
+        is_async,
+    })
+}
+
+fn decode_buffer_view_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Result<JsValueBridge, ()>> {
+    let obj = map.get(BUFFER_KEY)?.as_object()?;
+    let kind = obj
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Uint8Array")
+        .to_string();
+    let byte_offset = obj.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let length = obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let bytes_arr = obj.get("bytes").and_then(|v| v.as_array())?;
+    let Some(bytes) = parse_u8_array(bytes_arr) else {
+        return Some(Err(()));
+    };
+
+    Some(Ok(JsValueBridge::BufferView {
+        kind,
+        bytes,
+        byte_offset,
+        length,
+    }))
+}
+
+fn decode_v8_serialized_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Result<JsValueBridge, ()>> {
+    let bytes_arr = map.get(V8_KEY)?.as_array()?;
+    let Some(bytes) = parse_u8_array(bytes_arr) else {
+        return Some(Err(()));
+    };
+    Some(Ok(JsValueBridge::V8Serialized(bytes)))
+}
+
+fn decode_map_entries(items: &[serde_json::Value]) -> JsValueBridge {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(pair) = item.as_array() else {
+            continue;
+        };
+        if pair.len() != 2 {
+            continue;
+        }
+        out.push((from_wire_json(pair[0].clone()), from_wire_json(pair[1].clone())));
+    }
+    JsValueBridge::Map(out)
+}
+
+fn decode_set_items(items: &[serde_json::Value]) -> JsValueBridge {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(from_wire_json(item.clone()));
+    }
+    JsValueBridge::Set(out)
+}
+
 /// Canonical "wire" JSON format used between Rust and the Deno runtime bootstrap hydration layer.
 /// This must stay stable, because bootstrap.js depends on these tags.
 pub fn to_wire_json(v: &JsValueBridge) -> serde_json::Value {
@@ -126,12 +256,9 @@ pub fn from_wire_json(v: serde_json::Value) -> JsValueBridge {
             }
 
             if let Some(tag) = map.get(NUMBER_KEY).and_then(|v| v.as_str()) {
-                return match tag {
-                    "NaN" => JsValueBridge::Number(f64::NAN),
-                    "Infinity" => JsValueBridge::Number(f64::INFINITY),
-                    "-Infinity" => JsValueBridge::Number(f64::NEG_INFINITY),
-                    _ => JsValueBridge::Undefined,
-                };
+                return decode_special_number_tag(tag)
+                    .map(JsValueBridge::Number)
+                    .unwrap_or(JsValueBridge::Undefined);
             }
 
             if let Some(ms) = map.get(DATE_KEY).and_then(|v| v.as_f64()) {
@@ -156,60 +283,19 @@ pub fn from_wire_json(v: serde_json::Value) -> JsValueBridge {
                 return JsValueBridge::RegExp { source, flags };
             }
 
-            if let Some(obj) = map.get(BUFFER_KEY).and_then(|v| v.as_object()) {
-                let kind = obj
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Uint8Array")
-                    .to_string();
-
-                let byte_offset =
-                    obj.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-                let length = obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-                if let Some(bytes_arr) = obj.get("bytes").and_then(|v| v.as_array()) {
-                    let mut out = Vec::with_capacity(bytes_arr.len());
-                    for b in bytes_arr {
-                        if let Some(n) = b.as_u64() {
-                            out.push((n & 0xFF) as u8);
-                        } else {
-                            return JsValueBridge::Json(serde_json::Value::Object(map));
-                        }
-                    }
-
-                    return JsValueBridge::BufferView {
-                        kind,
-                        bytes: out,
-                        byte_offset,
-                        length,
-                    };
+            if let Some(decoded) = decode_buffer_view_object(&map) {
+                match decoded {
+                    Ok(val) => return val,
+                    Err(()) => return JsValueBridge::Json(serde_json::Value::Object(map)),
                 }
             }
 
             if let Some(arr) = map.get(MAP_KEY).and_then(|v| v.as_array()) {
-                let mut out = Vec::with_capacity(arr.len());
-                for item in arr {
-                    let Some(pair) = item.as_array() else {
-                        continue;
-                    };
-                    if pair.len() != 2 {
-                        continue;
-                    }
-                    out.push((
-                        from_wire_json(pair[0].clone()),
-                        from_wire_json(pair[1].clone()),
-                    ));
-                }
-                return JsValueBridge::Map(out);
+                return decode_map_entries(arr);
             }
 
             if let Some(arr) = map.get(SET_KEY).and_then(|v| v.as_array()) {
-                let mut out = Vec::with_capacity(arr.len());
-                for item in arr {
-                    out.push(from_wire_json(item.clone()));
-                }
-                return JsValueBridge::Set(out);
+                return decode_set_items(arr);
             }
 
             if let Some(href) = map.get(URL_KEY).and_then(|v| v.as_str()) {
@@ -224,63 +310,19 @@ pub fn from_wire_json(v: serde_json::Value) -> JsValueBridge {
                 };
             }
 
-            if let Some(bytes) = map.get(V8_KEY).and_then(|v| v.as_array()) {
-                let mut out = Vec::with_capacity(bytes.len());
-                for b in bytes {
-                    if let Some(n) = b.as_u64() {
-                        out.push((n & 0xFF) as u8);
-                    } else {
-                        return JsValueBridge::Json(serde_json::Value::Object(map));
-                    }
+            if let Some(decoded) = decode_v8_serialized_object(&map) {
+                match decoded {
+                    Ok(val) => return val,
+                    Err(()) => return JsValueBridge::Json(serde_json::Value::Object(map)),
                 }
-                return JsValueBridge::V8Serialized(out);
             }
 
-            if map.get(TYPE_KEY).and_then(|v| v.as_str()) == Some(TYPE_ERROR) {
-                let name = map
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Error")
-                    .to_string();
-                let message = map
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let stack = map
-                    .get("stack")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let code = map
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let cause = map.get("cause").cloned().and_then(|v| {
-                    if v.is_null() {
-                        None
-                    } else {
-                        Some(Box::new(from_wire_json(v)))
-                    }
-                });
-
-                return JsValueBridge::Error {
-                    name,
-                    message,
-                    stack,
-                    code,
-                    cause,
-                };
+            if let Some(err) = decode_error_object(&map) {
+                return err;
             }
 
-            if map.get(TYPE_KEY).and_then(|v| v.as_str()) == Some(TYPE_FUNCTION) {
-                if let Some(id) = map.get("id").and_then(|v| v.as_u64()) {
-                    let is_async = map.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
-                    return JsValueBridge::HostFunction {
-                        id: id as usize,
-                        is_async,
-                    };
-                }
+            if let Some(host_fn) = decode_host_function_object(&map) {
+                return host_fn;
             }
 
             JsValueBridge::Json(serde_json::Value::Object(map))
@@ -290,7 +332,11 @@ pub fn from_wire_json(v: serde_json::Value) -> JsValueBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{from_wire_json, to_wire_json};
+    use super::{
+        decode_buffer_view_object, decode_error_object, decode_host_function_object,
+        decode_map_entries, decode_set_items, decode_special_number_tag,
+        decode_v8_serialized_object, from_wire_json, parse_u8_array, to_wire_json,
+    };
     use crate::bridge::tags::{
         BUFFER_KEY, MAP_KEY, NUMBER_KEY, REGEXP_KEY, SET_KEY, TYPE_ERROR, TYPE_FUNCTION,
         TYPE_KEY, V8_KEY,
@@ -646,5 +692,197 @@ mod tests {
         });
         let out = from_wire_json(raw);
         assert_bridge_eq(out, JsValueBridge::V8Serialized(vec![0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn decode_special_number_tag_handles_supported_and_unknown_tags() {
+        assert!(decode_special_number_tag("NaN").expect("NaN").is_nan());
+        assert_eq!(decode_special_number_tag("Infinity"), Some(f64::INFINITY));
+        assert_eq!(decode_special_number_tag("-Infinity"), Some(f64::NEG_INFINITY));
+        assert_eq!(decode_special_number_tag("nope"), None);
+    }
+
+    #[test]
+    fn parse_u8_array_parses_and_masks_values() {
+        let arr = vec![
+            serde_json::json!(0),
+            serde_json::json!(255),
+            serde_json::json!(256),
+            serde_json::json!(511),
+        ];
+        assert_eq!(parse_u8_array(&arr), Some(vec![0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn parse_u8_array_rejects_non_numeric_entries() {
+        let arr = vec![serde_json::json!(1), serde_json::json!("bad"), serde_json::json!(3)];
+        assert_eq!(parse_u8_array(&arr), None);
+    }
+
+    #[test]
+    fn decode_error_object_parses_error_payloads() {
+        let map = serde_json::json!({
+            TYPE_KEY: TYPE_ERROR,
+            "name": "TypeError",
+            "message": "boom",
+            "stack": "stack",
+            "code": "E_BANG",
+            "cause": { NUMBER_KEY: "Infinity" }
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out = decode_error_object(&map).expect("decoded");
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Error {
+                name: "TypeError".into(),
+                message: "boom".into(),
+                stack: Some("stack".into()),
+                code: Some("E_BANG".into()),
+                cause: Some(Box::new(JsValueBridge::Number(f64::INFINITY))),
+            },
+        );
+    }
+
+    #[test]
+    fn decode_host_function_object_parses_and_defaults_async() {
+        let a = serde_json::json!({
+            TYPE_KEY: TYPE_FUNCTION,
+            "id": 9
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out_a = decode_host_function_object(&a).expect("decoded");
+        assert_bridge_eq(
+            out_a,
+            JsValueBridge::HostFunction {
+                id: 9,
+                is_async: false,
+            },
+        );
+
+        let b = serde_json::json!({
+            TYPE_KEY: TYPE_FUNCTION,
+            "id": 10,
+            "async": true
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out_b = decode_host_function_object(&b).expect("decoded");
+        assert_bridge_eq(
+            out_b,
+            JsValueBridge::HostFunction {
+                id: 10,
+                is_async: true,
+            },
+        );
+    }
+
+    #[test]
+    fn decode_buffer_view_object_parses_valid_payload() {
+        let map = serde_json::json!({
+            BUFFER_KEY: {
+                "kind": "Uint8Array",
+                "bytes": [1, 2, 255, 256],
+                "byteOffset": 0,
+                "length": 4
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out = decode_buffer_view_object(&map)
+            .expect("tag")
+            .expect("decode");
+        assert_bridge_eq(
+            out,
+            JsValueBridge::BufferView {
+                kind: "Uint8Array".into(),
+                bytes: vec![1, 2, 255, 0],
+                byte_offset: 0,
+                length: 4,
+            },
+        );
+    }
+
+    #[test]
+    fn decode_v8_serialized_object_parses_valid_payload() {
+        let map = serde_json::json!({
+            V8_KEY: [0, 255, 256]
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out = decode_v8_serialized_object(&map)
+            .expect("tag")
+            .expect("decode");
+        assert_bridge_eq(out, JsValueBridge::V8Serialized(vec![0, 255, 0]));
+    }
+
+    #[test]
+    fn decode_buffer_and_v8_objects_return_error_on_invalid_bytes() {
+        let bad_buf = serde_json::json!({
+            BUFFER_KEY: {
+                "kind": "Uint8Array",
+                "bytes": [1, "bad", 3],
+                "byteOffset": 0,
+                "length": 3
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        assert!(matches!(
+            decode_buffer_view_object(&bad_buf),
+            Some(Err(()))
+        ));
+
+        let bad_v8 = serde_json::json!({
+            V8_KEY: [1, "bad", 3]
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        assert!(matches!(
+            decode_v8_serialized_object(&bad_v8),
+            Some(Err(()))
+        ));
+    }
+
+    #[test]
+    fn decode_map_entries_skips_invalid_pairs() {
+        let out = decode_map_entries(&[
+            serde_json::json!(["k", 1]),
+            serde_json::json!(["only-one"]),
+            serde_json::json!("not-array"),
+            serde_json::json!([true, false, "extra"]),
+        ]);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Map(vec![(
+                JsValueBridge::String("k".into()),
+                JsValueBridge::Number(1.0),
+            )]),
+        );
+    }
+
+    #[test]
+    fn decode_set_items_preserves_order_and_value_decoding() {
+        let out = decode_set_items(&[
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!({ NUMBER_KEY: "Infinity" }),
+        ]);
+        assert_bridge_eq(
+            out,
+            JsValueBridge::Set(vec![
+                JsValueBridge::Null,
+                JsValueBridge::Bool(true),
+                JsValueBridge::Number(f64::INFINITY),
+            ]),
+        );
     }
 }

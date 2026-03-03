@@ -523,6 +523,37 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
     serde_json::from_str::<serde_json::Value>(&s.value(cx)).ok()
 }
 
+fn try_v8_serialize_bytes<'a, C: Context<'a>>(
+    cx: &mut C,
+    value: Handle<'a, JsValue>,
+) -> Option<Vec<u8>> {
+    cx.try_catch(|cx| {
+        // __v8 is installed as a global object property (globalThis.__v8), not
+        // as a global lexical binding, so resolve it from the global object.
+        let global = cx.global_object();
+        let v8_any = global.get_value(cx, "__v8")?;
+        let v8obj = v8_any.downcast::<JsObject, _>(cx).map_err(|_| {
+            cx.throw_error::<_, Throw>("globalThis.__v8 is not an object")
+                .unwrap_err()
+        })?;
+
+        let ser_any = v8obj.get_value(cx, "serialize")?;
+        let ser = ser_any.downcast::<JsFunction, _>(cx).map_err(|_| {
+            cx.throw_error::<_, Throw>("globalThis.__v8.serialize is not a function")
+                .unwrap_err()
+        })?;
+
+        let buf_any = ser.call_with(cx).arg(value).apply::<JsValue, _>(cx)?;
+        let buf = buf_any.downcast::<JsBuffer, _>(cx).map_err(|_| {
+            cx.throw_error::<_, Throw>("globalThis.__v8.serialize did not return Buffer")
+                .unwrap_err()
+        })?;
+
+        Ok(buf.as_slice(cx).to_vec())
+    })
+    .ok()
+}
+
 pub fn from_neon_value<'a, C: Context<'a>>(
     cx: &mut C,
     value: Handle<'a, JsValue>,
@@ -725,34 +756,10 @@ pub fn from_neon_value<'a, C: Context<'a>>(
         let tag = object_to_string_tag(cx, value);
         let is_plain = matches!(tag.as_deref(), Some("[object Object]" | "[object Array]"));
 
-        if is_plain {
-            if let Some(j) = try_json_stringify_with_replacer(cx, value) {
-                return Ok(JsValueBridge::Json(j));
+        if !is_plain {
+            if let Some(bytes) = try_v8_serialize_bytes(cx, value) {
+                return Ok(JsValueBridge::V8Serialized(bytes));
             }
-            return Ok(JsValueBridge::Undefined);
-        }
-
-        let v8_attempt: Option<JsValueBridge> = cx
-            .try_catch(|cx| {
-                let v8obj = cx.global::<JsObject>("__v8")?;
-                let ser_any = v8obj.get_value(cx, "serialize")?;
-                let ser = match ser_any.downcast::<JsFunction, _>(cx) {
-                    Ok(f) => f,
-                    Err(_) => return Ok(JsValueBridge::Undefined),
-                };
-
-                let buf_any = ser.call_with(cx).arg(value).apply::<JsValue, _>(cx)?;
-                let buf = match buf_any.downcast::<JsBuffer, _>(cx) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(JsValueBridge::Undefined),
-                };
-
-                Ok(JsValueBridge::V8Serialized(buf.as_slice(cx).to_vec()))
-            })
-            .ok();
-
-        if let Some(v) = v8_attempt {
-            return Ok(v);
         }
 
         if let Some(j) = try_json_stringify_with_replacer(cx, value) {
@@ -1372,27 +1379,41 @@ pub fn to_neon_value<'a, C: Context<'a>>(
                 }
             };
 
-            let Ok(v8obj) = v8_any.downcast::<JsObject, _>(cx) else {
-                return Ok(cx.undefined().upcast());
-            };
+            let v8obj = v8_any.downcast::<JsObject, _>(cx).map_err(|_| {
+                cx.throw_error::<_, Throw>(
+                    "Bridge decode failed: globalThis.__v8 is unavailable or invalid",
+                )
+                .unwrap_err()
+            })?;
 
             let deser_any: Handle<JsValue> = match v8obj.get_value(cx, "deserialize") {
                 Ok(v) => v,
-                Err(_) => return Ok(cx.undefined().upcast()),
+                Err(_) => {
+                    return cx.throw_error("Bridge decode failed: __v8.deserialize is missing");
+                }
             };
 
-            let Ok(deser) = deser_any.downcast::<JsFunction, _>(cx) else {
-                return Ok(cx.undefined().upcast());
-            };
+            let deser = deser_any.downcast::<JsFunction, _>(cx).map_err(|_| {
+                cx.throw_error::<_, Throw>(
+                    "Bridge decode failed: __v8.deserialize is not a function",
+                )
+                .unwrap_err()
+            })?;
 
             let mut b = JsBuffer::new(cx, bytes.len())?;
             b.as_mut_slice(cx).copy_from_slice(bytes);
 
-            deser
-                .call_with(cx)
-                .this(v8obj)
-                .arg(b)
-                .apply::<JsValue, _>(cx)
+            cx.try_catch(|cx| {
+                deser
+                    .call_with(cx)
+                    .this(v8obj)
+                    .arg(b)
+                    .apply::<JsValue, _>(cx)
+            })
+            .map_err(|_| {
+                cx.throw_error::<_, Throw>("Bridge decode failed: __v8.deserialize threw")
+                    .unwrap_err()
+            })
         }
 
         JsValueBridge::Error {

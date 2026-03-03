@@ -164,6 +164,32 @@ fn inspector_addr(host: &str, port: u16) -> std::net::SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
 }
 
+fn inspector_http_response(method: &str, path: &str, port: u16) -> (&'static str, String) {
+    if method == "GET" && path == "/json/version" {
+        return (
+            "200 OK",
+            r#"{"Browser":"denojs-worker","Protocol-Version":"1.3"}"#.to_string(),
+        );
+    }
+    if method == "GET" && (path == "/json/list" || path == "/json") {
+        return (
+            "200 OK",
+            format!(
+                r#"[{{"id":"denojs-worker","title":"denojs-worker","type":"node","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/ws"}}]"#
+            ),
+        );
+    }
+    ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+}
+
+fn parse_http_method_path(req: &str) -> (String, String) {
+    let first_line = req.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    (method, path)
+}
+
 fn create_params_from_limits(limits: &RuntimeLimits) -> Option<deno_core::v8::CreateParams> {
     let max_mem = limits.max_memory_bytes?;
     let max_heap = usize::try_from(max_mem).unwrap_or(usize::MAX);
@@ -177,6 +203,14 @@ fn emit_startup_warning(worker: &mut MainWorker, message: &str) {
     );
     let _ = worker.js_runtime.execute_script("<startupWarning>", script);
     eprintln!("[deno-director] {message}");
+}
+
+fn mark_worker_closed(worker_id: usize) {
+    if let Ok(map) = crate::WORKERS.read() {
+        if let Some(w) = map.get(&worker_id) {
+            w.closed.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 pub fn spawn_worker_thread(
@@ -233,31 +267,10 @@ pub fn spawn_worker_thread(
                                 let n = stream.read(&mut buf).unwrap_or(0);
                                 let req = String::from_utf8_lossy(&buf[..n]);
 
-                                let first_line = req.lines().next().unwrap_or("");
-                                let mut parts = first_line.split_whitespace();
-                                let method = parts.next().unwrap_or("");
-                                let path = parts.next().unwrap_or("");
-
-                                if method == "GET" && path == "/json/version" {
-                                    write_http(
-                                        &stream,
-                                        "200 OK",
-                                        r#"{"Browser":"denojs-worker","Protocol-Version":"1.3"}"#,
-                                    );
-                                } else if method == "GET"
-                                    && (path == "/json/list" || path == "/json")
-                                {
-                                    let body = format!(
-                                        r#"[{{"id":"denojs-worker","title":"denojs-worker","type":"node","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/ws"}}]"#
-                                    );
-                                    write_http(&stream, "200 OK", &body);
-                                } else {
-                                    write_http(
-                                        &stream,
-                                        "404 Not Found",
-                                        r#"{"error":"not found"}"#,
-                                    );
-                                }
+                                let (method, path) = parse_http_method_path(&req);
+                                let (status, body) =
+                                    inspector_http_response(method.as_str(), path.as_str(), port);
+                                write_http(&stream, status, &body);
 
                                 let _ = stream.shutdown(Shutdown::Both);
                             }
@@ -377,11 +390,7 @@ pub fn spawn_worker_thread(
             }
 
             if worker.run_event_loop(false).await.is_err() {
-                if let Ok(map) = crate::WORKERS.read() {
-                    if let Some(w) = map.get(&worker_id) {
-                        w.closed.store(true, Ordering::SeqCst);
-                    }
-                }
+                mark_worker_closed(worker_id);
                 return;
             }
 
@@ -407,20 +416,12 @@ pub fn spawn_worker_thread(
 
             if let Some(url) = startup_url.as_ref() {
                 if worker.execute_side_module(url).await.is_err() {
-                    if let Ok(map) = crate::WORKERS.read() {
-                        if let Some(w) = map.get(&worker_id) {
-                            w.closed.store(true, Ordering::SeqCst);
-                        }
-                    }
+                    mark_worker_closed(worker_id);
                     return;
                 }
 
                 if worker.run_event_loop(false).await.is_err() {
-                    if let Ok(map) = crate::WORKERS.read() {
-                        if let Some(w) = map.get(&worker_id) {
-                            w.closed.store(true, Ordering::SeqCst);
-                        }
-                    }
+                    mark_worker_closed(worker_id);
                     return;
                 }
             }
@@ -465,6 +466,7 @@ pub fn spawn_worker_thread(
 mod tests {
     use super::{
         apply_perm_field, cfg_items, create_params_from_limits, env_access_from_permissions, inspector_addr,
+        inspector_http_response, mark_worker_closed, parse_http_method_path,
         merge_env_snapshot,
     };
     use crate::worker::env::EnvAccess;
@@ -606,6 +608,60 @@ mod tests {
         let out = inspector_addr("not-a-valid-hostname", 9222);
         assert_eq!(out.ip().to_string(), "127.0.0.1");
         assert_eq!(out.port(), 9222);
+    }
+
+    #[test]
+    fn inspector_http_response_serves_version_endpoint() {
+        let (status, body) = inspector_http_response("GET", "/json/version", 9229);
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("\"Browser\":\"denojs-worker\""));
+        assert!(body.contains("\"Protocol-Version\":\"1.3\""));
+    }
+
+    #[test]
+    fn inspector_http_response_serves_list_endpoint_with_port() {
+        let (status, body) = inspector_http_response("GET", "/json/list", 9333);
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("\"id\":\"denojs-worker\""));
+        assert!(body.contains("ws://127.0.0.1:9333/ws"));
+
+        let (_status_json, body_json) = inspector_http_response("GET", "/json", 9444);
+        assert!(body_json.contains("ws://127.0.0.1:9444/ws"));
+    }
+
+    #[test]
+    fn inspector_http_response_returns_404_for_unknown_paths_or_methods() {
+        let (status_path, body_path) = inspector_http_response("GET", "/unknown", 9229);
+        assert_eq!(status_path, "404 Not Found");
+        assert_eq!(body_path, r#"{"error":"not found"}"#);
+
+        let (status_method, body_method) = inspector_http_response("POST", "/json/list", 9229);
+        assert_eq!(status_method, "404 Not Found");
+        assert_eq!(body_method, r#"{"error":"not found"}"#);
+    }
+
+    #[test]
+    fn parse_http_method_path_extracts_method_and_path() {
+        let req = "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let (method, path) = parse_http_method_path(req);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/json/list");
+    }
+
+    #[test]
+    fn parse_http_method_path_handles_invalid_or_empty_requests() {
+        let (m1, p1) = parse_http_method_path("");
+        assert_eq!(m1, "");
+        assert_eq!(p1, "");
+
+        let (m2, p2) = parse_http_method_path("MALFORMED");
+        assert_eq!(m2, "MALFORMED");
+        assert_eq!(p2, "");
+    }
+
+    #[test]
+    fn mark_worker_closed_is_noop_for_unknown_worker_id() {
+        mark_worker_closed(usize::MAX);
     }
 
     #[test]

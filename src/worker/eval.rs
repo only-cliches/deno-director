@@ -206,28 +206,7 @@ fn maybe_transpile_eval_source(
     }
 
     let media = media_type_for_eval_filename(filename);
-    let maybe_cache_path = limits
-        .module_loader
-        .as_ref()
-        .and_then(|ml| ml.ts_compiler.as_ref())
-        .and_then(|tc| tc.cache_dir.as_ref())
-        .map(|cache_dir| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            filename.hash(&mut hasher);
-            source.hash(&mut hasher);
-            format!("{media:?}").hash(&mut hasher);
-            if let Some(tc) = limits
-                .module_loader
-                .as_ref()
-                .and_then(|ml| ml.ts_compiler.as_ref())
-            {
-                tc.jsx.hash(&mut hasher);
-                tc.jsx_factory.hash(&mut hasher);
-                tc.jsx_fragment_factory.hash(&mut hasher);
-            }
-            let h = hasher.finish();
-            PathBuf::from(cache_dir).join(format!("{h:016x}.js"))
-        });
+    let maybe_cache_path = transpile_cache_path_from_limits(limits, filename, source, media);
 
     let reload = limits
         .module_loader
@@ -272,6 +251,35 @@ fn maybe_transpile_eval_source(
     }
 
     Ok(transpiled)
+}
+
+fn transpile_cache_path_from_limits(
+    limits: &RuntimeLimits,
+    filename: &str,
+    source: &str,
+    media: deno_ast::MediaType,
+) -> Option<PathBuf> {
+    let cache_dir = limits
+        .module_loader
+        .as_ref()
+        .and_then(|ml| ml.ts_compiler.as_ref())
+        .and_then(|tc| tc.cache_dir.as_ref())?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    filename.hash(&mut hasher);
+    source.hash(&mut hasher);
+    format!("{media:?}").hash(&mut hasher);
+    if let Some(tc) = limits
+        .module_loader
+        .as_ref()
+        .and_then(|ml| ml.ts_compiler.as_ref())
+    {
+        tc.jsx.hash(&mut hasher);
+        tc.jsx_factory.hash(&mut hasher);
+        tc.jsx_fragment_factory.hash(&mut hasher);
+    }
+    let h = hasher.finish();
+    Some(PathBuf::from(cache_dir).join(format!("{h:016x}.js")))
 }
 
 fn mk_err(name: &str, message: String) -> JsValueBridge {
@@ -694,5 +702,71 @@ async fn settle_until_non_promise(
                 .await
                 .map_err(|e| JsValueBridge::any_error_to_bridge(e.into()))?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{media_type_for_eval_filename, transpile_cache_path_from_limits};
+    use crate::worker::state::{ModuleLoaderConfig, RuntimeLimits, TsCompilerConfig};
+
+    fn limits_with_cache(
+        cache_dir: Option<&str>,
+        jsx: Option<&str>,
+        jsx_factory: Option<&str>,
+    ) -> RuntimeLimits {
+        RuntimeLimits {
+            module_loader: Some(ModuleLoaderConfig {
+                transpile_ts: true,
+                ts_compiler: Some(TsCompilerConfig {
+                    jsx: jsx.map(str::to_string),
+                    jsx_factory: jsx_factory.map(str::to_string),
+                    jsx_fragment_factory: None,
+                    cache_dir: cache_dir.map(str::to_string),
+                }),
+                ..ModuleLoaderConfig::default()
+            }),
+            ..RuntimeLimits::default()
+        }
+    }
+
+    #[test]
+    fn transpile_cache_path_is_none_without_cache_dir() {
+        let limits = limits_with_cache(None, Some("react"), None);
+        let media = media_type_for_eval_filename("x.ts");
+        let out = transpile_cache_path_from_limits(&limits, "x.ts", "const a: number = 1;", media);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn transpile_cache_path_is_stable_for_same_inputs() {
+        let limits = limits_with_cache(Some("/tmp/cache"), Some("react-jsx"), Some("h"));
+        let media = media_type_for_eval_filename("x.tsx");
+
+        let a =
+            transpile_cache_path_from_limits(&limits, "x.tsx", "const a: number = 1;", media)
+                .expect("cache path");
+        let b =
+            transpile_cache_path_from_limits(&limits, "x.tsx", "const a: number = 1;", media)
+                .expect("cache path");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn transpile_cache_path_changes_with_source_or_compiler_flags() {
+        let base = limits_with_cache(Some("/tmp/cache"), Some("react"), None);
+        let changed_source = limits_with_cache(Some("/tmp/cache"), Some("react"), None);
+        let changed_jsx = limits_with_cache(Some("/tmp/cache"), Some("react-jsx"), None);
+        let media = media_type_for_eval_filename("x.ts");
+
+        let a = transpile_cache_path_from_limits(&base, "x.ts", "const a = 1;", media)
+            .expect("cache path");
+        let b = transpile_cache_path_from_limits(&changed_source, "x.ts", "const a = 2;", media)
+            .expect("cache path");
+        let c = transpile_cache_path_from_limits(&changed_jsx, "x.ts", "const a = 1;", media)
+            .expect("cache path");
+
+        assert_ne!(a, b);
+        assert_ne!(a, c);
     }
 }

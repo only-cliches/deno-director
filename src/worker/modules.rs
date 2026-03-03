@@ -17,6 +17,12 @@ use tokio::sync::mpsc;
 
 use deno_core::url::Url;
 
+enum CallbackDecisionWait {
+    Decision(crate::worker::messages::ImportDecision),
+    ChannelClosed,
+    TimedOut,
+}
+
 fn dbg_imports_enabled() -> bool {
     std::env::var("DENOJS_WORKER_DEBUG_IMPORTS")
         .ok()
@@ -469,6 +475,265 @@ impl DynamicModuleLoader {
             permissions: self.permissions.clone(),
             eval_sync_active: self.eval_sync_active.clone(),
         }
+    }
+
+    fn original_spec_and_referrer(
+        module_specifier: &Url,
+        maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
+    ) -> (String, String) {
+        let spec = module_specifier.as_str().to_string();
+        let referrer_from_runtime = maybe_referrer
+            .map(|r| r.specifier.as_str().to_string())
+            .unwrap_or_default();
+
+        Self::decode_resolve_url(module_specifier)
+            .unwrap_or_else(|| (spec, referrer_from_runtime))
+    }
+
+    fn imports_policy_error(&self, orig_spec: &str) -> Option<JsErrorBox> {
+        match self.imports_policy {
+            crate::worker::state::ImportsPolicy::DenyAll => Some(JsErrorBox::generic(format!(
+                "Import blocked (imports disabled): {orig_spec}"
+            ))),
+            crate::worker::state::ImportsPolicy::AllowDisk
+            | crate::worker::state::ImportsPolicy::Callback => None,
+        }
+    }
+
+    fn callback_imports_blocked_during_eval_sync(&self) -> bool {
+        self.eval_sync_active
+            .as_ref()
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    fn should_wrap_with_redirect(requested_specifier: &Url) -> bool {
+        requested_specifier.scheme() == "denojs-worker"
+    }
+
+    fn resolve_allowed_disk_target(&self, orig_spec: &str, orig_referrer: &str) -> Option<Url> {
+        self.try_node_resolve_disk(orig_spec, orig_referrer)
+            .or_else(|| {
+                DynamicModuleLoader::map_jsr_specifier(orig_spec)
+                    .and_then(|jsr_spec| self.try_deno_resolve(&jsr_spec, orig_referrer).ok())
+            })
+            .or_else(|| self.try_deno_resolve(orig_spec, orig_referrer).ok())
+    }
+
+    fn resolve_rewritten_target(&self, rewritten_spec: &str, orig_referrer: &str) -> Option<Url> {
+        let ns = rewritten_spec.trim();
+        Url::parse(ns)
+            .ok()
+            .or_else(|| self.try_node_resolve_disk(ns, orig_referrer))
+            .or_else(|| {
+                DynamicModuleLoader::map_jsr_specifier(ns)
+                    .and_then(|jsr_spec| self.try_deno_resolve(&jsr_spec, orig_referrer).ok())
+            })
+            .or_else(|| self.try_deno_resolve(ns, orig_referrer).ok())
+    }
+
+    fn resolve_allow_disk_or_error(
+        &self,
+        orig_spec: &str,
+        orig_referrer: &str,
+    ) -> Result<Url, JsErrorBox> {
+        self.resolve_allowed_disk_target(orig_spec, orig_referrer)
+            .ok_or_else(|| JsErrorBox::generic(format!("Unable to resolve import: {}", orig_spec)))
+    }
+
+    fn resolve_rewritten_or_error(
+        &self,
+        new_spec: &str,
+        orig_referrer: &str,
+    ) -> Result<Url, JsErrorBox> {
+        self.resolve_rewritten_target(new_spec, orig_referrer).ok_or_else(|| {
+            JsErrorBox::generic(format!(
+                "Unable to resolve rewritten import: {}",
+                new_spec
+            ))
+        })
+    }
+
+    fn should_load_remote_non_callback(&self, module_specifier: &Url) -> bool {
+        (module_specifier.scheme() == "http" && self.http_resolve_enabled())
+            || (module_specifier.scheme() == "https" && self.https_resolve_enabled())
+    }
+
+    async fn load_resolved_module(
+        &self,
+        requested_specifier: Url,
+        resolved: Url,
+        maybe_referrer_owned: Option<deno_core::ModuleLoadReferrer>,
+        options: deno_core::ModuleLoadOptions,
+    ) -> Result<ModuleSource, JsErrorBox> {
+        self.ensure_remote_load_allowed(&resolved)?;
+
+        if resolved.scheme() == "file" && !self.within_sandbox(&resolved) {
+            return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
+        }
+
+        let loaded = match self
+            .fs_loader
+            .load(&resolved, maybe_referrer_owned.as_ref(), options)
+        {
+            deno_core::ModuleLoadResponse::Sync(r) => r,
+            deno_core::ModuleLoadResponse::Async(fut) => fut.await,
+        };
+
+        loaded.map(|mut src| {
+            if Self::should_wrap_with_redirect(&requested_specifier) {
+                let code = src.cheap_copy_code();
+                let module_type = src.module_type;
+                let code_cache = src.code_cache.take();
+
+                ModuleSource::new_with_redirect(
+                    module_type,
+                    code,
+                    &requested_specifier,
+                    &resolved,
+                    code_cache,
+                )
+            } else {
+                src
+            }
+        })
+    }
+
+    async fn read_or_fetch_remote_source(&self, module_specifier: &Url) -> Result<String, JsErrorBox> {
+        let cfg = self.module_loader_cfg();
+        let cache_path = self.remote_cache_path(module_specifier);
+
+        if !cfg.reload {
+            if let Ok(hit) = tokio::fs::read_to_string(&cache_path).await {
+                return Ok(hit);
+            }
+        }
+
+        let s = DynamicModuleLoader::fetch_remote_text(module_specifier, self.max_payload_bytes()).await?;
+        if let Some(parent) = cache_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&cache_path, s.as_bytes()).await;
+        Ok(s)
+    }
+
+    fn final_module_type_for_remote(ext: &str, base: ModuleType) -> ModuleType {
+        if DynamicModuleLoader::is_ts_like_ext(ext) {
+            ModuleType::JavaScript
+        } else {
+            base
+        }
+    }
+
+    async fn load_remote_non_callback_module(
+        &self,
+        module_specifier: Url,
+    ) -> Result<ModuleSource, JsErrorBox> {
+        self.ensure_remote_permissions(&module_specifier)?;
+        let ext = DynamicModuleLoader::module_ext(&module_specifier).unwrap_or_default();
+        let code = self.read_or_fetch_remote_source(&module_specifier).await?;
+        let module_type = DynamicModuleLoader::module_type_for_url(&module_specifier);
+        let final_code = self.maybe_transpile_ts_like(&module_specifier, &ext, code)?;
+        let final_module_type = Self::final_module_type_for_remote(&ext, module_type);
+
+        Ok(ModuleSource::new(
+            final_module_type,
+            deno_core::ModuleSourceCode::String(final_code.into()),
+            &module_specifier,
+            None,
+        ))
+    }
+
+    fn normalize_callback_decision(
+        wait: CallbackDecisionWait,
+        orig_spec: &str,
+    ) -> Result<crate::worker::messages::ImportDecision, JsErrorBox> {
+        match wait {
+            CallbackDecisionWait::Decision(decision) => Ok(decision),
+            CallbackDecisionWait::ChannelClosed => Ok(crate::worker::messages::ImportDecision::Block),
+            CallbackDecisionWait::TimedOut => Err(JsErrorBox::generic(format!(
+                "Import callback timed out: {}",
+                orig_spec
+            ))),
+        }
+    }
+
+    fn source_typed_wrapper(virt: &str) -> String {
+        format!(
+            "export * from {v};\nexport {{ default }} from {v};\n",
+            v = serde_json::to_string(virt)
+                .unwrap_or_else(|_| "\"denojs-worker://virtual/__vm_bad.js\"".into())
+        )
+    }
+
+    fn build_source_typed_module(
+        &self,
+        requested_specifier: &Url,
+        ext: &str,
+        code: String,
+    ) -> Result<ModuleSource, JsErrorBox> {
+        let mut final_code = code;
+        if DynamicModuleLoader::is_ts_like_ext(ext) {
+            final_code = self.maybe_transpile_ts_like(requested_specifier, ext, final_code)?;
+        }
+
+        let virt = self.reg.next_virtual_specifier("js");
+        self.reg
+            .put_persistent(&virt, &final_code, ModuleType::JavaScript);
+
+        let wrapper = DynamicModuleLoader::source_typed_wrapper(&virt);
+        Ok(ModuleSource::new(
+            ModuleType::JavaScript,
+            deno_core::ModuleSourceCode::String(wrapper.into()),
+            requested_specifier,
+            None,
+        ))
+    }
+
+    async fn request_import_decision(
+        node_tx: &mpsc::Sender<NodeMsg>,
+        orig_spec: &str,
+        orig_referrer: &str,
+        is_dynamic_import: bool,
+    ) -> Result<crate::worker::messages::ImportDecision, JsErrorBox> {
+        Self::request_import_decision_with_timeout(
+            node_tx,
+            orig_spec,
+            orig_referrer,
+            is_dynamic_import,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    async fn request_import_decision_with_timeout(
+        node_tx: &mpsc::Sender<NodeMsg>,
+        orig_spec: &str,
+        orig_referrer: &str,
+        is_dynamic_import: bool,
+        timeout: Duration,
+    ) -> Result<crate::worker::messages::ImportDecision, JsErrorBox> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::worker::messages::ImportDecision>();
+
+        if node_tx
+            .send(NodeMsg::ImportRequest {
+                specifier: orig_spec.to_string(),
+                referrer: orig_referrer.to_string(),
+                is_dynamic_import,
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(JsErrorBox::generic("Imports callback unavailable"));
+        }
+
+        let wait = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(decision)) => CallbackDecisionWait::Decision(decision),
+            Ok(Err(_)) => CallbackDecisionWait::ChannelClosed,
+            Err(_) => CallbackDecisionWait::TimedOut,
+        };
+        Self::normalize_callback_decision(wait, orig_spec)
     }
 
     fn permissions_cfg(&self) -> Option<&serde_json::Value> {
@@ -943,14 +1208,8 @@ impl ModuleLoader for DynamicModuleLoader {
                 .unwrap_or("<none>")
         ));
 
-        let spec = module_specifier.as_str().to_string();
-
-        let referrer_from_runtime = maybe_referrer
-            .map(|r| r.specifier.as_str().to_string())
-            .unwrap_or_default();
-
         // 1) Serve in-memory modules first
-        if let Some((code, module_type)) = self.reg.get_for_load(&spec) {
+        if let Some((code, module_type)) = self.reg.get_for_load(module_specifier.as_str()) {
             let source = ModuleSource::new(
                 module_type,
                 deno_core::ModuleSourceCode::String(code.into()),
@@ -961,20 +1220,12 @@ impl ModuleLoader for DynamicModuleLoader {
         }
 
         // 2) Decode synthetic resolve URL (callback path)
-        let decoded = Self::decode_resolve_url(module_specifier);
-        let (orig_spec, orig_referrer) = decoded
-            .clone()
-            .unwrap_or_else(|| (spec.clone(), referrer_from_runtime.clone()));
+        let (orig_spec, orig_referrer) =
+            Self::original_spec_and_referrer(module_specifier, maybe_referrer);
 
         // 3) Enforce imports policy for real module loads
-        match self.imports_policy {
-            crate::worker::state::ImportsPolicy::DenyAll => {
-                return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
-                    "Import blocked (imports disabled): {orig_spec}"
-                ))));
-            }
-            crate::worker::state::ImportsPolicy::AllowDisk => {}
-            crate::worker::state::ImportsPolicy::Callback => {}
+        if let Some(err) = self.imports_policy_error(&orig_spec) {
+            return deno_core::ModuleLoadResponse::Sync(Err(err));
         }
 
         // 4) Callback path
@@ -982,19 +1233,13 @@ impl ModuleLoader for DynamicModuleLoader {
             self.imports_policy,
             crate::worker::state::ImportsPolicy::Callback
         ) {
-            if self
-                .eval_sync_active
-                .as_ref()
-                .map(|v| v.load(Ordering::SeqCst))
-                .unwrap_or(false)
-            {
+            if self.callback_imports_blocked_during_eval_sync() {
                 return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(
                     "Import callbacks are unavailable during evalSync. Use eval() instead.",
                 )));
             }
 
             let node_tx = self.node_tx.clone();
-            let fs_loader = self.fs_loader.clone();
             let this_loader = self.clone_for_async();
 
             let requested_specifier = module_specifier.clone();
@@ -1003,32 +1248,13 @@ impl ModuleLoader for DynamicModuleLoader {
 
             return deno_core::ModuleLoadResponse::Async(Box::pin(async move {
                 use crate::worker::messages::ImportDecision;
-
-                let (tx, rx) = tokio::sync::oneshot::channel::<ImportDecision>();
-
-                if node_tx
-                    .send(NodeMsg::ImportRequest {
-                        specifier: orig_spec.clone(),
-                        referrer: orig_referrer.clone(),
-                        is_dynamic_import: options.is_dynamic_import,
-                        reply: tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return Err(JsErrorBox::generic("Imports callback unavailable"));
-                }
-
-                let decision = match tokio::time::timeout(Duration::from_secs(5), rx).await {
-                    Ok(Ok(decision)) => decision,
-                    Ok(Err(_)) => ImportDecision::Block,
-                    Err(_) => {
-                        return Err(JsErrorBox::generic(format!(
-                            "Import callback timed out: {}",
-                            orig_spec
-                        )));
-                    }
-                };
+                let decision = DynamicModuleLoader::request_import_decision(
+                    &node_tx,
+                    &orig_spec,
+                    &orig_referrer,
+                    options.is_dynamic_import,
+                )
+                .await?;
 
                 match decision {
                     ImportDecision::Block => Err(JsErrorBox::generic(format!(
@@ -1038,190 +1264,47 @@ impl ModuleLoader for DynamicModuleLoader {
 
                     ImportDecision::AllowDisk => {
                         let resolved = this_loader
-                            .try_node_resolve_disk(&orig_spec, &orig_referrer)
-                            .or_else(|| {
-                                DynamicModuleLoader::map_jsr_specifier(&orig_spec).and_then(
-                                    |jsr_spec| {
-                                        this_loader.try_deno_resolve(&jsr_spec, &orig_referrer).ok()
-                                    },
-                                )
-                            })
-                            .or_else(|| {
-                                this_loader
-                                    .try_deno_resolve(&orig_spec, &orig_referrer)
-                                    .ok()
-                            })
-                            .ok_or_else(|| {
-                                JsErrorBox::generic(format!(
-                                    "Unable to resolve import: {}",
-                                    orig_spec
-                                ))
-                            })?;
+                            .resolve_allow_disk_or_error(&orig_spec, &orig_referrer)?;
 
-                        this_loader.ensure_remote_load_allowed(&resolved)?;
-
-                        if resolved.scheme() == "file" && !this_loader.within_sandbox(&resolved) {
-                            return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
-                        }
-
-                        let loaded =
-                            match fs_loader.load(&resolved, maybe_referrer_owned.as_ref(), options)
-                            {
-                                deno_core::ModuleLoadResponse::Sync(r) => r,
-                                deno_core::ModuleLoadResponse::Async(fut) => fut.await,
-                            };
-
-                        loaded.map(|mut src| {
-                            if requested_specifier.scheme() == "denojs-worker" {
-                                let code = src.cheap_copy_code();
-                                let module_type = src.module_type;
-                                let code_cache = src.code_cache.take();
-
-                                ModuleSource::new_with_redirect(
-                                    module_type,
-                                    code,
-                                    &requested_specifier,
-                                    &resolved,
-                                    code_cache,
-                                )
-                            } else {
-                                src
-                            }
-                        })
+                        this_loader
+                            .load_resolved_module(
+                                requested_specifier.clone(),
+                                resolved,
+                                maybe_referrer_owned.clone(),
+                                options,
+                            )
+                            .await
                     }
 
                     ImportDecision::Resolve(new_spec) => {
-                        let ns = new_spec.trim();
+                        let resolved = this_loader
+                            .resolve_rewritten_or_error(&new_spec, &orig_referrer)?;
 
-                        let resolved = Url::parse(ns)
-                            .ok()
-                            .or_else(|| this_loader.try_node_resolve_disk(ns, &orig_referrer))
-                            .or_else(|| {
-                                DynamicModuleLoader::map_jsr_specifier(ns).and_then(|jsr_spec| {
-                                    this_loader.try_deno_resolve(&jsr_spec, &orig_referrer).ok()
-                                })
-                            })
-                            .or_else(|| this_loader.try_deno_resolve(ns, &orig_referrer).ok())
-                            .ok_or_else(|| {
-                                JsErrorBox::generic(format!(
-                                    "Unable to resolve rewritten import: {}",
-                                    new_spec
-                                ))
-                            })?;
-
-                        this_loader.ensure_remote_load_allowed(&resolved)?;
-
-                        if resolved.scheme() == "file" && !this_loader.within_sandbox(&resolved) {
-                            return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
-                        }
-
-                        let loaded =
-                            match fs_loader.load(&resolved, maybe_referrer_owned.as_ref(), options)
-                            {
-                                deno_core::ModuleLoadResponse::Sync(r) => r,
-                                deno_core::ModuleLoadResponse::Async(fut) => fut.await,
-                            };
-
-                        loaded.map(|mut src| {
-                            if requested_specifier.scheme() == "denojs-worker" {
-                                let code = src.cheap_copy_code();
-                                let module_type = src.module_type;
-                                let code_cache = src.code_cache.take();
-
-                                ModuleSource::new_with_redirect(
-                                    module_type,
-                                    code,
-                                    &requested_specifier,
-                                    &resolved,
-                                    code_cache,
-                                )
-                            } else {
-                                src
-                            }
-                        })
-                    }
-
-                    ImportDecision::SourceTyped { ext, code } => {
-                        let mut final_code = code;
-                        if DynamicModuleLoader::is_ts_like_ext(&ext) {
-                            final_code = this_loader.maybe_transpile_ts_like(
-                                &requested_specifier,
-                                &ext,
-                                final_code,
-                            )?;
-                        }
-
-                        let virt = this_loader.reg.next_virtual_specifier("js");
                         this_loader
-                            .reg
-                            .put_persistent(&virt, &final_code, ModuleType::JavaScript);
-
-                        let wrapper = format!(
-                            "export * from {v};\nexport {{ default }} from {v};\n",
-                            v = serde_json::to_string(&virt).unwrap_or_else(|_| {
-                                "\"denojs-worker://virtual/__vm_bad.js\"".into()
-                            })
-                        );
-
-                        Ok(ModuleSource::new(
-                            ModuleType::JavaScript,
-                            deno_core::ModuleSourceCode::String(wrapper.into()),
-                            &requested_specifier,
-                            None,
-                        ))
+                            .load_resolved_module(
+                                requested_specifier.clone(),
+                                resolved,
+                                maybe_referrer_owned.clone(),
+                                options,
+                            )
+                            .await
                     }
+
+                    ImportDecision::SourceTyped { ext, code } => this_loader
+                        .build_source_typed_module(&requested_specifier, &ext, code),
                 }
             }));
         }
 
         // 5) Non-callback: allow disk loads directly
-        if (module_specifier.scheme() == "http" && self.http_resolve_enabled())
-            || (module_specifier.scheme() == "https" && self.https_resolve_enabled())
-        {
+        if self.should_load_remote_non_callback(module_specifier) {
             let this_loader = self.clone_for_async();
             let module_specifier = module_specifier.clone();
 
             return deno_core::ModuleLoadResponse::Async(Box::pin(async move {
-                this_loader.ensure_remote_permissions(&module_specifier)?;
-                let ext = DynamicModuleLoader::module_ext(&module_specifier).unwrap_or_default();
-
-                let cfg = this_loader.module_loader_cfg();
-                let cache_path = this_loader.remote_cache_path(&module_specifier);
-                let mut maybe_cached = None;
-                if !cfg.reload {
-                    maybe_cached = tokio::fs::read_to_string(&cache_path).await.ok();
-                }
-
-                let code = match maybe_cached {
-                    Some(s) => s,
-                    None => {
-                        let s = DynamicModuleLoader::fetch_remote_text(
-                            &module_specifier,
-                            this_loader.max_payload_bytes(),
-                        )
-                        .await?;
-                        if let Some(parent) = cache_path.parent() {
-                            let _ = tokio::fs::create_dir_all(parent).await;
-                        }
-                        let _ = tokio::fs::write(&cache_path, s.as_bytes()).await;
-                        s
-                    }
-                };
-
-                let module_type = DynamicModuleLoader::module_type_for_url(&module_specifier);
-                let final_code =
-                    this_loader.maybe_transpile_ts_like(&module_specifier, &ext, code)?;
-                let final_module_type = if DynamicModuleLoader::is_ts_like_ext(&ext) {
-                    ModuleType::JavaScript
-                } else {
-                    module_type
-                };
-                Ok(ModuleSource::new(
-                    final_module_type,
-                    deno_core::ModuleSourceCode::String(final_code.into()),
-                    &module_specifier,
-                    None,
-                ))
+                this_loader
+                    .load_remote_non_callback_module(module_specifier)
+                    .await
             }));
         }
 
@@ -1238,13 +1321,16 @@ impl ModuleLoader for DynamicModuleLoader {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicModuleLoader, ModuleRegistry};
+    use super::{CallbackDecisionWait, DynamicModuleLoader, ModuleRegistry};
+    use crate::worker::messages::{ImportDecision, NodeMsg};
     use crate::worker::state::{ImportsPolicy, ModuleLoaderConfig};
     use deno_core::url::Url;
     use deno_runtime::deno_core;
     use deno_runtime::deno_core::ModuleType;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     fn test_registry(limit: usize) -> ModuleRegistry {
@@ -1268,6 +1354,14 @@ mod tests {
             permissions: Some(permissions),
             eval_sync_active: None,
         }
+    }
+
+    fn run_async<T>(fut: impl std::future::Future<Output = T>) -> T {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(fut)
     }
 
     #[test]
@@ -1342,5 +1436,347 @@ mod tests {
 
         let c = DynamicModuleLoader::map_jsr_specifier("@scope/pkg");
         assert!(c.is_none());
+    }
+
+    #[test]
+    fn original_spec_and_referrer_prefers_decoded_resolve_url() {
+        let u = Url::parse(
+            "denojs-worker://resolve?specifier=https%3A%2F%2Fexample.com%2Fa.ts&referrer=file%3A%2F%2F%2Ftmp%2Fmain.ts",
+        )
+        .expect("url");
+        let (spec, referrer) = DynamicModuleLoader::original_spec_and_referrer(&u, None);
+        assert_eq!(spec, "https://example.com/a.ts");
+        assert_eq!(referrer, "file:///tmp/main.ts");
+    }
+
+    #[test]
+    fn original_spec_and_referrer_falls_back_to_runtime_referrer() {
+        let module = Url::parse("file:///tmp/mod.ts").expect("url");
+        let runtime_ref = deno_core::ModuleLoadReferrer {
+            specifier: Url::parse("file:///tmp/main.ts").expect("url"),
+            line_number: 0,
+            column_number: 0,
+        };
+        let (spec, referrer) =
+            DynamicModuleLoader::original_spec_and_referrer(&module, Some(&runtime_ref));
+        assert_eq!(spec, "file:///tmp/mod.ts");
+        assert_eq!(referrer, "file:///tmp/main.ts");
+    }
+
+    #[test]
+    fn imports_policy_error_only_for_deny_all() {
+        let deny = DynamicModuleLoader {
+            imports_policy: ImportsPolicy::DenyAll,
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+        let allow_disk = DynamicModuleLoader {
+            imports_policy: ImportsPolicy::AllowDisk,
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+        let callback = DynamicModuleLoader {
+            imports_policy: ImportsPolicy::Callback,
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+
+        assert!(deny
+            .imports_policy_error("https://example.com/mod.ts")
+            .is_some());
+        assert!(allow_disk
+            .imports_policy_error("https://example.com/mod.ts")
+            .is_none());
+        assert!(callback
+            .imports_policy_error("https://example.com/mod.ts")
+            .is_none());
+    }
+
+    #[test]
+    fn callback_imports_blocked_during_eval_sync_tracks_atomic_state() {
+        let active = Arc::new(AtomicBool::new(false));
+        let loader = DynamicModuleLoader {
+            eval_sync_active: Some(active.clone()),
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+
+        assert!(!loader.callback_imports_blocked_during_eval_sync());
+        active.store(true, Ordering::SeqCst);
+        assert!(loader.callback_imports_blocked_during_eval_sync());
+    }
+
+    #[test]
+    fn should_wrap_with_redirect_is_true_only_for_internal_resolve_scheme() {
+        let internal = Url::parse("denojs-worker://resolve?specifier=x").expect("url");
+        let file = Url::parse("file:///tmp/mod.ts").expect("url");
+        let https = Url::parse("https://example.com/mod.ts").expect("url");
+
+        assert!(DynamicModuleLoader::should_wrap_with_redirect(&internal));
+        assert!(!DynamicModuleLoader::should_wrap_with_redirect(&file));
+        assert!(!DynamicModuleLoader::should_wrap_with_redirect(&https));
+    }
+
+    #[test]
+    fn resolve_allowed_disk_target_resolves_direct_remote_urls() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        let out = loader
+            .resolve_allowed_disk_target("https://example.com/mod.ts", "file:///tmp/main.ts")
+            .expect("resolved");
+        assert_eq!(out.as_str(), "https://example.com/mod.ts");
+    }
+
+    #[test]
+    fn resolve_rewritten_target_supports_absolute_url_and_trim() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        let out = loader
+            .resolve_rewritten_target("  https://example.com/rewrite.ts  ", "file:///tmp/main.ts")
+            .expect("resolved");
+        assert_eq!(out.as_str(), "https://example.com/rewrite.ts");
+    }
+
+    #[test]
+    fn should_load_remote_non_callback_respects_scheme_and_config() {
+        let https_only = DynamicModuleLoader {
+            module_loader: Some(ModuleLoaderConfig {
+                https_resolve: true,
+                http_resolve: false,
+                ..ModuleLoaderConfig::default()
+            }),
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+        let http_only = DynamicModuleLoader {
+            module_loader: Some(ModuleLoaderConfig {
+                https_resolve: false,
+                http_resolve: true,
+                ..ModuleLoaderConfig::default()
+            }),
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+
+        let https = Url::parse("https://example.com/mod.ts").expect("url");
+        let http = Url::parse("http://example.com/mod.ts").expect("url");
+        let file = Url::parse("file:///tmp/mod.ts").expect("url");
+
+        assert!(https_only.should_load_remote_non_callback(&https));
+        assert!(!https_only.should_load_remote_non_callback(&http));
+        assert!(!https_only.should_load_remote_non_callback(&file));
+
+        assert!(http_only.should_load_remote_non_callback(&http));
+        assert!(!http_only.should_load_remote_non_callback(&https));
+        assert!(!http_only.should_load_remote_non_callback(&file));
+    }
+
+    #[test]
+    fn final_module_type_for_remote_forces_js_for_ts_like_ext() {
+        assert_eq!(
+            DynamicModuleLoader::final_module_type_for_remote("ts", ModuleType::Json),
+            ModuleType::JavaScript
+        );
+        assert_eq!(
+            DynamicModuleLoader::final_module_type_for_remote("tsx", ModuleType::Json),
+            ModuleType::JavaScript
+        );
+        assert_eq!(
+            DynamicModuleLoader::final_module_type_for_remote("jsx", ModuleType::Json),
+            ModuleType::JavaScript
+        );
+        assert_eq!(
+            DynamicModuleLoader::final_module_type_for_remote("json", ModuleType::Json),
+            ModuleType::Json
+        );
+    }
+
+    #[test]
+    fn normalize_callback_decision_maps_channel_closed_to_block() {
+        let out = DynamicModuleLoader::normalize_callback_decision(
+            CallbackDecisionWait::ChannelClosed,
+            "https://example.com/mod.ts",
+        )
+        .expect("decision");
+        assert!(matches!(out, ImportDecision::Block));
+    }
+
+    #[test]
+    fn normalize_callback_decision_preserves_decision_variant() {
+        let out = DynamicModuleLoader::normalize_callback_decision(
+            CallbackDecisionWait::Decision(ImportDecision::Resolve(
+                "https://example.com/rewrite.ts".to_string(),
+            )),
+            "https://example.com/mod.ts",
+        )
+        .expect("decision");
+        match out {
+            ImportDecision::Resolve(s) => assert_eq!(s, "https://example.com/rewrite.ts"),
+            other => panic!("unexpected decision: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_callback_decision_reports_timeout_with_specifier() {
+        let err = DynamicModuleLoader::normalize_callback_decision(
+            CallbackDecisionWait::TimedOut,
+            "https://example.com/slow.ts",
+        )
+        .expect_err("timeout error");
+        assert!(err
+            .to_string()
+            .contains("Import callback timed out: https://example.com/slow.ts"));
+    }
+
+    #[test]
+    fn source_typed_wrapper_quotes_virtual_specifier() {
+        let virt = "denojs-worker://virtual/__vm_42.js";
+        let wrapper = DynamicModuleLoader::source_typed_wrapper(virt);
+        assert!(wrapper.contains("export * from \"denojs-worker://virtual/__vm_42.js\";"));
+        assert!(wrapper.contains(
+            "export { default } from \"denojs-worker://virtual/__vm_42.js\";"
+        ));
+    }
+
+    #[test]
+    fn resolve_allow_disk_or_error_produces_expected_success_and_error() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+
+        let ok = loader
+            .resolve_allow_disk_or_error("https://example.com/mod.ts", "file:///tmp/main.ts")
+            .expect("resolved");
+        assert_eq!(ok.as_str(), "https://example.com/mod.ts");
+
+        let err = loader
+            .resolve_allow_disk_or_error("@bad/bare", "file:///tmp/main.ts")
+            .expect_err("unresolved");
+        assert!(err.to_string().contains("Unable to resolve import: @bad/bare"));
+    }
+
+    #[test]
+    fn resolve_rewritten_or_error_produces_expected_success_and_error() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+
+        let ok = loader
+            .resolve_rewritten_or_error("https://example.com/rewrite.ts", "file:///tmp/main.ts")
+            .expect("resolved");
+        assert_eq!(ok.as_str(), "https://example.com/rewrite.ts");
+
+        let err = loader
+            .resolve_rewritten_or_error("@bad/rewrite", "file:///tmp/main.ts")
+            .expect_err("unresolved");
+        assert!(err
+            .to_string()
+            .contains("Unable to resolve rewritten import: @bad/rewrite"));
+    }
+
+    #[test]
+    fn build_source_typed_module_registers_virtual_module_for_js() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        let requested = Url::parse("denojs-worker://resolve?specifier=x").expect("url");
+        let _out = loader
+            .build_source_typed_module(&requested, "js", "export const x = 1;".to_string())
+            .expect("module");
+
+        let virt = "denojs-worker://virtual/__vm_1.js";
+        assert!(loader.reg.has(virt));
+    }
+
+    #[test]
+    fn build_source_typed_module_rejects_ts_when_transpile_disabled() {
+        let loader = DynamicModuleLoader {
+            module_loader: Some(ModuleLoaderConfig {
+                transpile_ts: false,
+                ..ModuleLoaderConfig::default()
+            }),
+            ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
+        };
+        let requested = Url::parse("denojs-worker://resolve?specifier=x").expect("url");
+        let err = loader
+            .build_source_typed_module(&requested, "ts", "export const x: number = 1;".to_string())
+            .expect_err("expected transpile-disabled error");
+        assert!(err.to_string().contains("TypeScript transpilation is disabled"));
+    }
+
+    #[test]
+    fn request_import_decision_returns_reply_from_node_channel() {
+        run_async(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                if let Some(NodeMsg::ImportRequest { reply, .. }) = rx.recv().await {
+                    let _ = reply.send(ImportDecision::AllowDisk);
+                }
+            });
+
+            let out = DynamicModuleLoader::request_import_decision_with_timeout(
+                &tx,
+                "https://example.com/mod.ts",
+                "file:///tmp/main.ts",
+                false,
+                Duration::from_millis(50),
+            )
+            .await
+            .expect("decision");
+            assert!(matches!(out, ImportDecision::AllowDisk));
+        });
+    }
+
+    #[test]
+    fn request_import_decision_channel_closed_maps_to_block() {
+        run_async(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                if let Some(NodeMsg::ImportRequest { .. }) = rx.recv().await {
+                    // Drop oneshot sender without replying.
+                }
+            });
+
+            let out = DynamicModuleLoader::request_import_decision_with_timeout(
+                &tx,
+                "https://example.com/mod.ts",
+                "file:///tmp/main.ts",
+                false,
+                Duration::from_millis(50),
+            )
+            .await
+            .expect("decision");
+            assert!(matches!(out, ImportDecision::Block));
+        });
+    }
+
+    #[test]
+    fn request_import_decision_timeout_returns_error() {
+        run_async(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                if let Some(NodeMsg::ImportRequest { .. }) = rx.recv().await {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+
+            let err = DynamicModuleLoader::request_import_decision_with_timeout(
+                &tx,
+                "https://example.com/slow.ts",
+                "file:///tmp/main.ts",
+                true,
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("timeout");
+            assert!(err
+                .to_string()
+                .contains("Import callback timed out: https://example.com/slow.ts"));
+        });
+    }
+
+    #[test]
+    fn request_import_decision_unavailable_when_channel_closed() {
+        run_async(async {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+
+            let err = DynamicModuleLoader::request_import_decision_with_timeout(
+                &tx,
+                "https://example.com/mod.ts",
+                "file:///tmp/main.ts",
+                false,
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("closed");
+            assert!(err.to_string().contains("Imports callback unavailable"));
+        });
     }
 }
