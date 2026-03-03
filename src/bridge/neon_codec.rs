@@ -718,13 +718,9 @@ pub fn from_neon_value<'a, C: Context<'a>>(
         }
     }
 
-    // Structured values (objects/arrays): prefer JSON-with-tags via replacer, then v8 serialize fallback.
+    // Structured values (objects/arrays): prefer V8 structured clone first,
+    // then JSON-with-tags via replacer fallback for non-cloneable host objects.
     if value.is_a::<JsArray, _>(cx) || value.is_a::<JsObject, _>(cx) {
-        if let Some(j) = try_json_stringify_with_replacer(cx, value) {
-            return Ok(JsValueBridge::Json(j));
-        }
-
-        // Last resort: V8 serializer (requires globalThis.__v8 polyfill on Node side).
         let v8_attempt: Option<JsValueBridge> = cx
             .try_catch(|cx| {
                 let v8obj = cx.global::<JsObject>("__v8")?;
@@ -746,6 +742,10 @@ pub fn from_neon_value<'a, C: Context<'a>>(
 
         if let Some(v) = v8_attempt {
             return Ok(v);
+        }
+
+        if let Some(j) = try_json_stringify_with_replacer(cx, value) {
+            return Ok(JsValueBridge::Json(j));
         }
 
         return Ok(JsValueBridge::Undefined);

@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -223,6 +223,7 @@ pub struct DynamicModuleLoader {
     pub fs_loader: Arc<deno_core::FsModuleLoader>,
     pub module_loader: Option<crate::worker::state::ModuleLoaderConfig>,
     pub permissions: Option<serde_json::Value>,
+    pub eval_sync_active: Option<Arc<AtomicBool>>,
 }
 
 impl DynamicModuleLoader {
@@ -466,6 +467,7 @@ impl DynamicModuleLoader {
             fs_loader: self.fs_loader.clone(),
             module_loader: self.module_loader.clone(),
             permissions: self.permissions.clone(),
+            eval_sync_active: self.eval_sync_active.clone(),
         }
     }
 
@@ -980,6 +982,17 @@ impl ModuleLoader for DynamicModuleLoader {
             self.imports_policy,
             crate::worker::state::ImportsPolicy::Callback
         ) {
+            if self
+                .eval_sync_active
+                .as_ref()
+                .map(|v| v.load(Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(
+                    "Import callbacks are unavailable during evalSync. Use eval() instead.",
+                )));
+            }
+
             let node_tx = self.node_tx.clone();
             let fs_loader = self.fs_loader.clone();
             let this_loader = self.clone_for_async();
@@ -1253,6 +1266,7 @@ mod tests {
                 ..ModuleLoaderConfig::default()
             }),
             permissions: Some(permissions),
+            eval_sync_active: None,
         }
     }
 

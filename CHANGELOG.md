@@ -42,7 +42,9 @@ All notable changes to this project will be documented in this file.
 - Replaced per-eval timeout thread spawning with a dedicated timer watchdog thread and channel-based scheduling.
 - Switched global worker registry locking from `Mutex<HashMap<...>>` to `RwLock<HashMap<...>>` to reduce read-path contention.
 - Reordered V8 object serialization fallback to prefer structured clone (`ValueSerializer`) before JSON stringification.
+- Reordered Node->Deno Neon codec structured-value fallback to prefer native `__v8.serialize` before JSON stringify/replacer fallback.
 - Updated inspect option normalization/parsing to allow `port: 0` for OS-assigned ephemeral debugging ports.
+- Reduced bridge conversion overhead for plain Deno objects/arrays by short-circuiting `serde_v8` output directly to `JsValueBridge::Json` when no wire markers are present (avoids an extra `wire::from_wire_json` pass).
 
 ### Fixed
 - Fixed promise settlement channel behavior to avoid dropped completions under load (`send` instead of non-blocking `try_send`).
@@ -55,6 +57,7 @@ All notable changes to this project will be documented in this file.
 - Fixed example scripts and local import paths so examples run from this repository.
 - Fixed outdated env permission test expectations to match the new explicit-permissions behavior.
 - Fixed potential leaks of never-loaded ephemeral virtual modules by removing eval-module virtual entries when module startup fails.
+- Fixed a deadlock path where `evalSync` could stall forever when dynamic imports required the host `imports` callback; import-callback loads are now rejected while sync eval is active.
 
 ### Security
 - Improved module loading safety by enforcing clearer permission boundaries for HTTPS/remote loads.

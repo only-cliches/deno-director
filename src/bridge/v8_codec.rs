@@ -651,7 +651,10 @@ pub fn from_v8<'s, 'p>(
         }
 
         if let Ok(j) = serde_v8::from_v8::<serde_json::Value>(ps, value) {
-            return Ok(wire::from_wire_json(j));
+            if json_contains_wire_markers(&j) {
+                return Ok(wire::from_wire_json(j));
+            }
+            return Ok(JsValueBridge::Json(j));
         }
 
         // Prefer V8 serializer before JSON.stringify so large/complex objects
@@ -676,7 +679,10 @@ pub fn from_v8<'s, 'p>(
         }
 
         if let Some(j) = try_json_stringify(ps, value) {
-            return Ok(wire::from_wire_json(j));
+            if json_contains_wire_markers(&j) {
+                return Ok(wire::from_wire_json(j));
+            }
+            return Ok(JsValueBridge::Json(j));
         }
     }
 

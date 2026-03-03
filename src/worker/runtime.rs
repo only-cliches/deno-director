@@ -313,6 +313,7 @@ pub fn spawn_worker_thread(
                 fs_loader: Arc::new(deno_core::FsModuleLoader),
                 module_loader: limits.module_loader.clone(),
                 permissions: limits.permissions.clone(),
+                eval_sync_active: Some(eval_sync_active.clone()),
             });
 
             let permissions = permissions_from_limits(&limits, &cwd_path);
