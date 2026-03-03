@@ -547,6 +547,7 @@ let nextWorkerStreamId = 1;
 globalThis.__nodeIncomingStreams = new Map();
 globalThis.__nodePendingStreamAccepts = new Map();
 globalThis.__nodeStreamBacklog = new Map();
+globalThis.__nodePendingIncomingStreamFrames = new Map();
 globalThis.__nodeStreamById = new Map();
 globalThis.__nodeStreamNameToId = new Map();
 globalThis.__nodeStreamWriterCredits = new Map();
@@ -774,6 +775,7 @@ function tryReleaseStream(id) {
   if (!meta.localDiscarded || !meta.remoteDiscarded) return;
   globalThis.__nodeStreamById.delete(id);
   globalThis.__nodeIncomingStreams.delete(id);
+  globalThis.__nodePendingIncomingStreamFrames.delete(id);
   const activeId = globalThis.__nodeStreamNameToId.get(meta.name);
   if (activeId === id) globalThis.__nodeStreamNameToId.delete(meta.name);
   globalThis.__nodeStreamWriterCredits.delete(id);
@@ -824,8 +826,16 @@ function markRemoteDiscard(id) {
 }
 
 function rejectIncomingOpen(id, reason) {
+  globalThis.__nodePendingIncomingStreamFrames.delete(id);
   hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "error", id, error: reason }));
   hostPostMessageImpl(encodeStreamFrameEnvelope({ t: "discard", id }));
+}
+
+function queuePendingIncomingStreamFrame(frame) {
+  const queued = globalThis.__nodePendingIncomingStreamFrames.get(frame.id) || [];
+  if (queued.length >= 256) queued.shift();
+  queued.push(frame);
+  globalThis.__nodePendingIncomingStreamFrames.set(frame.id, queued);
 }
 
 function makeStreamReader(id) {
@@ -974,11 +984,21 @@ function handleIncomingStreamFrame(frame) {
       reader.setOnChunkConsumed((bytes) => queueStreamCredit(frame.id, bytes));
       globalThis.__nodeIncomingStreams.set(frame.id, reader);
       queueAcceptedStream(key, reader);
+      const pending = globalThis.__nodePendingIncomingStreamFrames.get(frame.id);
+      if (Array.isArray(pending) && pending.length > 0) {
+        globalThis.__nodePendingIncomingStreamFrames.delete(frame.id);
+        for (const queued of pending) {
+          handleIncomingStreamFrame(queued);
+        }
+      }
       return true;
     }
     case "chunk": {
       const stream = globalThis.__nodeIncomingStreams.get(frame.id);
-      if (!stream) return true;
+      if (!stream) {
+        if (!globalThis.__nodeStreamById.has(frame.id)) queuePendingIncomingStreamFrame(frame);
+        return true;
+      }
       const chunk = frame.chunk ? toStreamChunk(frame.chunk) : null;
       if (!chunk) {
         stream.errorRemote(new Error("Invalid stream chunk"));
@@ -989,19 +1009,28 @@ function handleIncomingStreamFrame(frame) {
     }
     case "close": {
       const stream = globalThis.__nodeIncomingStreams.get(frame.id);
-      if (!stream) return true;
+      if (!stream) {
+        if (!globalThis.__nodeStreamById.has(frame.id)) queuePendingIncomingStreamFrame(frame);
+        return true;
+      }
       stream.closeRemote();
       return true;
     }
     case "error": {
       const stream = globalThis.__nodeIncomingStreams.get(frame.id);
-      if (!stream) return true;
+      if (!stream) {
+        if (!globalThis.__nodeStreamById.has(frame.id)) queuePendingIncomingStreamFrame(frame);
+        return true;
+      }
       stream.errorRemote(new Error(frame.error || "Remote stream error"));
       return true;
     }
     case "cancel": {
       const stream = globalThis.__nodeIncomingStreams.get(frame.id);
-      if (!stream) return true;
+      if (!stream) {
+        if (!globalThis.__nodeStreamById.has(frame.id)) queuePendingIncomingStreamFrame(frame);
+        return true;
+      }
       stream.errorRemote(new Error(frame.reason || "Remote stream cancelled"));
       return true;
     }

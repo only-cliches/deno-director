@@ -1,11 +1,13 @@
 use deno_runtime::deno_core::{JsBuffer, OpState, op2};
 use tokio::sync::oneshot;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::bridge::types::JsValueBridge;
 use crate::worker::env::{EnvRuntimeState, valid_env_key};
 use crate::worker::messages::NodeMsg;
 use crate::worker::op_reply::{err_reply, err_wire, ok_reply, ok_wire};
 use crate::worker::runtime::WorkerOpContext;
+use std::time::{Duration, Instant};
 
 fn ctx_from_state(state: &OpState) -> Option<WorkerOpContext> {
     state.try_borrow::<WorkerOpContext>().cloned()
@@ -39,6 +41,33 @@ fn host_call_blocked_during_evalsync(ctx: &WorkerOpContext) -> Option<serde_json
     None
 }
 
+enum NodeSendWaitError {
+    Closed,
+    TimedOut,
+}
+
+fn send_node_msg_wait(
+    tx: &tokio::sync::mpsc::Sender<NodeMsg>,
+    msg: NodeMsg,
+    timeout: Duration,
+) -> Result<(), NodeSendWaitError> {
+    let deadline = Instant::now() + timeout;
+    let mut pending = msg;
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Closed(_)) => return Err(NodeSendWaitError::Closed),
+            Err(TrySendError::Full(msg)) => {
+                if Instant::now() >= deadline {
+                    return Err(NodeSendWaitError::TimedOut);
+                }
+                pending = msg;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 // Worker -> Node: hostPostMessage() op
 #[op2]
 pub fn op_denojs_worker_post_message(state: &mut OpState, #[serde] msg: serde_json::Value) -> bool {
@@ -48,7 +77,12 @@ pub fn op_denojs_worker_post_message(state: &mut OpState, #[serde] msg: serde_js
 
     // Input is wire-JSON from bootstrap hostPostMessage wrapper.
     let value: JsValueBridge = crate::bridge::wire::from_wire_json(msg);
-    ctx.node_tx.try_send(NodeMsg::EmitMessage { value }).is_ok()
+    send_node_msg_wait(
+        &ctx.node_tx,
+        NodeMsg::EmitMessage { value },
+        Duration::from_secs(2),
+    )
+    .is_ok()
 }
 
 // Worker -> Node: hostPostMessage() binary fast path
@@ -59,7 +93,12 @@ pub fn op_denojs_worker_post_message_bin(state: &mut OpState, #[buffer] msg: JsB
     };
 
     let value = bytes_to_u8_bridge(&msg);
-    ctx.node_tx.try_send(NodeMsg::EmitMessage { value }).is_ok()
+    send_node_msg_wait(
+        &ctx.node_tx,
+        NodeMsg::EmitMessage { value },
+        Duration::from_secs(2),
+    )
+    .is_ok()
 }
 
 // Worker -> Node: host function call (sync)
@@ -91,18 +130,22 @@ pub fn op_denojs_worker_host_call_sync(
     // Sync host calls use std::mpsc because op2 sync handlers cannot await.
     let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
 
-    if ctx
-        .node_tx
-        .try_send(NodeMsg::InvokeHostFunctionSync {
+    if let Err(e) = send_node_msg_wait(
+        &ctx.node_tx,
+        NodeMsg::InvokeHostFunctionSync {
             func_id: func_id as usize,
             args: bridged_args,
             reply: tx,
-        })
-        .is_err()
-    {
+        },
+        Duration::from_secs(5),
+    ) {
+        let msg = match e {
+            NodeSendWaitError::Closed => "Node channel closed",
+            NodeSendWaitError::TimedOut => "Node channel saturated",
+        };
         return serde_json::json!({
             "ok": false,
-            "error": err_wire("HostFunctionError", "Node channel full or closed")
+            "error": err_wire("HostFunctionError", msg)
         });
     }
 
@@ -147,18 +190,22 @@ pub fn op_denojs_worker_host_call_sync_bin(
     let bridged_args = vec![bytes_to_u8_bridge(&arg)];
     let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
 
-    if ctx
-        .node_tx
-        .try_send(NodeMsg::InvokeHostFunctionSync {
+    if let Err(e) = send_node_msg_wait(
+        &ctx.node_tx,
+        NodeMsg::InvokeHostFunctionSync {
             func_id: func_id as usize,
             args: bridged_args,
             reply: tx,
-        })
-        .is_err()
-    {
+        },
+        Duration::from_secs(5),
+    ) {
+        let msg = match e {
+            NodeSendWaitError::Closed => "Node channel closed",
+            NodeSendWaitError::TimedOut => "Node channel saturated",
+        };
         return serde_json::json!({
             "ok": false,
-            "error": err_wire("HostFunctionError", "Node channel full or closed")
+            "error": err_wire("HostFunctionError", msg)
         });
     }
 
@@ -205,18 +252,22 @@ pub fn op_denojs_worker_host_call_sync_bin_mixed(
     bridged_args.extend(rest.into_iter().map(crate::bridge::wire::from_wire_json));
 
     let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
-    if ctx
-        .node_tx
-        .try_send(NodeMsg::InvokeHostFunctionSync {
+    if let Err(e) = send_node_msg_wait(
+        &ctx.node_tx,
+        NodeMsg::InvokeHostFunctionSync {
             func_id: func_id as usize,
             args: bridged_args,
             reply: tx,
-        })
-        .is_err()
-    {
+        },
+        Duration::from_secs(5),
+    ) {
+        let msg = match e {
+            NodeSendWaitError::Closed => "Node channel closed",
+            NodeSendWaitError::TimedOut => "Node channel saturated",
+        };
         return serde_json::json!({
             "ok": false,
-            "error": err_wire("HostFunctionError", "Node channel full or closed")
+            "error": err_wire("HostFunctionError", msg)
         });
     }
 

@@ -35,6 +35,7 @@ use std::sync::{
 use std::thread;
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 #[derive(Clone)]
 pub struct WorkerOpContext {
@@ -216,7 +217,8 @@ fn mark_worker_closed(worker_id: usize) {
 pub fn spawn_worker_thread(
     worker_id: usize,
     limits: RuntimeLimits,
-    mut deno_rx: mpsc::Receiver<DenoMsg>,
+    mut deno_control_rx: mpsc::Receiver<DenoMsg>,
+    mut deno_data_rx: mpsc::Receiver<DenoMsg>,
     mut node_rx: mpsc::Receiver<NodeMsg>,
 ) {
     thread::spawn(move || {
@@ -442,10 +444,52 @@ pub fn spawn_worker_thread(
                 }
             });
 
-            while let Some(dmsg) = deno_rx.recv().await {
-                let should_close = handle_deno_msg(&mut worker, worker_id, &limits, dmsg).await;
-                if should_close {
-                    break;
+            let mut control_open = true;
+            let mut data_open = true;
+            while control_open || data_open {
+                tokio::select! {
+                    biased;
+                    dmsg = deno_control_rx.recv(), if control_open => {
+                        match dmsg {
+                            Some(dmsg) => {
+                                let mut close_requested = false;
+                                // Drain already-queued data frames before running the next
+                                // control message. This avoids deadlock when eval waits on
+                                // stream/postMessage data that is already queued.
+                                for _ in 0..1024 {
+                                    match deno_data_rx.try_recv() {
+                                        Ok(data_msg) => {
+                                            let should_close = handle_deno_msg(&mut worker, worker_id, &limits, data_msg).await;
+                                            if should_close {
+                                                close_requested = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(TryRecvError::Empty) => break,
+                                        Err(TryRecvError::Disconnected) => {
+                                            data_open = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if close_requested {
+                                    break;
+                                }
+                                let should_close = handle_deno_msg(&mut worker, worker_id, &limits, dmsg).await;
+                                if should_close { break; }
+                            }
+                            None => control_open = false,
+                        }
+                    }
+                    dmsg = deno_data_rx.recv(), if data_open => {
+                        match dmsg {
+                            Some(dmsg) => {
+                                let should_close = handle_deno_msg(&mut worker, worker_id, &limits, dmsg).await;
+                                if should_close { break; }
+                            }
+                            None => data_open = false,
+                        }
+                    }
                 }
             }
 

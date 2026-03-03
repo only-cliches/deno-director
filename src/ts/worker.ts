@@ -383,6 +383,7 @@ export class DenoWorker {
         Array<{ minBytes: number; resolve: () => void; reject: (e: unknown) => void }>
     >();
     private readonly pendingCreditFrames = new Map<string, number>();
+    private readonly pendingIncomingStreamFrames = new Map<string, StreamFrame[]>();
     private streamCreditFlushQueued = false;
     private readonly streamWindowBytes: number;
     private readonly streamCreditFlushBytes: number;
@@ -582,7 +583,7 @@ export class DenoWorker {
         if (typeof (this.native as any).postMessages === "function") {
             const sent = (this.native as any).postMessages(raw);
             if (sent !== raw.length) {
-                throw new Error("DenoWorker.postMessages dropped: worker queue full or closed");
+                throw new Error("DenoWorker.postMessages failed: worker is closed");
             }
             return;
         }
@@ -682,6 +683,7 @@ export class DenoWorker {
         if (!meta.localDiscarded || !meta.remoteDiscarded) return;
         this.streamById.delete(id);
         this.streamIncoming.delete(id);
+        this.pendingIncomingStreamFrames.delete(id);
         this.pendingCreditFrames.delete(id);
         this.streamWriterCredits.delete(id);
         const waiters = this.streamWriterWaiters.get(id);
@@ -694,6 +696,7 @@ export class DenoWorker {
     }
 
     private rejectIncomingOpen(id: string, name: string, reason: string): void {
+        this.pendingIncomingStreamFrames.delete(id);
         this.emitStreamFrame({ t: "error", id, error: reason });
         this.emitStreamFrame({ t: "discard", id });
     }
@@ -706,6 +709,13 @@ export class DenoWorker {
             return;
         }
         this.streamBacklog.set(name, reader);
+    }
+
+    private queuePendingIncomingStreamFrame(frame: StreamFrame): void {
+        const queued = this.pendingIncomingStreamFrames.get(frame.id) || [];
+        if (queued.length >= 256) queued.shift();
+        queued.push(frame);
+        this.pendingIncomingStreamFrames.set(frame.id, queued);
     }
 
     private handleIncomingStreamFrame(payload: unknown): boolean {
@@ -736,11 +746,21 @@ export class DenoWorker {
                 });
                 this.streamIncoming.set(frame.id, reader);
                 this.queueAcceptedStream(key, reader);
+                const pending = this.pendingIncomingStreamFrames.get(frame.id);
+                if (pending && pending.length > 0) {
+                    this.pendingIncomingStreamFrames.delete(frame.id);
+                    for (const queued of pending) {
+                        this.handleIncomingStreamFrame(queued);
+                    }
+                }
                 return true;
             }
             case "chunk": {
                 const target = this.streamIncoming.get(frame.id);
-                if (!target) return true;
+                if (!target) {
+                    if (!this.streamById.has(frame.id)) this.queuePendingIncomingStreamFrame(frame);
+                    return true;
+                }
                 const chunk = frame.chunk instanceof Uint8Array ? frame.chunk : null;
                 if (!(chunk instanceof Uint8Array)) {
                     target.errorRemote(new Error(`Invalid stream chunk for ${frame.id}`));
@@ -751,19 +771,28 @@ export class DenoWorker {
             }
             case "close": {
                 const target = this.streamIncoming.get(frame.id);
-                if (!target) return true;
+                if (!target) {
+                    if (!this.streamById.has(frame.id)) this.queuePendingIncomingStreamFrame(frame);
+                    return true;
+                }
                 target.closeRemote();
                 return true;
             }
             case "error": {
                 const target = this.streamIncoming.get(frame.id);
-                if (!target) return true;
+                if (!target) {
+                    if (!this.streamById.has(frame.id)) this.queuePendingIncomingStreamFrame(frame);
+                    return true;
+                }
                 target.errorRemote(new Error(frame.error || "Remote stream error"));
                 return true;
             }
             case "cancel": {
                 const target = this.streamIncoming.get(frame.id);
-                if (!target) return true;
+                if (!target) {
+                    if (!this.streamById.has(frame.id)) this.queuePendingIncomingStreamFrame(frame);
+                    return true;
+                }
                 target.errorRemote(new Error(frame.reason || "Remote stream cancelled"));
                 return true;
             }
@@ -788,6 +817,7 @@ export class DenoWorker {
         this.streamById.clear();
         this.streamNameToId.clear();
         this.streamBacklog.clear();
+        this.pendingIncomingStreamFrames.clear();
         this.pendingCreditFrames.clear();
         this.streamWriterCredits.clear();
         for (const waiters of this.streamWriterWaiters.values()) {
@@ -944,7 +974,7 @@ export class DenoWorker {
     /**
      * Post a message into the runtime event channel.
      *
-     * Throws when queue is full or runtime is closed.
+     * Throws when runtime is closed.
      */
     postMessage(msg: any): void {
         const payload =
@@ -954,11 +984,11 @@ export class DenoWorker {
 
     private postMessageRaw(msg: any): void {
         if (this.isClosed()) {
-            throw new Error("DenoWorker.postMessage dropped: worker queue full or closed");
+            throw new Error("DenoWorker.postMessage failed: worker is closed");
         }
         const ok = this.native.postMessage(msg);
         if (!ok) {
-            throw new Error("DenoWorker.postMessage dropped: worker queue full or closed");
+            throw new Error("DenoWorker.postMessage failed: worker is closed");
         }
     }
 
@@ -966,11 +996,11 @@ export class DenoWorker {
      * Batch enqueue variant of {@link postMessage}.
      *
      * Returns the number of messages accepted by the native queue.
-     * Throws if worker is closed or any message in the batch is dropped.
+     * Throws if worker is closed.
      */
     postMessages(msgs: any[]): number {
         if (this.isClosed()) {
-            throw new Error("DenoWorker.postMessages dropped: worker queue full or closed");
+            throw new Error("DenoWorker.postMessages failed: worker is closed");
         }
         if (!Array.isArray(msgs) || msgs.length === 0) return 0;
 
@@ -979,7 +1009,7 @@ export class DenoWorker {
         );
         const sent = (this.native as any).postMessages(payloads) as number;
         if (sent !== payloads.length) {
-            throw new Error("DenoWorker.postMessages dropped: worker queue full or closed");
+            throw new Error("DenoWorker.postMessages failed: worker is closed");
         }
         return sent;
     }
@@ -1238,14 +1268,29 @@ export class DenoWorker {
             this.failAllStreams("DenoWorker force-closed");
             this.rejectInFlight(new Error("DenoWorker force-closed"));
             this.closed = true;
+            try {
+                oldNative.forceDispose?.();
+            } catch {
+                // ignore
+            }
 
             this.closePromise = Promise.resolve().then(() => {
                 this.emitCloseHandlers();
                 this.invokeHook("afterStop", { requested: true });
             });
 
-            void oldNative.close().catch(() => undefined);
-            await this.closePromise;
+            // Force-close is immediate for wrapper callers, but still wait a bounded
+            // amount for native teardown so Neon thread-safe handles do not linger.
+            const nativeCloseAttempt = Promise.race([
+                oldNative.close().catch(() => undefined),
+                new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+            ]);
+            await Promise.all([this.closePromise, nativeCloseAttempt]);
+            try {
+                if (oldNative.__isRegistered?.()) oldNative.forceDispose?.();
+            } catch {
+                // ignore
+            }
             return;
         }
 
@@ -1269,6 +1314,11 @@ export class DenoWorker {
             });
 
         await this.closePromise;
+        try {
+            if (this.native.__isRegistered?.()) this.native.forceDispose?.();
+        } catch {
+            // ignore
+        }
     }
 
     /**
@@ -1330,14 +1380,20 @@ export class DenoWorker {
      *
      * If evaluated source resolves to a Promise, this method waits until fulfillment/rejection.
      */
-    async eval(src: string, options?: EvalOptions): Promise<any> {
-        await this.startupPromise;
-        try {
-            const raw = await this.trackInFlight(this.native.eval(src, normalizeEvalOptions(options)));
-            return hydrateFromWire(raw);
-        } catch (e) {
-            throw hydrateFromWire(e);
-        }
+    eval(src: string, options?: EvalOptions): Promise<any> {
+        const op = (async () => {
+            await this.startupPromise;
+            try {
+                const raw = await this.trackInFlight(this.native.eval(src, normalizeEvalOptions(options)));
+                return hydrateFromWire(raw);
+            } catch (e) {
+                throw hydrateFromWire(e);
+            }
+        })();
+        // Keep rejection semantics unchanged for callers while preventing
+        // transient "unhandled rejection" races when handlers are attached later.
+        void op.catch(() => undefined);
+        return op;
     }
 
     /**

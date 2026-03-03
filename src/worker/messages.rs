@@ -62,6 +62,12 @@ pub enum DenoMsg {
     },
 }
 
+impl DenoMsg {
+    pub fn is_data_plane(&self) -> bool {
+        matches!(self, DenoMsg::PostMessage { .. })
+    }
+}
+
 pub enum ResolvePayload {
     Void,
     Json(serde_json::Value),

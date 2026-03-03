@@ -677,6 +677,10 @@ export type NativeWorker = {
 
     /** Close runtime gracefully. */
     close(): Promise<void>;
+    /** Immediate best-effort native handle disposal used by force close. */
+    forceDispose?: () => void;
+    /** Internal helper to check native registry membership. */
+    __isRegistered?: () => boolean;
     /** Fetch runtime memory statistics. */
     memory(): Promise<any>;
     /** Set a global value inside runtime context. */

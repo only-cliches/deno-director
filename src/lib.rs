@@ -3,7 +3,6 @@ use neon::prelude::*;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicUsize;
-use tokio::sync::mpsc::error::TrySendError;
 
 mod bridge;
 mod native_api;
@@ -27,43 +26,65 @@ pub(crate) fn mk_err(message: impl Into<String>) -> JsValueBridge {
     crate::bridge::errors::error("Error", message)
 }
 
-pub(crate) fn try_send_deno_msg_or_reject(tx: &tokio::sync::mpsc::Sender<DenoMsg>, msg: DenoMsg) {
-    match tx.try_send(msg) {
-        Ok(()) => {}
-        Err(TrySendError::Full(msg)) | Err(TrySendError::Closed(msg)) => match msg {
+pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
+    tx: tokio::sync::mpsc::Sender<DenoMsg>,
+    msg: DenoMsg,
+) {
+    if let Err(err) = tx.blocking_send(msg) {
+        match err.0 {
             DenoMsg::Eval {
                 deferred: Some(deferred),
                 ..
-            } => {
-                deferred.reject_with_error("Runtime is closed or request queue is full");
-            }
-
+            } => deferred.reject_with_error("Runtime is closed"),
             DenoMsg::Close { deferred }
             | DenoMsg::Memory { deferred }
-            | DenoMsg::SetGlobal { deferred, .. } => {
-                deferred.reject_with_error("Runtime is closed or request queue is full");
-            }
-
+            | DenoMsg::SetGlobal { deferred, .. } => deferred.reject_with_error("Runtime is closed"),
             DenoMsg::Eval { deferred: None, .. } | DenoMsg::PostMessage { .. } => {}
-        },
+        }
     }
 }
 
-pub(crate) fn deno_tx_for_worker(worker_id: usize) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
+pub(crate) fn deno_control_tx_for_worker(
+    worker_id: usize,
+) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
     WORKERS
         .read()
         .ok()
         .and_then(|map| map.get(&worker_id).map(|w| w.deno_tx.clone()))
 }
 
+pub(crate) fn deno_data_tx_for_worker(worker_id: usize) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
+    WORKERS
+        .read()
+        .ok()
+        .and_then(|map| map.get(&worker_id).map(|w| w.deno_data_tx.clone()))
+}
+
 pub(crate) fn queue_deno_msg_or_reject<F>(worker_id: usize, settler: PromiseSettler, mk_msg: F)
 where
     F: FnOnce(PromiseSettler) -> DenoMsg,
 {
-    if let Some(tx) = deno_tx_for_worker(worker_id) {
-        try_send_deno_msg_or_reject(&tx, mk_msg(settler));
+    let msg = mk_msg(settler);
+    let tx = if msg.is_data_plane() {
+        deno_data_tx_for_worker(worker_id)
     } else {
-        settler.reject_with_value_via_channel(mk_err("Runtime is closed or request queue is full"));
+        deno_control_tx_for_worker(worker_id)
+    };
+    if let Some(tx) = tx {
+        queue_deno_msg_or_reject_with_backpressure(tx, msg);
+    } else {
+        match msg {
+            DenoMsg::Eval {
+                deferred: Some(deferred),
+                ..
+            } => deferred.reject_with_value_via_channel(mk_err("Runtime is closed")),
+            DenoMsg::Close { deferred }
+            | DenoMsg::Memory { deferred }
+            | DenoMsg::SetGlobal { deferred, .. } => {
+                deferred.reject_with_value_via_channel(mk_err("Runtime is closed"))
+            }
+            DenoMsg::Eval { deferred: None, .. } | DenoMsg::PostMessage { .. } => {}
+        }
     }
 }
 

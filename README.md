@@ -6,7 +6,9 @@
 
 </div>
 
----
+[![GitHub Repo stars](https://img.shields.io/github/stars/only-cliches/deno-director)](https://github.com/only-cliches/deno-director)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Node.js is legendary. Deno is secure by default. **What if you didn't have to choose?**
 
@@ -159,8 +161,19 @@ console.log(await mod.encrypt("secret")); // "c2VjcmV0"
 If you already have a module specifier, use `getModule` as a shorthand:
 
 ```ts
+const worker = new DenoWorker({
+  imports: (specifier) => {
+    if (specifier === "app:math") {
+      return { ts: "export const add = (a: number, b: number) => a + b;" };
+    }
+    return false;
+  },
+});
+
 const math = await worker.getModule("app:math");
 console.log(await math.add(2, 3)); // 5
+
+await worker.close();
 ```
 
 ### 🪄 Magic Module Resolution: The `imports` Interceptor
@@ -261,17 +274,20 @@ await worker.setGlobal("nodeFs", fs);
 await worker.setGlobal("nodeCrypto", crypto);
 
 const result = await worker.eval(`
-  // Calling Node.js fs.readFileSync synchronously from inside Deno!
-  const fileBuffer = nodeFs.readFileSync("./secrets.txt");
+  // Calling Node.js fs functions from inside Deno!
+  const cwdEntries = nodeFs.readdirSync(".");
+  const payload = new TextEncoder().encode(String(cwdEntries.length));
   
   // Calling Node's crypto module from Deno
   // this function runs in the NODE context!
   const hash = nodeCrypto.createHash("sha256");
-  hash.update(fileBuffer);
+  hash.update(payload);
   hash.digest("hex");
 `);
 
 console.log(`File hash: ${result}`);
+
+await worker.close();
 
 ```
 
@@ -283,7 +299,7 @@ Untrusted code loves to spam `console.log`. Deno Director gives you absolute aut
 
 ```ts
 // 0. Default behavior: the sandbox console is routed to stdout/stderr/etc
-const silentWorker = new DenoWorker();
+const defaultWorker = new DenoWorker();
 
 // 1. Total Silence: no console output
 const silentWorker = new DenoWorker({ console: false });
@@ -295,7 +311,7 @@ const noisyWorker = new DenoWorker({ console: console });
 const customWorker = new DenoWorker({
   console: {
     log: (...args) => myDatadogLogger.info("Deno says:", ...args),
-    // async funcitons are supported!
+    // async functions are supported!
     error: async (...args) => await PagerDuty.alert("Deno crashed:", ...args),
     warn: false, // Drop warnings into the void
     debug: undefined // Fallback to default Deno behavior
@@ -303,6 +319,38 @@ const customWorker = new DenoWorker({
 });
 
 ```
+
+### Function Calls with `args`
+
+Use `options.args` to call a function value produced by `eval`/`evalSync`.
+
+```ts
+import { DenoWorker } from "deno-director";
+
+const worker = new DenoWorker();
+
+// Call a global function in the deno runtime ....
+// passing in args from the Node runtime
+const json_val = await worker.eval("JSON.parse", { args: ['{"key": "value"}'] });
+console.log(json_val); // {key: "value"}
+
+// Same pattern with inline functions and expressions.
+// promises automatically resolve across the call boundary
+const product = await worker.eval("async (a, b) => a * b", { args: [3, 4] });
+console.log(product); // 12
+
+// evalSync also supports args
+// even without await, promises resolve across the call boundary
+const out = worker.evalSync("async (name) => `hi ${name}`", { args: ["director"] });
+console.log(out); // "hi director"
+
+await worker.close();
+```
+
+Notes:
+- If `args` are provided (even empty `[]`) and the evaluated value is callable, the function is invoked with those args.
+- If `args` are omitted, function values are not auto-called.
+- If `args` are provided but the evaluated value is not callable, the value is returned as-is.
 ---
 
 ### 🧩 nodeCompat and nodeResolve Examples
@@ -334,10 +382,10 @@ const resolveWorker = new DenoWorker({
 });
 
 const resolveOut = await resolveWorker.evalModule(`
-  import pkg from "some-installed-package";
-  export const name = typeof pkg;
+  import path from "path";
+  export const base = path.basename("/tmp/some-installed-package");
 `);
-console.log(resolveOut.name);
+console.log(resolveOut.base); // "some-installed-package"
 
 await resolveWorker.close();
 ```
@@ -348,21 +396,24 @@ You can stream byte chunks between Node and the worker runtime in both direction
 
 ```ts
 import { DenoWorker } from "deno-director";
+import { randomUUID } from "node:crypto";
 
 const worker = new DenoWorker();
 const upload = worker.stream.create();
 const uploadKey = upload.getKey();
-const downloadKey = crypto.randomUUID();
+const downloadKey = randomUUID();
+const readerPromise = worker.stream.accept(downloadKey);
 
 await worker.eval(`
-  async (uploadKey, downloadKey) => {
+  // Launch a task that consumes Node -> worker bytes and then emits worker -> Node bytes.
+  globalThis.__streamTask = (async () => {
     const inStream = await hostStreams.accept(uploadKey);
     for await (const _chunk of inStream) {}
 
     const outStream = hostStreams.create(downloadKey);
     await outStream.write(new TextEncoder().encode("ok"));
     await outStream.close();
-  }
+  })();
 `, { args: [uploadKey, downloadKey] });
 
 // Node -> worker
@@ -371,10 +422,13 @@ await upload.write(new TextEncoder().encode("world"));
 await upload.close();
 
 // worker -> Node
-const reader = await worker.stream.accept(downloadKey);
+const reader = await readerPromise;
 for await (const chunk of reader) {
   console.log("download chunk bytes:", chunk.byteLength);
 }
+
+// Ensure worker-side stream task has finished.
+await worker.eval("__streamTask");
 
 await worker.close();
 ```
@@ -401,6 +455,8 @@ await outStream.close();
 By default, Deno Director locks down environment variables.  You can inject explicit key value pairs, or have the worker dynamically load a `.env` file from disk.
 
 ```ts
+import { DenoWorker } from "deno-director";
+
 const worker = new DenoWorker({
   // 1. Explicitly pass a map of variables
   env: {
@@ -420,12 +476,15 @@ await worker.eval(`
   const pass = Deno.env.get("DB_PASS"); // "super_secret"
 `);
 
+await worker.close();
 ```
 
 Permission note:
 - If you provide `env` as a map and `permissions.env` is missing (or `[]`), the runtime auto-populates `permissions.env` with those env-map keys.
 - If `permissions.env` is already set, it is not changed.
 - If configured env keys are not readable under `permissions.env`, startup emits a warning.
+
+
 
 ---
 

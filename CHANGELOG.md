@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Added a stream regression spec in `test-ts/streams.spec.ts`:
+  - `Node -> worker stream survives frames arriving before worker accepts`
+  - Covers the race where `open/chunk/close` can arrive before `hostStreams.accept(...)` is called.
+
+### Fixed
+- Fixed stream frame ordering race on both sides of the bridge (`src/ts/worker.ts`, `src/worker/bootstrap.js`):
+  - `chunk/close/error/cancel` frames arriving before `open` are now queued per stream id and replayed after `open`.
+  - Prevents Node->worker stream hangs when producer closes quickly before consumer attaches.
+- Fixed README examples that were not directly runnable as written:
+  - corrected invalid/placeholder snippets (`getModule`, node-resolve example, console snippet variable naming, args section typo),
+  - updated streaming section to safer key/import usage and explicit worker task completion.
+
 ## [0.8.5] - 2026-03-02
 
 ### Added

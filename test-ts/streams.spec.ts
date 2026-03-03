@@ -241,6 +241,40 @@ describe("deno_worker: streams bridge", () => {
     }
   });
 
+  test("Node -> worker stream survives frames arriving before worker accepts", async () => {
+    dw = createTestWorker();
+
+    const w = dw.stream.create("late-accept");
+    await w.write(new TextEncoder().encode("hello "));
+    await w.write(new TextEncoder().encode("world"));
+    await w.close();
+
+    const consumed = await Promise.race([
+      dw.eval(`
+        (async () => {
+          // Ensure this starts after Node has already sent open/chunk/close.
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          const s = await hostStreams.accept("late-accept");
+          const chunks = [];
+          for await (const chunk of s) chunks.push(chunk);
+          const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+          const merged = new Uint8Array(total);
+          let off = 0;
+          for (const c of chunks) {
+            merged.set(c, off);
+            off += c.byteLength;
+          }
+          return new TextDecoder().decode(merged);
+        })()
+      `),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timed out waiting for late-accept stream consumption")), 1500),
+      ),
+    ]);
+
+    expect(consumed).toBe("hello world");
+  });
+
   test("stream.create without key generates a secure key", async () => {
     dw = createTestWorker();
     const writer = dw.stream.create();

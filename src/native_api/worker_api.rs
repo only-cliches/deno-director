@@ -7,11 +7,13 @@ use crate::bridge::promise::PromiseSettler;
 use crate::bridge::tags::{TYPE_FUNCTION, TYPE_KEY};
 use crate::bridge::types::JsValueBridge;
 use crate::queue_deno_msg_or_reject;
-use crate::try_send_deno_msg_or_reject;
 use crate::worker;
 use crate::worker::messages::{DenoMsg, EvalReply};
 use crate::worker::state::WorkerHandle;
-use crate::{NEXT_ID, WORKERS, deno_tx_for_worker, mk_err, parse_eval_options};
+use crate::{
+    NEXT_ID, WORKERS, deno_control_tx_for_worker, deno_data_tx_for_worker, mk_err,
+    parse_eval_options,
+};
 use neon::result::Throw;
 use neon::types::JsDate;
 
@@ -425,7 +427,8 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let channel = cx.channel();
 
-    let (handle, deno_rx, node_rx) = WorkerHandle::new(id, channel.clone(), opts.channel_size);
+    let (handle, deno_rx, deno_data_rx, node_rx) =
+        WorkerHandle::new(id, channel.clone(), opts.channel_size);
 
     {
         let mut map = WORKERS
@@ -466,7 +469,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         }
     }
 
-    worker::runtime::spawn_worker_thread(id, opts.runtime_options, deno_rx, node_rx);
+    worker::runtime::spawn_worker_thread(id, opts.runtime_options, deno_rx, deno_data_rx, node_rx);
 
     let api = cx.empty_object();
 
@@ -477,7 +480,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             let value = cx.argument::<JsValue>(0)?;
             let msg = crate::bridge::neon_codec::from_neon_value(&mut cx, value)?;
 
-            let tx = deno_tx_for_worker(id2);
+            let tx = deno_data_tx_for_worker(id2);
 
             let Some(tx) = tx else {
                 if strict_channel() {
@@ -486,11 +489,11 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 return Ok(cx.boolean(false));
             };
 
-            match tx.try_send(DenoMsg::PostMessage { value: msg }) {
+            match tx.blocking_send(DenoMsg::PostMessage { value: msg }) {
                 Ok(()) => Ok(cx.boolean(true)),
                 Err(_) => {
                     if strict_channel() {
-                        cx.throw_error("postMessage dropped: worker queue full or closed")
+                        cx.throw_error("Runtime is closed (postMessage)")
                     } else {
                         Ok(cx.boolean(false))
                     }
@@ -510,7 +513,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 Err(_) => return Ok(cx.number(0.0)),
             };
 
-            let tx = deno_tx_for_worker(id2);
+            let tx = deno_data_tx_for_worker(id2);
             let Some(tx) = tx else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postMessages)");
@@ -522,11 +525,11 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             for i in 0..arr.len(&mut cx) {
                 let v = arr.get_value(&mut cx, i)?;
                 let msg = crate::bridge::neon_codec::from_neon_value(&mut cx, v)?;
-                match tx.try_send(DenoMsg::PostMessage { value: msg }) {
+                match tx.blocking_send(DenoMsg::PostMessage { value: msg }) {
                     Ok(()) => sent += 1,
                     Err(_) => {
                         if strict_channel() {
-                            return cx.throw_error("postMessages dropped: worker queue full or closed");
+                            return cx.throw_error("Runtime is closed (postMessages)");
                         }
                         break;
                     }
@@ -593,6 +596,35 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         api.set(&mut cx, "close", f)?;
     }
 
+    // forceDispose(): void (best-effort immediate native handle teardown)
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            if let Ok(mut map) = WORKERS.write() {
+                if let Some(w) = map.get(&id2) {
+                    w.closed.store(true, Ordering::SeqCst);
+                }
+                let _ = map.remove(&id2);
+            }
+            Ok(cx.undefined())
+        })?;
+        api.set(&mut cx, "forceDispose", f)?;
+    }
+
+    // __isRegistered(): boolean (internal test/teardown helper)
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let registered = WORKERS
+                .read()
+                .ok()
+                .map(|map| map.contains_key(&id2))
+                .unwrap_or(false);
+            Ok(cx.boolean(registered))
+        })?;
+        api.set(&mut cx, "__isRegistered", f)?;
+    }
+
     // memory(): Promise<any>
     {
         let id2 = id;
@@ -630,8 +662,8 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             };
 
             if let Some((tx, value)) = tx_and_value {
-                try_send_deno_msg_or_reject(
-                    &tx,
+                crate::queue_deno_msg_or_reject_with_backpressure(
+                    tx,
                     DenoMsg::SetGlobal {
                         key,
                         value,
@@ -639,9 +671,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                     },
                 );
             } else {
-                settler.reject_with_value_via_channel(mk_err(
-                    "Runtime is closed or request queue is full",
-                ));
+                settler.reject_with_value_via_channel(mk_err("Runtime is closed"));
             }
 
             Ok(promise)
@@ -699,27 +729,17 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             eval_sync_active.store(true, std::sync::atomic::Ordering::SeqCst);
             let _guard = EvalSyncGuard(eval_sync_active);
 
-            let tx = deno_tx_for_worker(id2)
+            let tx = deno_control_tx_for_worker(id2)
                 .ok_or_else(|| cx.throw_error::<_, ()>("Runtime is closed").unwrap_err())?;
 
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.try_send(DenoMsg::Eval {
+            tx.blocking_send(DenoMsg::Eval {
                 source: src,
                 options,
                 deferred: None,
                 sync_reply: Some(reply_tx),
             })
-            .map_err(|e| {
-                let msg = match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        "Runtime request queue is full".to_string()
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        "Runtime is closed".to_string()
-                    }
-                };
-                cx.throw_error::<_, ()>(msg).unwrap_err()
-            })?;
+            .map_err(|_e| cx.throw_error::<_, ()>("Runtime is closed").unwrap_err())?;
 
             let result = reply_rx
                 .blocking_recv()

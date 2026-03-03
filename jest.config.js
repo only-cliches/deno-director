@@ -3,6 +3,7 @@ module.exports = {
   preset: "ts-jest",
   testEnvironment: "node",
   silent: false,
+  forceExit: true,
   
   // Only scan these directories
   roots: ["<rootDir>/src", "<rootDir>/test-ts"],

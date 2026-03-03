@@ -434,6 +434,12 @@ pub async fn eval_in_runtime(
     source: &str,
     options: EvalOptions,
 ) -> EvalReply {
+    // Defensive pre-clear:
+    // timeout-driven termination can race with request boundaries; clear any
+    // stale terminate flag before starting a fresh eval request.
+    worker.js_runtime.v8_isolate().cancel_terminate_execution();
+    worker.js_runtime.v8_isolate().cancel_terminate_execution();
+
     let start_wall = Instant::now();
     let start_cpu = ProcessTime::now();
     let filename = if options.filename.is_empty() {

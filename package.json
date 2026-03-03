@@ -11,6 +11,8 @@
     "test-txt": "jest --verbose --silent=false &> test_results.txt",
     "test-json": "jest --json > test_results.json",
     "test": "npm run test:guard:any && cargo test && jest",
+    "test:contention": "jest test-ts/contention.spec.ts --runInBand --silent=false --forceExit",
+    "test:contention:absurd": "DENO_DIRECTOR_ABSURD_RUNTIMES=40 DENO_DIRECTOR_ABSURD_WAVES=5 DENO_DIRECTOR_ABSURD_STREAMS=16 DENO_DIRECTOR_ABSURD_HOST_CALLS=140 jest test-ts/contention.spec.ts --runInBand --silent=false --forceExit",
     "test:guard:any": "bash codex/check-test-any.sh"
   },
   "keywords": [
@@ -55,10 +57,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/only-cliches/quickjs-worker.git"
+    "url": "git+https://github.com/only-cliches/deno-director/quickjs-worker.git"
   },
   "bugs": {
-    "url": "https://github.com/only-cliches/quickjs-worker/issues"
+    "url": "https://github.com/only-cliches/deno-director/quickjs-worker/issues"
   },
-  "homepage": "https://github.com/only-cliches/quickjs-worker#readme"
+  "homepage": "https://github.com/only-cliches/deno-director/quickjs-worker#readme"
 }

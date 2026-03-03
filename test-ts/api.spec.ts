@@ -21,7 +21,7 @@ describe("DenoWorker API", () => {
     expect(dw.isClosed()).toBe(true);
 
     expect(dw.tryPostMessage({ a: 1 })).toBe(false);
-    expect(() => dw.postMessage({ a: 1 })).toThrow(/postMessage dropped/i);
+    expect(() => dw.postMessage({ a: 1 })).toThrow(/postMessage failed/i);
   });
 
   test("lastExecutionStats updates after evalSync and contains finite numbers", async () => {

@@ -840,7 +840,10 @@ impl Default for ImportsPolicy {
 #[derive(Clone)]
 pub struct WorkerHandle {
     pub id: usize,
+    // Control plane: eval/evalModule/evalSync, setGlobal, memory, close.
     pub deno_tx: mpsc::Sender<DenoMsg>,
+    // Data plane: postMessage + stream frames carried over postMessage.
+    pub deno_data_tx: mpsc::Sender<DenoMsg>,
     pub node_tx: mpsc::Sender<NodeMsg>,
     pub channel: Channel,
     pub callbacks: NodeCallbacks,
@@ -857,13 +860,20 @@ impl WorkerHandle {
         id: usize,
         channel: Channel,
         channel_size: usize,
-    ) -> (Self, mpsc::Receiver<DenoMsg>, mpsc::Receiver<NodeMsg>) {
+    ) -> (
+        Self,
+        mpsc::Receiver<DenoMsg>,
+        mpsc::Receiver<DenoMsg>,
+        mpsc::Receiver<NodeMsg>,
+    ) {
         let (deno_tx, deno_rx) = mpsc::channel(channel_size);
+        let (deno_data_tx, deno_data_rx) = mpsc::channel(channel_size);
         let (node_tx, node_rx) = mpsc::channel(channel_size);
 
         let handle = Self {
             id,
             deno_tx,
+            deno_data_tx,
             node_tx,
             channel,
             callbacks: NodeCallbacks::default(),
@@ -875,7 +885,7 @@ impl WorkerHandle {
             inspect_bound_port: Arc::new(AtomicU16::new(0)),
         };
 
-        (handle, deno_rx, node_rx)
+        (handle, deno_rx, deno_data_rx, node_rx)
     }
 
     pub fn register_global_fn(&mut self, root: Root<JsFunction>) -> usize {

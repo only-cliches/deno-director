@@ -60,38 +60,57 @@ describe("deno_worker: limits", () => {
   );
 
   test(
-    "limits: evalSync fails fast when worker queue is full",
+    "limits: evalSync waits behind an in-flight eval",
     async () => {
-      const dw = createTestWorker({ maxEvalMs: 1_000, bridge: { channelSize: 1 } });
+      const dw = createTestWorker({ maxEvalMs: 2_000, bridge: { channelSize: 8 } });
 
       const busy = dw.eval(`
         (() => {
-          const end = Date.now() + 3000;
+          const end = Date.now() + 450;
           while (Date.now() < end) {}
           return 1;
         })()
       `);
 
-      // While `busy` occupies the worker thread, this call fills the only queue slot.
-      const queued = dw.eval("2 + 2");
+      await sleep(30);
 
       const start = Date.now();
-      let threw = false;
-      let syncOut: any;
-      try {
-        syncOut = dw.evalSync("1 + 1");
-      } catch {
-        threw = true;
-      }
+      const syncOut = dw.evalSync("1 + 1");
       const elapsed = Date.now() - start;
-      expect(elapsed).toBeLessThan(300);
-      if (!threw) {
-        expect(syncOut).toBe(2);
-      }
+      expect(syncOut).toBe(2);
+      expect(elapsed).toBeGreaterThanOrEqual(250);
 
-      await queued.catch(() => undefined);
-      await busy.catch(() => undefined);
+      await expect(busy).resolves.toBe(1);
       if (!dw.isClosed()) await dw.close({ force: true });
+    },
+    15_000
+  );
+
+  test(
+    "limits: evalModule waits behind an in-flight eval instead of failing",
+    async () => {
+      const dw = createTestWorker({ maxEvalMs: 2_000, bridge: { channelSize: 8 } });
+      try {
+        const busy = dw.eval(`
+          (() => {
+            const end = Date.now() + 450;
+            while (Date.now() < end) {}
+            return "busy-done";
+          })()
+        `);
+
+        await sleep(30);
+        const start = Date.now();
+        const mod = dw.evalModule(`
+          export const answer = 42;
+        `);
+
+        await expect(withHardTimeout(busy, 4_000)).resolves.toBe("busy-done");
+        await expect(withHardTimeout(mod, 4_000)).resolves.toMatchObject({ answer: 42 });
+        expect(Date.now() - start).toBeGreaterThanOrEqual(250);
+      } finally {
+        if (!dw.isClosed()) await dw.close({ force: true });
+      }
     },
     15_000
   );
@@ -99,4 +118,38 @@ describe("deno_worker: limits", () => {
   test("limits: maxStackSizeBytes is rejected explicitly", () => {
     expect(() => createTestWorker({ maxStackSizeBytes: 1024 })).toThrow(/maxStackSizeBytes/i);
   });
+
+  test(
+    "limits: delayed catch attachment on eval rejection does not emit unhandledRejection",
+    async () => {
+      const dw = createTestWorker({ maxEvalMs: 25, bridge: { channelSize: 8 } });
+      const unhandled: string[] = [];
+      const onUnhandled = (reason: unknown) => {
+        const msg =
+          typeof reason === "object" && reason && "message" in (reason as any)
+            ? String((reason as any).message)
+            : String(reason);
+        unhandled.push(msg);
+      };
+      process.on("unhandledRejection", onUnhandled);
+
+      try {
+        const pending = dw.eval("while (true) {}");
+        await sleep(60); // attach handler after rejection would normally have occurred
+
+        const err = await pending.then(
+          () => "",
+          (e) => String((e as any)?.message ?? e),
+        );
+        expect(err).toMatch(/execution terminated/i);
+
+        await sleep(0);
+        expect(unhandled).toHaveLength(0);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+        if (!dw.isClosed()) await dw.close({ force: true });
+      }
+    },
+    15_000
+  );
 });

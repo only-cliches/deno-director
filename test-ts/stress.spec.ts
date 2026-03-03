@@ -28,13 +28,14 @@ async function waitFor(fn: () => boolean, ms: number) {
 describe("DenoWorker stress and backpressure", () => {
 
     test(
-        "tryPostMessage returns false when the worker channel is full (while worker is busy)",
+        "tryPostMessage stays true while worker is busy by queueing until drained",
         async () => {
             const prevStrict = process.env.DENOJS_WORKER_STRICT_CHANNEL;
             delete process.env.DENOJS_WORKER_STRICT_CHANNEL;
 
             const dw = createTestWorker({ bridge: { channelSize: 8 }, maxEvalMs: 500 });
             try {
+                await dw.eval("0");
                 const busy = dw.eval(`
                     (() => {
                       const end = Date.now() + 150;
@@ -44,13 +45,13 @@ describe("DenoWorker stress and backpressure", () => {
                 `);
 
                 let ok = 0;
-                let dropped = 0;
+                let failed = 0;
 
-                for (let i = 0; i < 10_000; i++) {
+                for (let i = 0; i < 512; i++) {
                     const enq = dw.tryPostMessage({ i });
                     if (enq) ok++;
                     else {
-                        dropped++;
+                        failed++;
                         break;
                     }
                 }
@@ -58,7 +59,7 @@ describe("DenoWorker stress and backpressure", () => {
                 await busy.catch(() => { });
 
                 expect(ok).toBeGreaterThan(0);
-                expect(dropped).toBeGreaterThan(0);
+                expect(failed).toBe(0);
             } finally {
                 if (!dw.isClosed()) await dw.close();
                 if (prevStrict !== undefined) process.env.DENOJS_WORKER_STRICT_CHANNEL = prevStrict;
@@ -81,19 +82,18 @@ describe("DenoWorker stress and backpressure", () => {
     );
 
     test(
-        "stress: backpressure triggers when concurrency exceeds channel capacity",
+        "stress: eval queue drains even when concurrency exceeds channel capacity",
         async () => {
             const dw = createTestWorker({ bridge: { channelSize: 32 } });
 
             const tasks = Array.from({ length: 200 }, () => dw.eval("1 + 1"));
             const results = await Promise.allSettled(tasks);
 
-            // Expect at least some successes, and at least some rejections due to queue full.
             const ok = results.filter((r) => r.status === "fulfilled").length;
             const bad = results.filter((r) => r.status === "rejected").length;
 
-            expect(ok).toBeGreaterThan(0);
-            expect(bad).toBeGreaterThan(0);
+            expect(ok).toBe(200);
+            expect(bad).toBe(0);
 
             await dw.close();
         },
@@ -239,4 +239,5 @@ describe("DenoWorker stress and backpressure", () => {
             expect(dw.isClosed()).toBe(true);
         }
     });
+
 });

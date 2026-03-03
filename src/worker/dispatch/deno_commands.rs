@@ -72,19 +72,26 @@ fn handle_close_msg(worker_id: usize, deferred: crate::bridge::promise::PromiseS
         };
 
         let wid = worker_id;
-        let _ = channel.try_send(move |mut cx| {
-            if let Some(cb_arc) = on_close_cb_opt.as_ref() {
-                let cb = cb_arc.to_inner(&mut cx);
-                let this = cx.undefined();
-                let _ = cb.call(&mut cx, this, &[]);
-            }
+        if channel
+            .try_send(move |mut cx| {
+                if let Some(cb_arc) = on_close_cb_opt.as_ref() {
+                    let cb = cb_arc.to_inner(&mut cx);
+                    let this = cx.undefined();
+                    let _ = cb.call(&mut cx, this, &[]);
+                }
 
             if let Ok(mut map) = crate::WORKERS.write() {
                 let _ = map.remove(&wid);
             }
 
-            Ok(())
-        });
+                Ok(())
+            })
+            .is_err()
+        {
+            if let Ok(mut map) = crate::WORKERS.write() {
+                let _ = map.remove(&wid);
+            }
+        }
     }
 
     true
