@@ -249,4 +249,44 @@ describe("inspect + envFile", () => {
       await rmRF(root);
     }
   });
+
+  test("inspect + heavy message traffic emits close once", async () => {
+    let port: number;
+    try {
+      port = await findFreePort();
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    let dw: DenoWorker | undefined;
+    try {
+      dw = createTestWorker({
+        inspect: { host: "127.0.0.1", port },
+        permissions: { env: true },
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const closes: number[] = [];
+    dw.on("close", () => closes.push(Date.now()));
+
+    try {
+      await dw.eval(`
+        globalThis.__msgs = 0;
+        on("message", () => { globalThis.__msgs += 1; });
+        0;
+      `);
+      const payloads = Array.from({ length: 250 }, (_, i) => ({ i, s: "x".repeat(8) }));
+      const accepted = dw.tryPostMessages(payloads);
+      expect(accepted).toBeGreaterThan(0);
+      await dw.eval(`new Promise((r) => setTimeout(r, 30))`);
+    } finally {
+      if (dw && !dw.isClosed()) await dw.close();
+    }
+
+    expect(closes.length).toBe(1);
+  });
 });

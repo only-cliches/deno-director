@@ -27,7 +27,7 @@ describe("deno_worker: eval", () => {
     "evalSync honors maxEvalMs and returns promptly on runaway scripts",
     async () => {
       await dw.close();
-      dw = createTestWorker({ maxEvalMs: 5_000 });
+      dw = createTestWorker({ limits: { maxEvalMs: 5_000 } });
 
       const started = Date.now();
       expect(() => dw.evalSync("while (true) {}", { maxEvalMs: 25 })).toThrow();
@@ -137,7 +137,7 @@ describe("deno_worker: eval", () => {
     "per-eval maxEvalMs overrides global maxEvalMs for that call only",
     async () => {
       await dw.close();
-      dw = createTestWorker({ maxEvalMs: 5_000 });
+      dw = createTestWorker({ limits: { maxEvalMs: 5_000 } });
 
       const err1 = await dw.eval("while (true) {}", { maxEvalMs: 25 }).catch((e) => e);
       expect(err1).toBeTruthy();
@@ -151,7 +151,7 @@ describe("deno_worker: eval", () => {
     "per-eval maxEvalMs can be longer than global (overrides for that call)",
     async () => {
       await dw.close();
-      dw = createTestWorker({ maxEvalMs: 25 });
+      dw = createTestWorker({ limits: { maxEvalMs: 25 } });
 
       await expect(
         dw.eval(
@@ -173,7 +173,7 @@ describe("deno_worker: eval", () => {
     "per-eval maxEvalMs overrides global maxEvalMs for that call only (and does not poison subsequent evals)",
     async () => {
       await dw.close();
-      dw = createTestWorker({ maxEvalMs: 5_000 });
+      dw = createTestWorker({ limits: { maxEvalMs: 5_000 } });
 
       const err1 = await dw.eval("while (true) {}", { maxEvalMs: 25 }).catch((e) => e);
       expect(err1).toBeTruthy();

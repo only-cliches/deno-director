@@ -107,7 +107,7 @@ import { DenoDirector } from "deno-director";
 const director = new DenoDirector({
   template: {
     // Base configuration for ALL workers
-    workerOptions: { maxMemoryBytes: 128 * 1024 * 1024 }, // 128MB limit
+    workerOptions: { limits: { maxMemoryBytes: 128 * 1024 * 1024 } }, // 128MB limit
     bootstrapScripts: ["globalThis.APP_RUNTIME = 'DenoDirector';"]
   }
 });
@@ -581,14 +581,19 @@ Passed into `new DenoWorker(opts)` or used as `workerOptions` in templates.
 
 ```ts
 type DenoWorkerOptions = {
+  limits?: {
+    maxHandle?: number;         // Active handle cap (default 128)
+    maxEvalMs?: number;         // Default timeout for eval + handle runtime operations
+    maxMemoryBytes?: number;    // V8 Heap limit
+    maxStackSizeBytes?: number; // Stack limit (if supported)
+  };
   bridge?: {                    // Transport tuning
-    channelSize?: number;       // Internal command queue capacity
+    channelSize?: number;       // Per-queue capacity (control/data/node callback queues)
     streamWindowBytes?: number; // Per-stream flow-control window
     streamCreditFlushBytes?: number; // Credit flush threshold
+    streamBacklogLimit?: number; // Max unaccepted worker->Node stream opens to backlog (default 256)
   };
   cwd?: string;                 // Virtual root for the filesystem sandbox
-  maxEvalMs?: number;           // Hard timeout for eval operations
-  maxMemoryBytes?: number;      // V8 Heap limit
   startup?: string;             // Script evaluated before user code runs
   permissions?: {               // Deno secure sandbox permissions
     read?: boolean | string[];  // Allow read everywhere, or specific paths
@@ -623,6 +628,9 @@ type DenoWorkerOptions = {
 };
 
 ```
+
+`bridge.channelSize` applies independently to multiple internal queues (control-plane, data-plane, and node callback dispatch), not a single shared queue. Under heavy load, total buffered slots can approach roughly `3 * channelSize`.
+`bridge.streamBacklogLimit` caps worker->Node stream opens that arrive before Node calls `stream.accept(key)`; excess opens are rejected to bound host memory growth.
 
 ### `nodeCompat` vs `moduleLoader.nodeResolve`
 

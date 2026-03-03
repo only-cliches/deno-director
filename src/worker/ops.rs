@@ -1,13 +1,13 @@
 use deno_runtime::deno_core::{JsBuffer, OpState, op2};
 use tokio::sync::oneshot;
-use tokio::sync::mpsc::error::TrySendError;
 
 use crate::bridge::types::JsValueBridge;
 use crate::worker::env::{EnvRuntimeState, valid_env_key};
 use crate::worker::messages::NodeMsg;
 use crate::worker::op_reply::{err_reply, err_wire, ok_reply, ok_wire};
-use crate::worker::runtime::WorkerOpContext;
-use std::time::{Duration, Instant};
+use crate::worker::runtime::{SyncNodeDispatchAck, SyncNodeDispatchRequest, WorkerOpContext};
+use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 
 fn ctx_from_state(state: &OpState) -> Option<WorkerOpContext> {
     state.try_borrow::<WorkerOpContext>().cloned()
@@ -47,24 +47,24 @@ enum NodeSendWaitError {
 }
 
 fn send_node_msg_wait(
-    tx: &tokio::sync::mpsc::Sender<NodeMsg>,
+    ctx: &WorkerOpContext,
     msg: NodeMsg,
     timeout: Duration,
 ) -> Result<(), NodeSendWaitError> {
-    let deadline = Instant::now() + timeout;
-    let mut pending = msg;
-    loop {
-        match tx.try_send(pending) {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Closed(_)) => return Err(NodeSendWaitError::Closed),
-            Err(TrySendError::Full(msg)) => {
-                if Instant::now() >= deadline {
-                    return Err(NodeSendWaitError::TimedOut);
-                }
-                pending = msg;
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+    let (ack_tx, ack_rx) = std_mpsc::channel::<SyncNodeDispatchAck>();
+    if ctx
+        .sync_node_dispatch_tx
+        .send(SyncNodeDispatchRequest { msg, ack: ack_tx })
+        .is_err()
+    {
+        return Err(NodeSendWaitError::Closed);
+    }
+
+    match ack_rx.recv_timeout(timeout) {
+        Ok(SyncNodeDispatchAck::Sent) => Ok(()),
+        Ok(SyncNodeDispatchAck::Closed) => Err(NodeSendWaitError::Closed),
+        Err(std_mpsc::RecvTimeoutError::Timeout) => Err(NodeSendWaitError::TimedOut),
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(NodeSendWaitError::Closed),
     }
 }
 
@@ -77,12 +77,7 @@ pub fn op_denojs_worker_post_message(state: &mut OpState, #[serde] msg: serde_js
 
     // Input is wire-JSON from bootstrap hostPostMessage wrapper.
     let value: JsValueBridge = crate::bridge::wire::from_wire_json(msg);
-    send_node_msg_wait(
-        &ctx.node_tx,
-        NodeMsg::EmitMessage { value },
-        Duration::from_secs(2),
-    )
-    .is_ok()
+    send_node_msg_wait(&ctx, NodeMsg::EmitMessage { value }, Duration::from_secs(2)).is_ok()
 }
 
 // Worker -> Node: hostPostMessage() binary fast path
@@ -93,12 +88,7 @@ pub fn op_denojs_worker_post_message_bin(state: &mut OpState, #[buffer] msg: JsB
     };
 
     let value = bytes_to_u8_bridge(&msg);
-    send_node_msg_wait(
-        &ctx.node_tx,
-        NodeMsg::EmitMessage { value },
-        Duration::from_secs(2),
-    )
-    .is_ok()
+    send_node_msg_wait(&ctx, NodeMsg::EmitMessage { value }, Duration::from_secs(2)).is_ok()
 }
 
 // Worker -> Node: host function call (sync)
@@ -131,7 +121,7 @@ pub fn op_denojs_worker_host_call_sync(
     let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
 
     if let Err(e) = send_node_msg_wait(
-        &ctx.node_tx,
+        &ctx,
         NodeMsg::InvokeHostFunctionSync {
             func_id: func_id as usize,
             args: bridged_args,
@@ -191,7 +181,7 @@ pub fn op_denojs_worker_host_call_sync_bin(
     let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
 
     if let Err(e) = send_node_msg_wait(
-        &ctx.node_tx,
+        &ctx,
         NodeMsg::InvokeHostFunctionSync {
             func_id: func_id as usize,
             args: bridged_args,
@@ -253,7 +243,7 @@ pub fn op_denojs_worker_host_call_sync_bin_mixed(
 
     let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
     if let Err(e) = send_node_msg_wait(
-        &ctx.node_tx,
+        &ctx,
         NodeMsg::InvokeHostFunctionSync {
             func_id: func_id as usize,
             args: bridged_args,

@@ -25,7 +25,7 @@ describe("deno_worker: limits", () => {
     test(
     "limits: per-eval maxEvalMs overrides worker default (and recovery works)",
     async () => {
-      const dw = createTestWorker({ maxEvalMs: 30, bridge: { channelSize: 256 } });
+      const dw = createTestWorker({ limits: { maxEvalMs: 30 }, bridge: { channelSize: 256 } });
 
       const burn80ms = `
         (() => {
@@ -49,7 +49,7 @@ describe("deno_worker: limits", () => {
   test(
     "limits: maxEvalMs eventually rejects or resolves, but never hangs",
     async () => {
-      const dw = createTestWorker({ maxEvalMs: 100, bridge: { channelSize: 256 } });
+      const dw = createTestWorker({ limits: { maxEvalMs: 100 }, bridge: { channelSize: 256 } });
 
       const p = dw.eval("while (true) {}"); // worst case
       await expect(withHardTimeout(p, 2000)).rejects.toBeDefined();
@@ -62,7 +62,7 @@ describe("deno_worker: limits", () => {
   test(
     "limits: evalSync waits behind an in-flight eval",
     async () => {
-      const dw = createTestWorker({ maxEvalMs: 2_000, bridge: { channelSize: 8 } });
+      const dw = createTestWorker({ limits: { maxEvalMs: 2_000 }, bridge: { channelSize: 8 } });
 
       const busy = dw.eval(`
         (() => {
@@ -89,7 +89,7 @@ describe("deno_worker: limits", () => {
   test(
     "limits: evalModule waits behind an in-flight eval instead of failing",
     async () => {
-      const dw = createTestWorker({ maxEvalMs: 2_000, bridge: { channelSize: 8 } });
+      const dw = createTestWorker({ limits: { maxEvalMs: 2_000 }, bridge: { channelSize: 8 } });
       try {
         const busy = dw.eval(`
           (() => {
@@ -116,13 +116,13 @@ describe("deno_worker: limits", () => {
   );
 
   test("limits: maxStackSizeBytes is rejected explicitly", () => {
-    expect(() => createTestWorker({ maxStackSizeBytes: 1024 })).toThrow(/maxStackSizeBytes/i);
+    expect(() => createTestWorker({ limits: { maxStackSizeBytes: 1024 } })).toThrow(/maxStackSizeBytes/i);
   });
 
   test(
     "limits: delayed catch attachment on eval rejection does not emit unhandledRejection",
     async () => {
-      const dw = createTestWorker({ maxEvalMs: 25, bridge: { channelSize: 8 } });
+      const dw = createTestWorker({ limits: { maxEvalMs: 25 }, bridge: { channelSize: 8 } });
       const unhandled: string[] = [];
       const onUnhandled = (reason: unknown) => {
         const msg =

@@ -11,6 +11,12 @@ import type {
 // Alias to preserve existing exported name
 export type DenoWorkerWorkerOptions = DenoWorkerOptions;
 
+/**
+ * Sanitizes user-provided eval options before crossing the native boundary.
+ *
+ * This strips invalid fields and dehydrates typed-array views so native can
+ * rehydrate values consistently in the target runtime.
+ */
 export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undefined {
     if (!options) return undefined;
     const out: EvalOptions = {};
@@ -39,12 +45,14 @@ export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undef
     return out;
 }
 
+/** Coerces raw native memory payload into the public memory response shape. */
 export function coerceMemoryPayload(raw: unknown): DenoWorkerMemory {
     const hs = (raw as any).heapStatistics;
     const hss = (raw as any).heapSpaceStatistics;
     return { heapStatistics: hs, heapSpaceStatistics: hss };
 }
 
+/** Normalizes the `console` option into the wire-safe shape expected by native. */
 function normalizeConsoleOption(x: unknown): unknown {
     if (x === undefined) return undefined;
     if (x === false) return false;
@@ -71,6 +79,7 @@ function normalizeConsoleOption(x: unknown): unknown {
     return undefined;
 }
 
+/** Normalizes environment input (`string` path or key/value object). */
 function normalizeEnvOption(x: unknown): unknown {
     if (x === undefined) return undefined;
 
@@ -95,6 +104,7 @@ function normalizeEnvOption(x: unknown): unknown {
     return undefined;
 }
 
+/** Normalizes inspector config and bounds-checks numeric port values. */
 function normalizeInspectOption(x: unknown): unknown {
     if (x === undefined) return undefined;
 
@@ -118,6 +128,7 @@ function normalizeInspectOption(x: unknown): unknown {
     return undefined;
 }
 
+/** Extracts recognized module-loader flags and drops unsupported keys. */
 function normalizeModuleLoaderOption(x: unknown): unknown {
     if (!x || typeof x !== "object") return undefined;
     const o: any = x as any;
@@ -139,6 +150,7 @@ function normalizeModuleLoaderOption(x: unknown): unknown {
     return Object.keys(out).length ? out : undefined;
 }
 
+/** Extracts TS/JSX compiler options used by runtime transpilation paths. */
 function normalizeTsCompilerOption(x: unknown): unknown {
     if (!x || typeof x !== "object") return undefined;
     const o: any = x as any;
@@ -162,6 +174,7 @@ function normalizeTsCompilerOption(x: unknown): unknown {
     return Object.keys(out).length ? out : undefined;
 }
 
+/** Normalizes stream/channel bridge tuning values into finite integers. */
 function normalizeBridgeOption(x: unknown): unknown {
     if (!x || typeof x !== "object") return undefined;
     const o: any = x as any;
@@ -180,14 +193,52 @@ function normalizeBridgeOption(x: unknown): unknown {
     ) {
         out.streamCreditFlushBytes = Math.trunc(o.streamCreditFlushBytes);
     }
+    if (typeof o.streamBacklogLimit === "number" && Number.isFinite(o.streamBacklogLimit) && o.streamBacklogLimit >= 1) {
+        out.streamBacklogLimit = Math.trunc(o.streamBacklogLimit);
+    }
 
     return Object.keys(out).length ? out : undefined;
 }
 
+/** Normalizes top-level `limits` fields into finite integer/number values. */
+function normalizeLimitsOption(x: unknown): unknown {
+    if (!x || typeof x !== "object") return undefined;
+    const o: any = x as any;
+    const out: any = {};
+
+    if (typeof o.maxHandle === "number" && Number.isFinite(o.maxHandle) && o.maxHandle >= 1) {
+        out.maxHandle = Math.trunc(o.maxHandle);
+    }
+    if (typeof o.maxEvalMs === "number" && Number.isFinite(o.maxEvalMs) && o.maxEvalMs > 0) {
+        out.maxEvalMs = o.maxEvalMs;
+    }
+    if (typeof o.maxMemoryBytes === "number" && Number.isFinite(o.maxMemoryBytes) && o.maxMemoryBytes > 0) {
+        out.maxMemoryBytes = Math.trunc(o.maxMemoryBytes);
+    }
+    if (typeof o.maxStackSizeBytes === "number" && Number.isFinite(o.maxStackSizeBytes) && o.maxStackSizeBytes > 0) {
+        out.maxStackSizeBytes = Math.trunc(o.maxStackSizeBytes);
+    }
+
+    return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * Produces the worker option payload sent to native worker construction.
+ *
+ * Fields that are host-only (`lifecycle`, `globals`) are removed here because
+ * they are implemented by the TypeScript wrapper layer.
+ */
 export function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerWorkerOptions {
     const o: any = { ...(options ?? {}) };
     delete o.lifecycle;
     delete o.globals;
+    const limits: any = normalizeLimitsOption(o.limits);
+    delete o.limits;
+    if (limits) {
+        if (typeof limits.maxEvalMs === "number") o.maxEvalMs = limits.maxEvalMs;
+        if (typeof limits.maxMemoryBytes === "number") o.maxMemoryBytes = limits.maxMemoryBytes;
+        if (typeof limits.maxStackSizeBytes === "number") o.maxStackSizeBytes = limits.maxStackSizeBytes;
+    }
 
     if (typeof o.nodeCompat !== "boolean") delete o.nodeCompat;
 
@@ -215,12 +266,17 @@ export function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerW
     return o as any;
 }
 
+/** Helper for template/director APIs that accept either string or string array fields. */
 export function asStringArray(v: string | string[] | undefined): string[] {
     if (typeof v === "string") return v ? [v] : [];
     if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string" && x.length > 0);
     return [];
 }
 
+/**
+ * Shallow-merges two worker option objects with deep merges for nested
+ * `permissions`, `lifecycle`, `bridge`, `limits`, and `moduleLoader` sections.
+ */
 export function mergeWorkerOptions(base?: DenoWorkerOptions, overrides?: DenoWorkerOptions): DenoWorkerOptions | undefined {
     if (!base && !overrides) return undefined;
     const out: DenoWorkerOptions = { ...(base ?? {}), ...(overrides ?? {}) };
@@ -235,6 +291,15 @@ export function mergeWorkerOptions(base?: DenoWorkerOptions, overrides?: DenoWor
 
     if ((base as any)?.bridge || (overrides as any)?.bridge) {
         (out as any).bridge = { ...((base as any)?.bridge ?? {}), ...((overrides as any)?.bridge ?? {}) };
+    }
+    if ((base as any)?.limits || (overrides as any)?.limits) {
+        (out as any).limits = { ...((base as any)?.limits ?? {}), ...((overrides as any)?.limits ?? {}) };
+    }
+    if ((base as any)?.moduleLoader || (overrides as any)?.moduleLoader) {
+        (out as any).moduleLoader = {
+            ...((base as any)?.moduleLoader ?? {}),
+            ...((overrides as any)?.moduleLoader ?? {}),
+        };
     }
 
     return out;

@@ -2,8 +2,10 @@ import { DenoWorker } from "../src/index";
 
 async function main() {
     const worker = new DenoWorker({
-        maxEvalMs: 50,
-        maxMemoryBytes: 64 * 1024 * 1024,
+        limits: {
+            maxEvalMs: 50,
+            maxMemoryBytes: 64 * 1024 * 1024,
+        },
     });
 
     try {

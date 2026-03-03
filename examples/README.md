@@ -11,10 +11,11 @@ Simple usage examples for `deno-director`.
 - `05-imports-callback.ts`: custom import callback and virtual modules.
 - `06-https-imports.ts`: remote HTTPS imports.
 - `07-node-resolve.ts`: `moduleLoader.nodeResolve` and `nodeCompat`.
-- `08-limits.ts`: `maxEvalMs` and memory limits.
+- `08-limits.ts`: `limits.maxEvalMs` and memory limits.
 - `09-console-routing.ts`: custom console handlers.
 - `10-director.ts`: manage multiple workers with `DenoDirector`.
 - `11-streams.ts`: byte-stream bridge (`stream.create` / `stream.accept`).
+- `12-handles.ts`: runtime value handles (`handle.get` / `handle.eval` / `handle.tryGet`).
 
 ## Running
 

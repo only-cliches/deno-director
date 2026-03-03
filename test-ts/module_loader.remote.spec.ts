@@ -12,7 +12,8 @@ function isBindPermissionError(err: any): boolean {
 
 async function startServer(routes: Record<string, string>): Promise<{ base: string; close: () => Promise<void> }> {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const url = req.url || "/";
+    const rawUrl = req.url || "/";
+    const url = rawUrl.split("?")[0];
     const body = routes[url];
     if (body === undefined) {
       res.statusCode = 404;
@@ -214,6 +215,39 @@ describe("moduleLoader.httpsResolve MVP", () => {
     }
   });
 
+  test("permissions.import URL allowlist does not allow host-prefix confusion", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/oak/mod.ts": `export const v: string = "ok";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const url = new URL("/oak/mod.ts", srv.base);
+    const confusedHost = `${url.protocol}//${url.host}.attacker.invalid${url.pathname}`;
+
+    const dw = createTestWorker({
+      imports: true,
+      transpileTs: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true },
+      permissions: { import: [srv.base], net: true },
+    });
+
+    try {
+      const src = `
+        import { v } from "${confusedHost}";
+        export const out = v;
+      `;
+      await expect(dw.evalModule(src)).rejects.toBeTruthy();
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+      await srv.close();
+    }
+  });
+
   test("imports callback promise timeout rejects instead of hanging", async () => {
     const dw = createTestWorker({
       imports: async () => await new Promise(() => {}),
@@ -290,6 +324,99 @@ describe("moduleLoader.httpsResolve MVP", () => {
         export const out = data.length;
       `;
       await expect(dw.evalModule(src)).rejects.toThrow(/payload too large/i);
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+      await srv.close();
+    }
+  });
+
+  test("permissions.import host/port rules enforce exact port while allowing exact origin", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/ok/mod.ts": `export const v = 42;`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const ok = createTestWorker({
+      imports: true,
+      transpileTs: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true },
+      permissions: { import: [srv.base], net: true },
+    });
+    const wrongPort = new URL("/ok/mod.ts", srv.base);
+    wrongPort.port = String(Number(wrongPort.port || "80") + 1);
+    const bad = createTestWorker({
+      imports: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true },
+      permissions: { import: [wrongPort.origin], net: true },
+    });
+
+    try {
+      await expect(
+        ok.evalModule(`import { v } from "${srv.base}/ok/mod.ts"; export const out = v;`),
+      ).resolves.toMatchObject({ out: 42 });
+      await expect(
+        bad.evalModule(`import { v } from "${srv.base}/ok/mod.ts"; export const out = v;`),
+      ).rejects.toThrow(/permissions\.import|denied/i);
+    } finally {
+      if (!ok.isClosed()) await ok.close();
+      if (!bad.isClosed()) await bad.close();
+      await srv.close();
+    }
+  });
+
+  test("permissions.import path boundary rejects sibling prefix collisions", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/api/mod.ts": `export const v = "ok";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const dw = createTestWorker({
+      imports: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true },
+      permissions: { import: [`${srv.base}/ap`], net: true },
+    });
+
+    try {
+      const src = `import { v } from "${srv.base}/api/mod.ts"; export const out = v;`;
+      await expect(dw.evalModule(src)).rejects.toThrow(/permissions\.import|denied/i);
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+      await srv.close();
+    }
+  });
+
+  test("permissions.import URL allows query/fragment variations on same path", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/q/mod.ts": `export const v = "q-ok";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const allow = `${srv.base}/q`;
+    const dw = createTestWorker({
+      imports: true,
+      transpileTs: true,
+      moduleLoader: { httpsResolve: true, httpResolve: true },
+      permissions: { import: [allow], net: true },
+    });
+
+    try {
+      const src = `import { v } from "${srv.base}/q/mod.ts?x=1#frag"; export const out = v;`;
+      await expect(dw.evalModule(src)).resolves.toMatchObject({ out: "q-ok" });
     } finally {
       if (!dw.isClosed()) await dw.close();
       await srv.close();

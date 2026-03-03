@@ -10,16 +10,19 @@ import type {
     DenoRuntimeRecord,
 } from "./types";
 
+/** Generates a mostly-unique runtime id when caller does not provide one. */
 function randomId(): string {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** Trims labels and converts blank labels to `undefined`. */
 function normalizeLabel(label: string | undefined): string | undefined {
     if (typeof label !== "string") return undefined;
     const v = label.trim();
     return v.length > 0 ? v : undefined;
 }
 
+/** Trims tags, drops blanks, and deduplicates while preserving insertion order. */
 function normalizeTags(tags: string[] | undefined): string[] {
     if (!Array.isArray(tags)) return [];
     const out = new Set<string>();
@@ -32,6 +35,7 @@ function normalizeTags(tags: string[] | undefined): string[] {
     return [...out];
 }
 
+/** Internal guard that ensures a runtime came from this director instance. */
 function getRuntimeMeta(runtime: DenoDirectedRuntime): DenoRuntimeMeta {
     const meta = (runtime as any).meta;
     if (!meta || typeof meta !== "object") {

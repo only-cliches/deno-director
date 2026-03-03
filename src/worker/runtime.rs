@@ -32,6 +32,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use tokio::sync::mpsc;
@@ -42,7 +43,18 @@ pub struct WorkerOpContext {
     #[allow(dead_code)]
     pub worker_id: usize,
     pub node_tx: mpsc::Sender<NodeMsg>,
+    pub sync_node_dispatch_tx: std_mpsc::Sender<SyncNodeDispatchRequest>,
     pub eval_sync_active: Arc<AtomicBool>,
+}
+
+pub enum SyncNodeDispatchAck {
+    Sent,
+    Closed,
+}
+
+pub struct SyncNodeDispatchRequest {
+    pub msg: NodeMsg,
+    pub ack: std_mpsc::Sender<SyncNodeDispatchAck>,
 }
 
 extension!(
@@ -309,6 +321,20 @@ pub fn spawn_worker_thread(
                 return;
             };
 
+            let (sync_node_dispatch_tx, sync_node_dispatch_rx) =
+                std_mpsc::channel::<SyncNodeDispatchRequest>();
+            let node_tx_for_sync_dispatch = node_tx.clone();
+            let sync_node_dispatch_thread = std::thread::spawn(move || {
+                while let Ok(req) = sync_node_dispatch_rx.recv() {
+                    let ack = if node_tx_for_sync_dispatch.blocking_send(req.msg).is_ok() {
+                        SyncNodeDispatchAck::Sent
+                    } else {
+                        SyncNodeDispatchAck::Closed
+                    };
+                    let _ = req.ack.send(ack);
+                }
+            });
+
             let cwd_path = normalize_cwd(limits.cwd.as_deref());
 
             let env_snapshot = merge_env_snapshot(std::env::vars().collect(), limits.env.as_ref());
@@ -382,6 +408,7 @@ pub fn spawn_worker_thread(
                 s.put(WorkerOpContext {
                     worker_id,
                     node_tx: node_tx.clone(),
+                    sync_node_dispatch_tx: sync_node_dispatch_tx.clone(),
                     eval_sync_active: eval_sync_active.clone(),
                 });
                 s.put(module_reg.clone());
@@ -495,6 +522,8 @@ pub fn spawn_worker_thread(
 
             stop.store(true, Ordering::SeqCst);
             let _ = node_pump.join();
+            drop(sync_node_dispatch_tx);
+            let _ = sync_node_dispatch_thread.join();
         });
 
         if let Some(s) = inspect_stop.as_ref() {

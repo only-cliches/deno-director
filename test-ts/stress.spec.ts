@@ -33,7 +33,7 @@ describe("DenoWorker stress and backpressure", () => {
             const prevStrict = process.env.DENOJS_WORKER_STRICT_CHANNEL;
             delete process.env.DENOJS_WORKER_STRICT_CHANNEL;
 
-            const dw = createTestWorker({ bridge: { channelSize: 8 }, maxEvalMs: 500 });
+            const dw = createTestWorker({ bridge: { channelSize: 8 }, limits: { maxEvalMs: 500 } });
             try {
                 await dw.eval("0");
                 const busy = dw.eval(`

@@ -11,6 +11,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -233,6 +234,54 @@ pub struct DynamicModuleLoader {
 }
 
 impl DynamicModuleLoader {
+    fn shared_http_client() -> Result<&'static reqwest::Client, JsErrorBox> {
+        static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+        let built = CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .map_err(|e| format!("Remote fetch client build failed: {e}"))
+        });
+        match built {
+            Ok(c) => Ok(c),
+            Err(msg) => Err(JsErrorBox::generic(msg.clone())),
+        }
+    }
+
+    fn path_is_prefix_boundary(allow_path: &str, req_path: &str) -> bool {
+        if allow_path.is_empty() || allow_path == "/" {
+            return true;
+        }
+        if req_path == allow_path {
+            return true;
+        }
+        req_path.starts_with(allow_path)
+            && req_path
+                .as_bytes()
+                .get(allow_path.len())
+                .map(|b| *b == b'/')
+                .unwrap_or(false)
+    }
+
+    fn match_allow_url_prefix(allow: &Url, req: &Url) -> bool {
+        if !allow.scheme().eq_ignore_ascii_case(req.scheme()) {
+            return false;
+        }
+        let (Some(allow_host), Some(req_host)) = (allow.host_str(), req.host_str()) else {
+            return false;
+        };
+        if !allow_host.eq_ignore_ascii_case(req_host) {
+            return false;
+        }
+        let allow_port = allow.port_or_known_default();
+        let req_port = req.port_or_known_default();
+        if allow_port.is_some() && allow_port != req_port {
+            return false;
+        }
+        Self::path_is_prefix_boundary(allow.path(), req.path())
+    }
+
     fn node_disk_resolve_enabled(&self) -> bool {
         self.node_resolve
             || self.node_compat
@@ -795,17 +844,9 @@ impl DynamicModuleLoader {
                         return true;
                     }
                     if s.starts_with("http://") || s.starts_with("https://") {
-                        if u.as_str().starts_with(s) {
-                            return true;
-                        }
                         if let Ok(au) = Url::parse(s) {
-                            if let (Some(ah), Some(h)) = (au.host_str(), u.host_str()) {
-                                if ah.eq_ignore_ascii_case(h)
-                                    && (au.port_or_known_default().is_none()
-                                        || au.port_or_known_default() == u.port_or_known_default())
-                                {
-                                    return true;
-                                }
+                            if Self::match_allow_url_prefix(&au, u) {
+                                return true;
                             }
                         }
                         continue;
@@ -940,11 +981,7 @@ impl DynamicModuleLoader {
         module_specifier: &Url,
         max_payload_bytes: i64,
     ) -> Result<String, JsErrorBox> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(|e| JsErrorBox::generic(format!("Remote fetch client build failed: {e}")))?;
+        let client = Self::shared_http_client()?;
 
         let mut resp = client
             .get(module_specifier.clone())
@@ -1424,6 +1461,40 @@ mod tests {
 
         let ok = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         assert!(ok.ensure_remote_load_allowed(&url).is_ok());
+    }
+
+    #[test]
+    fn import_allow_url_does_not_match_host_prefix_confusion() {
+        let loader = test_loader(
+            true,
+            serde_json::json!({
+                "import": ["https://example.com"],
+                "net": true
+            }),
+        );
+
+        let ok = Url::parse("https://example.com/mod.ts").expect("url");
+        let bad = Url::parse("https://example.com.attacker.tld/mod.ts").expect("url");
+
+        assert!(loader.ensure_remote_load_allowed(&ok).is_ok());
+        assert!(loader.ensure_remote_load_allowed(&bad).is_err());
+    }
+
+    #[test]
+    fn import_allow_url_honors_path_boundary() {
+        let loader = test_loader(
+            true,
+            serde_json::json!({
+                "import": ["https://example.com/api"],
+                "net": true
+            }),
+        );
+
+        let ok = Url::parse("https://example.com/api/v1/mod.ts").expect("url");
+        let bad = Url::parse("https://example.com/apix/mod.ts").expect("url");
+
+        assert!(loader.ensure_remote_load_allowed(&ok).is_ok());
+        assert!(loader.ensure_remote_load_allowed(&bad).is_err());
     }
 
     #[test]

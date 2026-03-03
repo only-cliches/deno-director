@@ -218,9 +218,19 @@ fn resolve_env_path(base_cwd: &Path, raw: &str) -> PathBuf {
     }
 }
 
+fn canonicalize_or_lexical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(path))
+}
+
+fn within_base_dir(base_dir: &Path, candidate: &Path) -> bool {
+    let base_abs = canonicalize_or_lexical(base_dir);
+    let cand_abs = canonicalize_or_lexical(candidate);
+    cand_abs.starts_with(&base_abs)
+}
+
 fn find_dotenv_upwards(start_dir: &Path) -> Option<PathBuf> {
     // Walk up to filesystem root, first .env wins.
-    let mut cur = std::fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
+    let mut cur = canonicalize_or_lexical(start_dir);
     loop {
         let cand = cur.join(".env");
         if cand.is_file() {
@@ -564,6 +574,9 @@ impl WorkerCreateOptions {
                     let trimmed = raw_path.trim();
                     if !trimmed.is_empty() {
                         let p = resolve_env_path(&base_cwd, trimmed);
+                        if !within_base_dir(&base_cwd, &p) {
+                            return cx.throw_error("envFile path must stay within worker cwd sandbox");
+                        }
                         let map = load_dotenv_file_strict(cx, &p)?;
                         out.runtime_options.env = Some(EnvConfig::Map(map));
                     }
@@ -581,6 +594,9 @@ impl WorkerCreateOptions {
                 let trimmed = raw_path.trim();
                 if !trimmed.is_empty() {
                     let path = resolve_env_path(&base_cwd, trimmed);
+                    if !within_base_dir(&base_cwd, &path) {
+                        return cx.throw_error("env path must stay within worker cwd sandbox");
+                    }
                     let map = load_dotenv_file_strict(cx, &path)?;
                     out.runtime_options.env = Some(EnvConfig::Map(map));
                 }
@@ -765,8 +781,9 @@ impl WorkerCreateOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_env_permission_enabled;
+    use super::{ensure_env_permission_enabled, within_base_dir};
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn env_map(keys: &[&str]) -> HashMap<String, String> {
         let mut out = HashMap::new();
@@ -821,6 +838,20 @@ mod tests {
             ensure_env_permission_enabled(Some(serde_json::json!({ "env": false })), Some(&env));
         assert_eq!(out, Some(serde_json::json!({ "env": false })));
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn within_base_dir_rejects_parent_escape() {
+        let base = if cfg!(windows) {
+            PathBuf::from(r"C:\tmp\deno-director-sandbox")
+        } else {
+            PathBuf::from("/tmp/deno-director-sandbox")
+        };
+        let inside = base.join("a").join("b.env");
+        let outside = base.join("..").join("outside.env");
+
+        assert!(within_base_dir(&base, &inside));
+        assert!(!within_base_dir(&base, &outside));
     }
 }
 

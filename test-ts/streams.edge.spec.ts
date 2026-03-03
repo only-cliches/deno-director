@@ -148,4 +148,163 @@ describe("deno_worker: streams edge cases", () => {
     expect(totals).toHaveLength(streamCount);
     for (const total of totals) expect(total).toBe(expectedPerStream);
   });
+
+  test("streamBacklogLimit bounds unaccepted worker->Node open streams", async () => {
+    dw = createTestWorker({ bridge: { streamBacklogLimit: 1 } });
+
+    const inject = (dw as any).handleIncomingStreamFrame.bind(dw);
+    const tag = "__denojs_worker_stream_v1";
+
+    expect(
+      inject({ [tag]: true, t: "open", id: "edge-open-a", key: "edge-backlog-a" }),
+    ).toBe(true);
+    expect((dw as any).streamBacklog.size).toBe(1);
+
+    expect(
+      inject({ [tag]: true, t: "open", id: "edge-open-b", key: "edge-backlog-b" }),
+    ).toBe(true);
+    expect((dw as any).streamBacklog.size).toBe(1);
+    expect((dw as any).streamNameToId.has("edge-backlog-b")).toBe(false);
+  });
+
+  test("pending accept waiter bypasses backlog cap for matching key", async () => {
+    dw = createTestWorker({ bridge: { streamBacklogLimit: 1 } });
+
+    const acceptPromise = dw.stream.accept("edge-backlog-wait");
+    const inject = (dw as any).handleIncomingStreamFrame.bind(dw);
+    const tag = "__denojs_worker_stream_v1";
+
+    expect(inject({ [tag]: true, t: "open", id: "edge-open-1", key: "edge-backlog-1" })).toBe(true);
+    expect((dw as any).streamBacklog.size).toBe(1);
+
+    expect(inject({ [tag]: true, t: "open", id: "edge-open-2", key: "edge-backlog-wait" })).toBe(true);
+    const reader = await acceptPromise;
+    expect(reader).toBeDefined();
+    await reader.cancel("done");
+  });
+
+  test("repeated backlog rejections do not grow stream maps", async () => {
+    dw = createTestWorker({ bridge: { streamBacklogLimit: 1 } });
+    const inject = (dw as any).handleIncomingStreamFrame.bind(dw);
+    const tag = "__denojs_worker_stream_v1";
+
+    inject({ [tag]: true, t: "open", id: "edge-open-base", key: "edge-backlog-base" });
+    const beforeById = (dw as any).streamById.size;
+
+    for (let i = 0; i < 20; i++) {
+      inject({ [tag]: true, t: "open", id: `edge-open-rej-${i}`, key: `edge-backlog-rej-${i}` });
+    }
+
+    expect((dw as any).streamBacklog.size).toBe(1);
+    expect((dw as any).streamById.size).toBe(beforeById);
+  });
+
+  test("backlog rejection emits error and discard frames", async () => {
+    dw = createTestWorker({ bridge: { streamBacklogLimit: 1 } });
+    const sent: any[] = [];
+    const originalEmit = (dw as any).emitStreamFrame.bind(dw);
+    (dw as any).emitStreamFrame = (frame: any) => {
+      sent.push(frame);
+      return originalEmit(frame);
+    };
+
+    const inject = (dw as any).handleIncomingStreamFrame.bind(dw);
+    const tag = "__denojs_worker_stream_v1";
+
+    inject({ [tag]: true, t: "open", id: "edge-open-allow", key: "edge-bk-allow" });
+    inject({ [tag]: true, t: "open", id: "edge-open-reject", key: "edge-bk-reject" });
+
+    expect(sent.some((f) => f.t === "error" && f.id === "edge-open-reject")).toBe(true);
+    expect(sent.some((f) => f.t === "discard" && f.id === "edge-open-reject")).toBe(true);
+  });
+
+  test("accept after rejected open waits for a later valid open", async () => {
+    dw = createTestWorker({ bridge: { streamBacklogLimit: 1 } });
+    const inject = (dw as any).handleIncomingStreamFrame.bind(dw);
+    const tag = "__denojs_worker_stream_v1";
+
+    inject({ [tag]: true, t: "open", id: "edge-open-a", key: "edge-over-a" });
+    inject({ [tag]: true, t: "open", id: "edge-open-b", key: "edge-over-b" }); // rejected by cap
+
+    let resolved = false;
+    const pending = dw.stream.accept("edge-over-b").then((r) => {
+      resolved = true;
+      return r;
+    });
+    await sleep(30);
+    expect(resolved).toBe(false);
+
+    inject({ [tag]: true, t: "open", id: "edge-open-b2", key: "edge-over-b" });
+    inject({ [tag]: true, t: "chunk", id: "edge-open-b2", chunk: new Uint8Array([7]) });
+    inject({ [tag]: true, t: "close", id: "edge-open-b2" });
+
+    const reader = await pending;
+    const got: number[] = [];
+    for await (const chunk of reader) {
+      got.push(...Array.from(chunk));
+    }
+    expect(got).toEqual([7]);
+  });
+
+  test("ready(minBytes) waits at exact credit boundary and resumes after credit refill", async () => {
+    dw = createTestWorker();
+    const anyDw = dw as any;
+    const id = "edge-credit-internal";
+
+    anyDw.streamWriterCredits.set(id, 1);
+    anyDw.consumeWriterCredit(id, 1);
+    expect(anyDw.streamWriterCredits.get(id)).toBe(0);
+
+    const pending = anyDw.waitForWriterCredit(id, 1);
+    let done = false;
+    void pending.then(() => {
+      done = true;
+    });
+    await sleep(10);
+    expect(done).toBe(false);
+
+    anyDw.addWriterCredit(id, 1);
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  test("pending writer ready rejects on force restart and internal waiter map is cleared", async () => {
+    dw = createTestWorker();
+    await dw.eval(`
+      globalThis.__edgeRestartHold = (async () => {
+        await hostStreams.accept("edge-restart-ready");
+        await new Promise(() => {});
+      })();
+      0;
+    `);
+
+    const writer = dw.stream.create("edge-restart-ready");
+    const pending = writer.ready(32 * 1024 * 1024);
+    await sleep(20);
+    await dw.restart({ force: true });
+    await expect(pending).rejects.toThrow(/force-closed|released|closed/i);
+    expect((dw as any).streamWriterWaiters.size).toBe(0);
+  });
+
+  test("force restart clears stale stream state and allows fresh open in next epoch", async () => {
+    dw = createTestWorker();
+    const anyDw = dw as any;
+    const inject = anyDw.handleIncomingStreamFrame.bind(anyDw);
+    const tag = "__denojs_worker_stream_v1";
+
+    inject({ [tag]: true, t: "open", id: "edge-old-id", key: "edge-old-key" });
+    inject({ [tag]: true, t: "chunk", id: "edge-old-id", chunk: new Uint8Array([1]) });
+    expect(anyDw.streamById.size).toBeGreaterThan(0);
+    expect(anyDw.streamIncoming.size).toBeGreaterThan(0);
+
+    await dw.restart({ force: true });
+    expect(anyDw.streamById.size).toBe(0);
+    expect(anyDw.streamIncoming.size).toBe(0);
+    expect(anyDw.streamBacklog.size).toBe(0);
+
+    const acceptPromise = dw.stream.accept("edge-new-key");
+    inject({ [tag]: true, t: "open", id: "edge-new-id", key: "edge-new-key" });
+    const reader = await acceptPromise;
+    expect(reader).toBeDefined();
+    await reader.cancel("done");
+  });
 });

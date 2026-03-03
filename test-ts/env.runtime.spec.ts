@@ -1,5 +1,8 @@
 import { DenoWorker } from "../src/index";
 import { createTestWorker } from "./helpers.worker-harness";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 describe("deno_worker: runtime-local env namespace", () => {
   const key = `TEST_ENV_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -70,5 +73,57 @@ describe("deno_worker: runtime-local env namespace", () => {
 
     await dw.restart();
     await expect(dw.eval(`Deno.env.get("${key}")`)).resolves.toBe("boot");
+  });
+
+  test("env file paths are constrained to worker cwd sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "deno-director-env-root-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "deno-director-env-outside-"));
+    try {
+      await fs.writeFile(path.join(root, ".env"), "INSIDE_OK=1\n", "utf8");
+      await fs.writeFile(path.join(outside, "outside.env"), "OUTSIDE_BAD=1\n", "utf8");
+
+      const ok = createTestWorker({
+        cwd: root,
+        envFile: ".env",
+        permissions: { env: true },
+      });
+      workers.push(ok);
+      await expect(ok.eval(`Deno.env.get("INSIDE_OK")`)).resolves.toBe("1");
+
+      expect(() =>
+        createTestWorker({
+          cwd: root,
+          envFile: path.join(outside, "outside.env"),
+          permissions: { env: true },
+        }),
+      ).toThrow(/cwd sandbox|within worker cwd/i);
+
+      expect(() =>
+        createTestWorker({
+          cwd: root,
+          env: path.join(outside, "outside.env"),
+          permissions: { env: true },
+        }),
+      ).toThrow(/cwd sandbox|within worker cwd/i);
+
+      expect(() =>
+        createTestWorker({
+          cwd: root,
+          envFile: `file://${path.join(outside, "outside.env")}`,
+          permissions: { env: true },
+        }),
+      ).toThrow(/cwd sandbox|within worker cwd/i);
+
+      const insideAbs = createTestWorker({
+        cwd: root,
+        envFile: path.join(root, ".env"),
+        permissions: { env: true },
+      });
+      workers.push(insideAbs);
+      await expect(insideAbs.eval(`Deno.env.get("INSIDE_OK")`)).resolves.toBe("1");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    }
   });
 });

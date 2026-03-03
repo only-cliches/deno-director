@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] Future
+
+### Added
+- Added a new runtime handle API surface under `worker.handle` with rich value operations:
+  - `get`, `tryGet`, `eval`, `set`, `has`, `delete`, `keys`, `entries`,
+  - `getOwnPropertyDescriptor`, `define`, `instanceOf`, `isCallable`, `isPromise`,
+  - `call`, `construct`, `await`, `clone`, `toJSON`, `apply`, `getType`, `dispose`.
+- Added `rootType` handle metadata snapshot and root `getType()` cache refresh behavior.
+- Added handle-level execution options (`DenoWorkerHandleExecOptions`) with per-call `maxEvalMs`.
+- Added handle creation-level timeout defaults (`handle.eval(..., { maxEvalMs })`, `handle.get(..., { maxEvalMs })`) that apply to subsequent handle operations.
+- Added `bridge.streamBacklogLimit` option to cap unaccepted worker->Node stream-open backlog (default `256`).
+- Added a new handles usage example: `examples/12-handles.ts`.
+- Added new tests:
+  - `test-ts/handles.spec.ts` (comprehensive handle API behavior),
+  - `test-ts/options.merge.spec.ts` (deep merge semantics),
+  - additional hardening/regression coverage in env/module-loader/streams specs.
+
+### Changed
+- Breaking API cleanup:
+  - consolidated handle entrypoints to `worker.handle.{get,tryGet,eval}`,
+  - removed prior alias/legacy-style handle entrypoints and watch/unwatch-style behavior.
+- Moved worker limits to `options.limits` and updated docs/examples/tests accordingly:
+  - `maxHandle`, `maxEvalMs`, `maxMemoryBytes`, `maxStackSizeBytes`.
+- Updated `mergeWorkerOptions` to deep-merge `limits` and `moduleLoader` (in addition to existing nested merges).
+- Enriched `DenoWorkerHandleApplyOp` typing with explicit operation union values.
+- Updated bridge/options/docs comments for clearer defaults and operational guidance.
+
+### Fixed
+- Fixed `permissions.import` URL allowlist matching to prevent host-prefix confusion (for example, `example.com` no longer matches `example.com.attacker.tld`).
+- Fixed `permissions.import` URL matching to enforce path-boundary semantics.
+- Fixed `env`/`envFile` path loading to stay within configured worker `cwd` sandbox.
+- Fixed handle option precedence and inheritance edge case where passing `{}` at call-time could accidentally drop handle-level defaults.
+- Fixed unbounded inbound stream-open backlog growth by enforcing configurable backlog limits.
+
+### Security
+- Hardened remote import permission checks (strict origin/path matching for URL allowlists).
+- Hardened environment file loading boundaries to prevent out-of-sandbox path reads through config.
+- Hardened handle bridge/runtime behavior and error signaling (structured codes and safer edge-case handling).
+
+### Performance
+- Reused a shared `reqwest` HTTP client for remote module fetches (avoids per-fetch client construction).
+- Reworked sync Node-dispatch flow to use a dedicated dispatch thread + ack channel, removing queue-polling sleep loops from the runtime thread.
+- Kept handle batching path (`handle.apply`) and timeout controls aligned for lower roundtrip overhead under heavy handle usage.
+
+
 ## [0.8.5] Mar 3, 2026
 
 ### Added

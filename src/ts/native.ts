@@ -10,7 +10,9 @@ try {
     const g: any = globalThis as any;
     if (!g.__v8) {
         g.__v8 = {
+            /** Serialize host values using Node's V8 serializer. */
             serialize: (value: any) => v8mod.serialize(value),
+            /** Deserialize buffers produced by Node's V8 serializer. */
             deserialize: (buf: any) => v8mod.deserialize(buf),
         };
     }

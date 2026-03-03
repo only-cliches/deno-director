@@ -6,8 +6,14 @@ import { wrapModuleNamespace } from "./module-namespace";
 import { coerceMemoryPayload, normalizeEvalOptions, normalizeWorkerOptions } from "./options";
 import { dehydrateForWire, hydrateFromWire } from "./wire";
 import type {
+    DenoWorkerHandleApplyOp,
+    DenoWorkerHandleAwaitOptions,
+    DenoWorkerHandleExecOptions,
+    DenoWorkerHandleApi,
     DenoWorkerCloseHandler,
     DenoWorkerEvent,
+    DenoWorkerHandle,
+    DenoWorkerHandleTypeInfo,
     DenoWorkerLifecycleContext,
     DenoWorkerLifecycleHandler,
     DenoWorkerLifecycleHooks,
@@ -54,7 +60,332 @@ const STREAM_DEFAULT_WINDOW_BYTES = 16 * 1024 * 1024;
 // Default credit flush threshold (256 KiB): avoids chatty credit updates while
 // keeping writers responsive under sustained transfer.
 const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
+const STREAM_BACKLOG_DEFAULT_LIMIT = 256;
+const HANDLE_DEFAULT_MAX = 128;
+const HANDLE_RUNTIME_KEY = "__denojs_worker_handle_v1";
+const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
+    const mkErr = (code, message) => {
+        const e = new Error(message);
+        e.code = code;
+        throw e;
+    };
 
+    const existing = globalThis.${HANDLE_RUNTIME_KEY};
+    if (existing) {
+        if (existing.__denojs_worker_handle_api_v1 === true) return true;
+        mkErr("HANDLE_BRIDGE_TAMPERED", "Handle runtime bridge key is already occupied by incompatible value");
+    }
+
+    const reg = new Map();
+    const splitPath = (path) => {
+        if (path == null || path === "") return [];
+        if (typeof path !== "string") mkErr("HANDLE_PATH_INVALID", "Handle path must be a string");
+        const segs = path.split(".").map((s) => s.trim());
+        if (segs.length === 0 || segs.some((s) => !s)) {
+            mkErr("HANDLE_PATH_INVALID", \`Invalid handle path: \${String(path)}\`);
+        }
+        if (segs.some((s) => s === "__proto__" || s === "prototype" || s === "constructor")) {
+            mkErr("HANDLE_PATH_FORBIDDEN", "Path contains forbidden prototype mutation segment");
+        }
+        return segs;
+    };
+    const mustObjectLike = (v, path) => {
+        const t = typeof v;
+        if (v == null || (t !== "object" && t !== "function")) {
+            mkErr("HANDLE_PATH_INVALID", \`Cannot traverse handle path '\${path}'\`);
+        }
+    };
+    const hasOwnOrProto = (obj, key) => key in Object(obj);
+    const resolve = (base, path) => {
+        const segs = splitPath(path);
+        let cur = base;
+        for (const seg of segs) {
+            mustObjectLike(cur, path);
+            cur = cur[seg];
+        }
+        return cur;
+    };
+    const resolveWithExistence = (base, path) => {
+        const segs = splitPath(path);
+        let cur = base;
+        for (const seg of segs) {
+            mustObjectLike(cur, path);
+            if (!hasOwnOrProto(cur, seg)) return { exists: false, value: undefined };
+            cur = cur[seg];
+        }
+        return { exists: true, value: cur };
+    };
+    const resolveParent = (base, path) => {
+        const segs = splitPath(path);
+        if (segs.length === 0) mkErr("HANDLE_PATH_INVALID", "Handle set/call path cannot be empty");
+        let cur = base;
+        for (let i = 0; i < segs.length - 1; i += 1) {
+            const seg = segs[i];
+            mustObjectLike(cur, path);
+            cur = cur[seg];
+        }
+        return { parent: cur, key: segs[segs.length - 1] };
+    };
+    const toEntries = (value) => {
+        if (value == null) return [];
+        if (value instanceof Map) return Array.from(value.entries());
+        if (value instanceof Set) return Array.from(value.entries());
+        if (typeof value === "object" || typeof value === "function") return Object.entries(value);
+        return [];
+    };
+    const toKeys = (value) => {
+        if (value == null) return [];
+        if (value instanceof Map || value instanceof Set) return Array.from(value.keys());
+        if (typeof value === "object" || typeof value === "function") return Object.keys(value);
+        return [];
+    };
+    const toJsonSnapshot = (value) => {
+        const seen = new WeakSet();
+        const s = JSON.stringify(value, (_key, v) => {
+            if (typeof v === "bigint") return { __bigint: v.toString() };
+            if (typeof v === "function") return \`[Function \${v.name || "anonymous"}]\`;
+            if (typeof v === "symbol") return String(v);
+            if (v instanceof Map) return { __map: Array.from(v.entries()) };
+            if (v instanceof Set) return { __set: Array.from(v.values()) };
+            if (v instanceof Date) return { __date: v.toISOString() };
+            if (v instanceof Error) return { __error: { name: v.name, message: v.message, stack: v.stack } };
+            if (v && typeof v === "object") {
+                if (seen.has(v)) return "[Circular]";
+                seen.add(v);
+            }
+            return v;
+        });
+        if (s === undefined) return undefined;
+        return JSON.parse(s);
+    };
+    const isPromiseLike = (value) =>
+        value != null &&
+        (typeof value === "object" || typeof value === "function") &&
+        typeof value.then === "function";
+    const awaitOne = (value) =>
+        new Promise((resolve, reject) => {
+            try {
+                value.then(
+                    (v) => resolve({ value: v }),
+                    reject,
+                );
+            } catch (e) {
+                reject(e);
+            }
+        });
+    const typeInfo = (value) => {
+        const tag = Object.prototype.toString.call(value);
+        let type = "object";
+        if (value === undefined) type = "undefined";
+        else if (value === null) type = "null";
+        else if (Array.isArray(value)) type = "array";
+        else if (tag === "[object Date]") type = "date";
+        else if (tag === "[object RegExp]") type = "regexp";
+        else if (tag === "[object Map]") type = "map";
+        else if (tag === "[object Set]") type = "set";
+        else if (tag === "[object ArrayBuffer]") type = "arraybuffer";
+        else if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value)) type = "typedarray";
+        else if (value instanceof Error) type = "error";
+        else if (tag === "[object Promise]") type = "promise";
+        else type = typeof value;
+        const out = { type, callable: typeof value === "function" };
+        if (value && (typeof value === "object" || typeof value === "function")) {
+            const ctorName = value.constructor && typeof value.constructor.name === "string" ? value.constructor.name : undefined;
+            if (ctorName) out.constructorName = ctorName;
+        }
+        return out;
+    };
+    const api = {
+        async run(payload) {
+            if (!payload || typeof payload !== "object") mkErr("HANDLE_PAYLOAD_INVALID", "Invalid handle payload");
+            const op = String(payload.op || "");
+            const id = String(payload.id || "");
+            if (!id) mkErr("HANDLE_ID_INVALID", "Invalid handle id");
+
+            if (op === "createFromPath") {
+                const found = resolveWithExistence(globalThis, payload.path);
+                if (!found.exists) mkErr("HANDLE_PATH_NOT_FOUND", \`Handle path not found: \${String(payload.path)}\`);
+                reg.set(id, found.value);
+                return { id };
+            }
+            if (op === "createFromEval") {
+                const src = String(payload.source || "");
+                if (!src.trim()) mkErr("HANDLE_EVAL_SOURCE_EMPTY", "handle.eval(source) requires non-empty source");
+                const root = (0, eval)(src);
+                reg.set(id, root);
+                return { id };
+            }
+            if (op === "dispose") {
+                reg.delete(id);
+                return true;
+            }
+
+            if (!reg.has(id)) mkErr("HANDLE_INVALIDATED", "Handle disposed or invalidated");
+            const root = reg.get(id);
+
+            if (op === "get") return resolve(root, payload.path);
+            if (op === "set") {
+                const { parent, key } = resolveParent(root, payload.path);
+                mustObjectLike(parent, payload.path);
+                parent[key] = payload.value;
+                return null;
+            }
+            if (op === "has") {
+                const found = resolveWithExistence(root, payload.path);
+                return found.exists;
+            }
+            if (op === "delete") {
+                const { parent, key } = resolveParent(root, payload.path);
+                mustObjectLike(parent, payload.path);
+                if (!(key in Object(parent))) return false;
+                return delete parent[key];
+            }
+            if (op === "keys") return toKeys(resolve(root, payload.path));
+            if (op === "entries") return toEntries(resolve(root, payload.path));
+            if (op === "getOwnPropertyDescriptor") {
+                const { parent, key } = resolveParent(root, payload.path);
+                mustObjectLike(parent, payload.path);
+                return Object.getOwnPropertyDescriptor(parent, key);
+            }
+            if (op === "define") {
+                const { parent, key } = resolveParent(root, payload.path);
+                mustObjectLike(parent, payload.path);
+                Object.defineProperty(parent, key, payload.descriptor || {});
+                return true;
+            }
+            if (op === "instanceOf") {
+                const ctor = resolve(globalThis, payload.constructorPath);
+                if (typeof ctor !== "function") mkErr("HANDLE_CTOR_INVALID", "constructorPath does not resolve to a function");
+                return root instanceof ctor;
+            }
+            if (op === "isCallable") return typeof resolve(root, payload.path) === "function";
+            if (op === "isPromise") return isPromiseLike(resolve(root, payload.path));
+            if (op === "call") {
+                const path = payload.path == null ? "" : String(payload.path);
+                const args = Array.isArray(payload.args) ? payload.args : [];
+                if (!path) {
+                    if (typeof root !== "function") mkErr("HANDLE_NOT_CALLABLE", "Handle root is not callable");
+                    return root(...args);
+                }
+                const { parent, key } = resolveParent(root, path);
+                mustObjectLike(parent, path);
+                const fn = parent[key];
+                if (typeof fn !== "function") mkErr("HANDLE_NOT_CALLABLE", \`Handle path is not callable: \${path}\`);
+                return fn.apply(parent, args);
+            }
+            if (op === "construct") {
+                const args = Array.isArray(payload.args) ? payload.args : [];
+                if (typeof root !== "function") mkErr("HANDLE_NOT_CONSTRUCTABLE", "Handle root is not constructable");
+                return new root(...args);
+            }
+            if (op === "await") {
+                const returnValue = payload.returnValue !== false;
+                const untilNonPromise = payload.untilNonPromise === true;
+                const run = async () => {
+                    if (!untilNonPromise) {
+                        return await Promise.resolve(root);
+                    }
+                    let resolved = root;
+                    for (let i = 0; i < 1024; i += 1) {
+                        if (!isPromiseLike(resolved)) break;
+                        const step = await awaitOne(resolved);
+                        resolved = step.value;
+                    }
+                    if (isPromiseLike(resolved)) {
+                        mkErr("HANDLE_AWAIT_MAX_DEPTH", "handle.await({ untilNonPromise: true }) exceeded max unwrap depth");
+                    }
+                    return resolved;
+                };
+                return run().then((resolved) => {
+                    reg.set(id, resolved);
+                    return returnValue ? resolved : undefined;
+                });
+            }
+            if (op === "clone") {
+                const nextId = String(payload.nextId || "");
+                if (!nextId) mkErr("HANDLE_CLONE_ID_INVALID", "clone requires nextId");
+                reg.set(nextId, root);
+                return { id: nextId };
+            }
+            if (op === "toJSON") return toJsonSnapshot(resolve(root, payload.path));
+            if (op === "apply") {
+                const items = Array.isArray(payload.ops) ? payload.ops : [];
+                const out = [];
+                for (const item of items) {
+                    const opName = item && typeof item.op === "string" ? item.op : "";
+                    if (!opName) mkErr("HANDLE_APPLY_OP_INVALID", "Invalid handle apply op");
+                    if (opName === "get") out.push(resolve(root, item.path == null ? "" : item.path));
+                    else if (opName === "set") {
+                        const { parent, key } = resolveParent(root, item.path);
+                        mustObjectLike(parent, item.path);
+                        parent[key] = item.value;
+                        out.push(null);
+                    } else if (opName === "call") {
+                        const path = item.path == null ? "" : String(item.path);
+                        const args = Array.isArray(item.args) ? item.args : [];
+                        if (!path) {
+                            if (typeof root !== "function") mkErr("HANDLE_NOT_CALLABLE", "Handle root is not callable");
+                            let result = root(...args);
+                            if (isPromiseLike(result)) result = await Promise.resolve(result);
+                            out.push(result);
+                        } else {
+                            const { parent, key } = resolveParent(root, path);
+                            mustObjectLike(parent, path);
+                            const fn = parent[key];
+                            if (typeof fn !== "function") mkErr("HANDLE_NOT_CALLABLE", \`Handle path is not callable: \${path}\`);
+                            let result = fn.apply(parent, args);
+                            if (isPromiseLike(result)) result = await Promise.resolve(result);
+                            out.push(result);
+                        }
+                    } else if (opName === "has") {
+                        out.push(resolveWithExistence(root, item.path).exists);
+                    } else if (opName === "delete") {
+                        const { parent, key } = resolveParent(root, item.path);
+                        mustObjectLike(parent, item.path);
+                        out.push(key in Object(parent) ? delete parent[key] : false);
+                    } else if (opName === "getType") {
+                        out.push(typeInfo(resolve(root, item.path == null ? "" : item.path)));
+                    } else if (opName === "toJSON") {
+                        out.push(toJsonSnapshot(resolve(root, item.path == null ? "" : item.path)));
+                    } else if (opName === "isCallable") {
+                        out.push(typeof resolve(root, item.path == null ? "" : item.path) === "function");
+                    } else if (opName === "isPromise") {
+                        out.push(isPromiseLike(resolve(root, item.path == null ? "" : item.path)));
+                    } else {
+                        mkErr("HANDLE_APPLY_OP_UNSUPPORTED", \`Unsupported apply op: \${opName}\`);
+                    }
+                }
+                return out;
+            }
+            if (op === "getType") return typeInfo(resolve(root, payload.path));
+
+            mkErr("HANDLE_OP_UNKNOWN", \`Unknown handle operation: \${op}\`);
+        },
+    };
+    Object.defineProperty(api, "__denojs_worker_handle_api_v1", {
+        value: true,
+        enumerable: false,
+        configurable: false,
+        writable: false,
+    });
+
+    Object.defineProperty(globalThis, "${HANDLE_RUNTIME_KEY}", {
+        value: api,
+        configurable: false,
+        enumerable: false,
+        writable: false,
+    });
+    return true;
+})()`;
+const HANDLE_RUNTIME_RUN_SOURCE = `(payload) => {
+    const api = globalThis.${HANDLE_RUNTIME_KEY};
+    if (!api || typeof api.run !== "function") {
+        const e = new Error("Handle runtime bridge is not installed");
+        e.code = "HANDLE_BRIDGE_MISSING";
+        throw e;
+    }
+    return api.run(payload);
+}`;
 type StreamFrameType = "open" | "chunk" | "close" | "error" | "cancel" | "discard" | "credit";
 
 type StreamFrame = {
@@ -388,10 +719,260 @@ export class DenoWorker {
     private streamCreditFlushQueued = false;
     private readonly streamWindowBytes: number;
     private readonly streamCreditFlushBytes: number;
+    private readonly streamBacklogLimit: number;
+    private handleGeneration = 1;
+    private handleCounter = 0;
+    private handleBridgeInstallPromise: Promise<void> | null = null;
+    private readonly activeHandleIds = new Set<string>();
+    private readonly maxHandle: number;
     readonly stream: DenoWorkerStreamApi = {
         create: (key?: string) => this.streamCreate(key),
         accept: (key: string) => this.streamAccept(key),
     };
+    readonly handle: DenoWorkerHandleApi = {
+        get: (path: string, options?: DenoWorkerHandleExecOptions) => this.handleGet(path, options),
+        tryGet: (path: string, options?: DenoWorkerHandleExecOptions) => this.handleTryGet(path, options),
+        eval: (source: string, options?: Omit<EvalOptions, "args" | "type">) => this.handleEval(source, options),
+    };
+
+    private nextHandleId(): string {
+        this.handleCounter += 1;
+        return `h:${this.nativeEpoch}:${this.handleCounter}`;
+    }
+
+    private ensureHandleCapacity(): void {
+        if (this.activeHandleIds.size < this.maxHandle) return;
+        const e: any = new Error(`handle limit reached (${this.maxHandle})`);
+        e.code = "HANDLE_LIMIT_REACHED";
+        throw e;
+    }
+
+    private invalidateHandles(): void {
+        this.handleGeneration += 1;
+        this.handleBridgeInstallPromise = null;
+        this.activeHandleIds.clear();
+    }
+
+    private async ensureHandleBridgeInstalled(): Promise<void> {
+        if (this.handleBridgeInstallPromise) return this.handleBridgeInstallPromise;
+        const pending = this.eval(HANDLE_RUNTIME_INSTALL_SOURCE).then(() => undefined);
+        this.handleBridgeInstallPromise = pending;
+        try {
+            await pending;
+        } catch (e) {
+            this.handleBridgeInstallPromise = null;
+            throw e;
+        }
+    }
+
+    private async runHandleOp(
+        payload: Record<string, unknown>,
+        options?: Omit<EvalOptions, "args" | "type">,
+    ): Promise<any> {
+        await this.startupPromise;
+        await this.ensureHandleBridgeInstalled();
+        return await this.eval(HANDLE_RUNTIME_RUN_SOURCE, {
+            ...(options ?? {}),
+            args: [payload],
+        });
+    }
+
+    private createHandle(
+        id: string,
+        generation: number,
+        rootType: DenoWorkerHandleTypeInfo,
+        defaultExecOptions?: Omit<EvalOptions, "args" | "type">,
+    ): DenoWorkerHandle {
+        let disposed = false;
+        let rootTypeCache = rootType;
+        const self = this;
+        const toExecOptions = (
+            value?: DenoWorkerHandleExecOptions | Omit<EvalOptions, "args" | "type">,
+        ): Omit<EvalOptions, "args" | "type"> | undefined => {
+            if (!value || typeof value !== "object") return defaultExecOptions ? { ...defaultExecOptions } : undefined;
+            const out: Omit<EvalOptions, "args" | "type"> = {};
+            if (typeof value.maxEvalMs === "number") out.maxEvalMs = value.maxEvalMs;
+            if (typeof (value as Omit<EvalOptions, "args" | "type">).filename === "string") {
+                out.filename = (value as Omit<EvalOptions, "args" | "type">).filename;
+            }
+            if (Object.keys(out).length === 0) return defaultExecOptions ? { ...defaultExecOptions } : undefined;
+            if (!defaultExecOptions) return out;
+            return { ...defaultExecOptions, ...out };
+        };
+        const ensureUsable = () => {
+            if (disposed || generation !== self.handleGeneration) {
+                disposed = true;
+                throw new Error("Handle disposed or invalidated");
+            }
+        };
+
+        const handle: Record<string, unknown> = {
+            id,
+            get: async (path?: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                return await self.runHandleOp({ op: "get", id, path: path ?? "" }, toExecOptions(options));
+            },
+            has: async (path: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const p = String(path ?? "").trim();
+                if (!p) throw new Error("handle.has(path) requires a non-empty path");
+                return await self.runHandleOp({ op: "has", id, path: p }, toExecOptions(options));
+            },
+            set: async (path: string, value: any, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const p = String(path ?? "").trim();
+                if (!p) throw new Error("handle.set(path, value) requires a non-empty path");
+                await self.runHandleOp({ op: "set", id, path: p, value }, toExecOptions(options));
+            },
+            delete: async (path: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const p = String(path ?? "").trim();
+                if (!p) throw new Error("handle.delete(path) requires a non-empty path");
+                return await self.runHandleOp({ op: "delete", id, path: p }, toExecOptions(options));
+            },
+            keys: async (path?: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                return await self.runHandleOp({ op: "keys", id, path: path ?? "" }, toExecOptions(options));
+            },
+            entries: async (path?: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                return await self.runHandleOp({ op: "entries", id, path: path ?? "" }, toExecOptions(options));
+            },
+            getOwnPropertyDescriptor: async (path: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const p = String(path ?? "").trim();
+                if (!p) throw new Error("handle.getOwnPropertyDescriptor(path) requires a non-empty path");
+                return await self.runHandleOp({ op: "getOwnPropertyDescriptor", id, path: p }, toExecOptions(options));
+            },
+            define: async (path: string, descriptor: PropertyDescriptor, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const p = String(path ?? "").trim();
+                if (!p) throw new Error("handle.define(path, descriptor) requires a non-empty path");
+                return await self.runHandleOp({ op: "define", id, path: p, descriptor }, toExecOptions(options));
+            },
+            instanceOf: async (constructorPath: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const p = String(constructorPath ?? "").trim();
+                if (!p) throw new Error("handle.instanceOf(constructorPath) requires a non-empty path");
+                return await self.runHandleOp({ op: "instanceOf", id, constructorPath: p }, toExecOptions(options));
+            },
+            isCallable: async (path?: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                return await self.runHandleOp({ op: "isCallable", id, path: path ?? "" }, toExecOptions(options));
+            },
+            isPromise: async (path?: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                return await self.runHandleOp({ op: "isPromise", id, path: path ?? "" }, toExecOptions(options));
+            },
+            call: async (
+                pathOrArgs?: string | any[],
+                argsOrOptions?: any[] | DenoWorkerHandleExecOptions,
+                optionsMaybe?: DenoWorkerHandleExecOptions,
+            ) => {
+                ensureUsable();
+                if (typeof pathOrArgs === "string") {
+                    const p = pathOrArgs.trim();
+                    if (!p) throw new Error("handle.call(path, args?) requires a non-empty path");
+                    if (argsOrOptions !== undefined && !Array.isArray(argsOrOptions)) {
+                        throw new Error("handle.call(path, args?, options?) expects args as an array when path is provided");
+                    }
+                    return await self.runHandleOp({
+                        op: "call",
+                        id,
+                        path: p,
+                        args: Array.isArray(argsOrOptions) ? argsOrOptions : [],
+                    }, toExecOptions(optionsMaybe));
+                }
+                const args = pathOrArgs;
+                if (args !== undefined && !Array.isArray(args)) {
+                    throw new Error("handle.call(args?) expects args as an array");
+                }
+                const execOptions = toExecOptions(optionsMaybe ?? (Array.isArray(argsOrOptions) ? undefined : argsOrOptions));
+                return await self.runHandleOp({
+                    op: "call",
+                    id,
+                    path: "",
+                    args: Array.isArray(args) ? args : [],
+                }, execOptions);
+            },
+            construct: async (args?: any[], options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                if (args !== undefined && !Array.isArray(args)) {
+                    throw new Error("handle.construct(args?) expects args as an array");
+                }
+                return await self.runHandleOp(
+                    { op: "construct", id, args: Array.isArray(args) ? args : [] },
+                    toExecOptions(options),
+                );
+            },
+            await: async (options?: DenoWorkerHandleAwaitOptions & DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                const resolved = await self.runHandleOp({
+                    op: "await",
+                    id,
+                    returnValue: options?.returnValue,
+                    untilNonPromise: options?.untilNonPromise,
+                }, toExecOptions(options));
+                rootTypeCache = (await self.runHandleOp({ op: "getType", id, path: "" }, toExecOptions(options))) as DenoWorkerHandleTypeInfo;
+                return resolved;
+            },
+            clone: async (options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                self.ensureHandleCapacity();
+                const nextId = self.nextHandleId();
+                const execOptions = toExecOptions(options);
+                await self.runHandleOp({ op: "clone", id, nextId }, execOptions);
+                const clonedRootType = (await self.runHandleOp({
+                    op: "getType",
+                    id: nextId,
+                    path: "",
+                }, execOptions)) as DenoWorkerHandleTypeInfo;
+                self.activeHandleIds.add(nextId);
+                return self.createHandle(nextId, generation, clonedRootType, defaultExecOptions);
+            },
+            toJSON: async (path?: string, options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                return await self.runHandleOp({ op: "toJSON", id, path: path ?? "" }, toExecOptions(options));
+            },
+            apply: async (ops: DenoWorkerHandleApplyOp[], options?: DenoWorkerHandleExecOptions) => {
+                ensureUsable();
+                if (!Array.isArray(ops)) throw new Error("handle.apply(ops) expects an array");
+                return await self.runHandleOp({ op: "apply", id, ops }, toExecOptions(options));
+            },
+            getType: async (path?: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandleTypeInfo> => {
+                ensureUsable();
+                const p = path ?? "";
+                const info = (await self.runHandleOp({ op: "getType", id, path: p }, toExecOptions(options))) as DenoWorkerHandleTypeInfo;
+                if (p === "") {
+                    rootTypeCache = info;
+                }
+                return info;
+            },
+            dispose: async (options?: DenoWorkerHandleExecOptions) => {
+                if (disposed) return;
+                disposed = true;
+                self.activeHandleIds.delete(id);
+                if (generation !== self.handleGeneration || self.isClosed()) return;
+                try {
+                    await self.runHandleOp({ op: "dispose", id }, toExecOptions(options));
+                } catch {
+                    // ignore best-effort dispose races
+                }
+            },
+        };
+
+        Object.defineProperty(handle, "disposed", {
+            enumerable: true,
+            configurable: false,
+            get: () => disposed || generation !== self.handleGeneration,
+        });
+        Object.defineProperty(handle, "rootType", {
+            enumerable: true,
+            configurable: false,
+            get: () => rootTypeCache,
+        });
+        return handle as DenoWorkerHandle;
+    }
 
     private isBinaryLikeValue(value: any): boolean {
         if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) return true;
@@ -547,6 +1128,7 @@ export class DenoWorker {
         native.on("close", () => {
             if (epoch !== this.nativeEpoch) return;
             this.closed = true;
+            this.invalidateHandles();
             this.failAllStreams("DenoWorker closed unexpectedly");
             this.emitCloseHandlersIfNeeded();
             if (!this.closeRequested) {
@@ -739,6 +1321,10 @@ export class DenoWorker {
                     this.rejectIncomingOpen(frame.id, key, `Stream key already in use: ${key}`);
                     return true;
                 }
+                if (!this.streamPendingAccepts.has(key) && this.streamBacklog.size >= this.streamBacklogLimit) {
+                    this.rejectIncomingOpen(frame.id, key, `Stream backlog limit reached (${this.streamBacklogLimit})`);
+                    return true;
+                }
                 this.registerStream(key, frame.id);
                 const reader = new StreamReaderImpl();
                 reader.setRemoteCancel((reason?: string) => {
@@ -900,9 +1486,15 @@ export class DenoWorker {
     constructor(options?: DenoWorkerOptions) {
         this.lifecycleHooks = options?.lifecycle;
         this.creationOptions = options;
+        const parsedMaxHandle = Number((options as any)?.limits?.maxHandle);
+        this.maxHandle =
+            Number.isFinite(parsedMaxHandle) && parsedMaxHandle >= 1
+                ? Math.trunc(parsedMaxHandle)
+                : HANDLE_DEFAULT_MAX;
         const rawBridge: any = options && typeof options === "object" ? (options as any).bridge : undefined;
         const parsedWindow = Number(rawBridge?.streamWindowBytes);
         const parsedFlush = Number(rawBridge?.streamCreditFlushBytes);
+        const parsedBacklogLimit = Number(rawBridge?.streamBacklogLimit);
         this.streamWindowBytes =
             Number.isFinite(parsedWindow) && parsedWindow >= 1
                 ? Math.trunc(parsedWindow)
@@ -911,6 +1503,10 @@ export class DenoWorker {
             Number.isFinite(parsedFlush) && parsedFlush >= 1
                 ? Math.trunc(parsedFlush)
                 : STREAM_CREDIT_FLUSH_THRESHOLD;
+        this.streamBacklogLimit =
+            Number.isFinite(parsedBacklogLimit) && parsedBacklogLimit >= 1
+                ? Math.trunc(parsedBacklogLimit)
+                : STREAM_BACKLOG_DEFAULT_LIMIT;
         this.invokeHook("beforeStart", { options });
         this.native = this.createNative(false);
         this.nativeEpoch += 1;
@@ -1279,6 +1875,7 @@ export class DenoWorker {
         this.closeRequested = true;
         if (!alreadyClosing) {
             this.invokeHook("beforeStop", { requested: true });
+            this.invalidateHandles();
         }
 
         if (force) {
@@ -1356,6 +1953,7 @@ export class DenoWorker {
         this.closed = false;
         this.closeRequested = false;
         this.closeNotified = false;
+        this.invalidateHandles();
 
         this.invokeHook("beforeStart", { options: this.creationOptions });
         this.native = this.createNative(true);
@@ -1394,6 +1992,44 @@ export class DenoWorker {
     async setGlobal(key: string, value: any): Promise<void> {
         await this.startupPromise;
         await this.setGlobalInternal(key, value);
+    }
+
+    private async handleGet(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle> {
+        const p = String(path ?? "").trim();
+        if (!p) throw new Error("handle.get(path) requires a non-empty path");
+        this.ensureHandleCapacity();
+        const id = this.nextHandleId();
+        const defaultExecOptions: Omit<EvalOptions, "args" | "type"> | undefined =
+            typeof options?.maxEvalMs === "number" ? { maxEvalMs: options.maxEvalMs } : undefined;
+        await this.runHandleOp({ op: "createFromPath", id, path: p }, defaultExecOptions);
+        const rootType = (await this.runHandleOp({ op: "getType", id, path: "" }, defaultExecOptions)) as DenoWorkerHandleTypeInfo;
+        this.activeHandleIds.add(id);
+        return this.createHandle(id, this.handleGeneration, rootType, defaultExecOptions);
+    }
+
+    private async handleTryGet(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle | undefined> {
+        try {
+            return await this.handleGet(path, options);
+        } catch (e) {
+            const code = String((e as any)?.code ?? "");
+            if (code === "HANDLE_PATH_NOT_FOUND") return undefined;
+            throw e;
+        }
+    }
+
+    private async handleEval(source: string, options?: Omit<EvalOptions, "args" | "type">): Promise<DenoWorkerHandle> {
+        const src = String(source ?? "");
+        if (!src.trim()) throw new Error("handle.eval(source) requires non-empty source");
+        this.ensureHandleCapacity();
+        const id = this.nextHandleId();
+        const defaultExecOptions: Omit<EvalOptions, "args" | "type"> | undefined =
+            options && (typeof options.maxEvalMs === "number" || typeof options.filename === "string")
+                ? { ...(typeof options.maxEvalMs === "number" ? { maxEvalMs: options.maxEvalMs } : {}), ...(typeof options.filename === "string" ? { filename: options.filename } : {}) }
+                : undefined;
+        await this.runHandleOp({ op: "createFromEval", id, source: src }, defaultExecOptions);
+        const rootType = (await this.runHandleOp({ op: "getType", id, path: "" }, defaultExecOptions)) as DenoWorkerHandleTypeInfo;
+        this.activeHandleIds.add(id);
+        return this.createHandle(id, this.handleGeneration, rootType, defaultExecOptions);
     }
 
     /**

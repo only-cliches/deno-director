@@ -8,6 +8,7 @@ type ModuleWrapperHost = {
     eval(src: string, options?: EvalOptions): Promise<any>;
 };
 
+/** Detects encoded module-function descriptors emitted by runtime-side module wrappers. */
 function getModuleFnTag(x: any): { spec: string; name: string; isAsync: boolean } | null {
     if (!x || typeof x !== "object") return null;
     const specRaw = (x as any).spec;
@@ -32,6 +33,10 @@ function getModuleFnTag(x: any): { spec: string; name: string; isAsync: boolean 
     return null;
 }
 
+/**
+ * Wraps hydrated module namespaces so exported runtime functions become
+ * host-callable stubs that dispatch back through `dw.eval`/`dw.evalSync`.
+ */
 export function wrapModuleNamespace<T extends Record<string, any>>(dw: ModuleWrapperHost, ns: any): T {
     if (!ns || typeof ns !== "object") return ns as T;
 

@@ -4,8 +4,10 @@ async function main() {
     const director = new DenoDirector({
         template: {
             workerOptions: {
-                maxMemoryBytes: 128 * 1024 * 1024,
-                maxEvalMs: 500,
+                limits: {
+                    maxMemoryBytes: 128 * 1024 * 1024,
+                    maxEvalMs: 500,
+                },
             },
         },
     });

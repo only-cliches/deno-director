@@ -6,14 +6,22 @@ const GRAPH_REF_KEY = "__denojs_worker_graph_ref";
 const GRAPH_KIND_KEY = "__denojs_worker_graph_kind";
 const GRAPH_VALUE_KEY = "__denojs_worker_graph_value";
 
+/** Canonical wire sentinel for `undefined` values. */
 function wireUndef(): WireJson {
     return { __undef: true };
 }
 
+/** Canonical wire sentinel for non-finite numeric markers. */
 function wireNum(tag: string): WireJson {
     return { __num: tag };
 }
 
+/**
+ * Converts host values into a JSON-safe wire representation.
+ *
+ * Preserves special JS types (Error, Date, typed arrays, Map/Set, bigint) and
+ * keeps object graph identity for cyclic/shared references via graph ids.
+ */
 export function dehydrateForWire(value: any): WireJson {
     const seen = typeof WeakMap !== "undefined" ? new WeakMap<object, number>() : null;
     let nextGraphId = 1;
@@ -150,17 +158,20 @@ export function dehydrateForWire(value: any): WireJson {
     return inner(value, 0);
 }
 
+/** Convenience wrapper for argument lists passed into eval/evalModule calls. */
 export function dehydrateArgs(args: any[] | undefined): any[] {
     if (!Array.isArray(args)) return [];
     return args.map((a) => dehydrateForWire(a));
 }
 
+/** Downcasts bigint to number only when precision would remain exact. */
 function maybeBigIntToNumber(x: bigint): number | bigint {
     const n = Number(x);
     if (Number.isSafeInteger(n) && BigInt(n) === x) return n;
     return x;
 }
 
+/** Clones typed-array views into the current realm to avoid cross-realm surprises. */
 function cloneViewToRealm(x: any): any {
     if (typeof Buffer !== "undefined" && Buffer.isBuffer(x)) return Buffer.from(x);
 
@@ -195,6 +206,7 @@ function cloneViewToRealm(x: any): any {
     }
 }
 
+/** Reconstructs ArrayBuffer/typed-array payloads from wire transport objects. */
 function bufferViewFromWire(obj: any): any {
     const b =
         obj && typeof obj === "object"
@@ -250,6 +262,11 @@ function bufferViewFromWire(obj: any): any {
     }
 }
 
+/**
+ * Rehydrates wire values back into host JS values.
+ *
+ * This is the inverse of `dehydrateForWire` for supported value categories.
+ */
 export function hydrateFromWire(v: any): any {
     const graph = new Map<number, any>();
 

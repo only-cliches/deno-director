@@ -73,7 +73,7 @@ describe("DenoWorker API", () => {
 
     // If your native constructor does not yet accept options, instantiate via whatever
     // option path your JS wrapper supports. This assumes you will wire options later.
-    const limited = createTestWorker({ maxEvalMs: 50 });
+    const limited = createTestWorker({ limits: { maxEvalMs: 50 } });
 
     try {
       await expect(limited.eval("while (true) {}")).rejects.toBeTruthy();
@@ -182,5 +182,15 @@ describe("DenoWorker API", () => {
     expect(out.status).toBe("rejected");
     await expect(dw.eval("21 * 2")).resolves.toBe(42);
     expect(dw.isClosed()).toBe(false);
+  });
+
+  test("repeated worker create/close cycles complete without teardown hangs", async () => {
+    const cycles = 12;
+    for (let i = 0; i < cycles; i++) {
+      const w = createTestWorker();
+      await expect(w.eval(`${i} + 1`)).resolves.toBe(i + 1);
+      await expect(w.close()).resolves.toBeUndefined();
+      expect(w.isClosed()).toBe(true);
+    }
   });
 });

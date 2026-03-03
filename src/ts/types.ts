@@ -227,7 +227,16 @@ export type DenoWorkerBridgeOption =
     | undefined
     | {
             /**
-             * Internal command queue capacity for host/runtime bridge channels.
+             * Per-queue capacity for internal host/runtime bridge channels.
+             *
+             * The runtime currently maintains separate bounded queues for:
+             * - control-plane work (`eval`, `setGlobal`, `memory`, `close`)
+             * - data-plane work (`postMessage` and stream envelopes)
+             * - node callback dispatch (`message`/`close`/host-callback settlements)
+             *
+             * So `channelSize` applies to each queue independently (not one
+             * global shared queue). Effective total buffered message slots can
+             * approach roughly `3 * channelSize` under load.
              *
              * Default: `512`.
              *
@@ -296,6 +305,27 @@ export type DenoWorkerBridgeOption =
              * - potential underutilization on latency-sensitive or mid-size workloads
              */
             streamCreditFlushBytes?: number;
+            /**
+             * Maximum number of worker->Node streams that may remain opened but not yet accepted on Node side.
+             *
+             * This caps the host-side backlog map used when stream `open` frames arrive before `stream.accept(key)`.
+             * When the limit is reached, additional incoming `open` frames are rejected until backlog entries are consumed.
+             *
+             * Default: `256`.
+             *
+             * Sane range:
+             * - typical: `64` to `2048`
+             * - high fanout/burst: up to `8192`
+             *
+             * If too low:
+             * - worker->Node producers can see earlier stream-open rejections
+             * - requires faster/earlier Node `stream.accept(...)` consumption
+             *
+             * If too high:
+             * - more idle stream reader state can accumulate
+             * - higher peak memory under key-fanout bursts
+             */
+            streamBacklogLimit?: number;
       };
 
 /**
@@ -322,6 +352,42 @@ export type DenoWorkerLifecycleHooks = Partial<
 >;
 export type DenoWorkerLifecycleHandler = (ctx: DenoWorkerLifecycleContext) => void;
 
+/** Worker limit controls for execution, memory, stack, and handle capacity. */
+export type DenoWorkerLimits = {
+    /**
+     * Description: maximum number of allowed simultaneously active handle references on this worker.
+     * Default: `128`.
+     * Min recommended: `16`.
+     * Max recommended: `4096`.
+     */
+    maxHandle?: number;
+    /**
+     * Description: default per-evaluation timeout in milliseconds.
+     * Applies to runtime execution surfaces including `eval`, `evalSync`, `evalModule`, `importModule`, and handle operations that execute code in runtime (for example `handle.call`, `handle.apply`, `handle.await`).
+     * Can be overridden per call via:
+     * - `EvalOptions.maxEvalMs` on `eval`/`evalSync`/`evalModule`
+     * - `DenoWorkerHandleExecOptions.maxEvalMs` on handle methods
+     * Default: unset (no default timeout).
+     * Min recommended: `10`.
+     * Max recommended: `120000`.
+     */
+    maxEvalMs?: number;
+    /**
+     * Description: maximum V8 heap size in bytes.
+     * Default: unset (runtime default).
+     * Min recommended: `33554432` (32 MiB).
+     * Max recommended: `2147483648` (2 GiB).
+     */
+    maxMemoryBytes?: number;
+    /**
+     * Description: maximum stack size in bytes.
+     * Default: unset.
+     * Min recommended: n/a (currently not supported; setting this currently rejects).
+     * Max recommended: n/a (currently not supported; setting this currently rejects).
+     */
+    maxStackSizeBytes?: number;
+};
+
 /**
  * Runtime creation options for {@link DenoWorker}.
  *
@@ -339,16 +405,8 @@ export type DenoWorkerLifecycleHandler = (ctx: DenoWorkerLifecycleContext) => vo
  * ```
  */
 export type DenoWorkerOptions = {
-    /**
-     * Default per-evaluation timeout (milliseconds).
-     *
-     * Can be overridden per call with `eval(..., { maxEvalMs })`.
-     */
-    maxEvalMs?: number;
-    /** Maximum V8 heap size in bytes. */
-    maxMemoryBytes?: number;
-    /** Maximum stack size in bytes. */
-    maxStackSizeBytes?: number;
+    /** Runtime limits bundle (timeouts, memory/stack caps, handle cap). */
+    limits?: DenoWorkerLimits;
     /** Bridge transport tuning (queue capacity and stream flow-control). */
     bridge?: DenoWorkerBridgeOption;
 
@@ -659,6 +717,145 @@ export type DenoWorkerStreamReader = AsyncIterable<Uint8Array> & {
 export type DenoWorkerStreamApi = {
     create(key?: string): DenoWorkerStreamWriter;
     accept(key: string): Promise<DenoWorkerStreamReader>;
+};
+
+export type DenoWorkerHandleType =
+    | "undefined"
+    | "null"
+    | "boolean"
+    | "number"
+    | "string"
+    | "bigint"
+    | "symbol"
+    | "function"
+    | "array"
+    | "object"
+    | "date"
+    | "regexp"
+    | "map"
+    | "set"
+    | "arraybuffer"
+    | "typedarray"
+    | "error"
+    | "promise";
+
+export type DenoWorkerHandleTypeInfo = {
+    type: DenoWorkerHandleType;
+    callable: boolean;
+    constructorName?: string;
+};
+
+export type DenoWorkerHandleApplyOp =
+    | { op: "get"; path?: string }
+    | { op: "set"; path: string; value: any }
+    | { op: "call"; path?: string; args?: any[] }
+    | { op: "has"; path: string }
+    | { op: "delete"; path: string }
+    | { op: "getType"; path?: string }
+    | { op: "toJSON"; path?: string }
+    | { op: "isCallable"; path?: string }
+    | { op: "isPromise"; path?: string };
+
+export type DenoWorkerHandleAwaitOptions = {
+    /** When true (default), resolve with the awaited value. When false, resolve with `undefined`. */
+    returnValue?: boolean;
+    /**
+     * Continue awaiting while the resolved value is still promise-like.
+     *
+     * Useful for aggressively unwrapping custom thenable/promise chains.
+     */
+    untilNonPromise?: boolean;
+};
+
+/**
+ * Per-handle-operation execution limits.
+ *
+ * This currently supports the same per-call eval timeout override used by
+ * top-level `eval`/`evalSync`.
+ */
+export type DenoWorkerHandleExecOptions = {
+    /** Per-call timeout override in milliseconds for this handle operation. */
+    maxEvalMs?: number;
+};
+
+/**
+ * Handle to a runtime-side value with explicit lifetime management.
+ *
+ * Handle operations are resolved relative to the handle root value.
+ */
+export type DenoWorkerHandle = {
+    /** Opaque handle id unique within a worker epoch. */
+    readonly id: string;
+    /** Root value type snapshot captured when the handle was created. */
+    readonly rootType: DenoWorkerHandleTypeInfo;
+    /** True after `dispose()` is called or worker lifecycle invalidates the handle. */
+    readonly disposed: boolean;
+    /** Get the handle root or a nested property under the handle root (`a.b.c` dot notation). */
+    get(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any>;
+    /** Returns true when a nested path exists under the handle root (`a.b.c` dot notation). */
+    has(path: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+    /** Set a nested property under the handle root (`a.b.c` dot notation). */
+    set(path: string, value: any, options?: DenoWorkerHandleExecOptions): Promise<void>;
+    /** Delete a nested property under the handle root (`a.b.c` dot notation). */
+    delete(path: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+    /** Return enumerable keys for objects/maps/sets at root or nested path. */
+    keys(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any[]>;
+    /** Return entries for objects/maps/sets at root or nested path. */
+    entries(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any[]>;
+    /** Return own-property descriptor for a nested property path (`a.b.c` dot notation). */
+    getOwnPropertyDescriptor(path: string, options?: DenoWorkerHandleExecOptions): Promise<PropertyDescriptor | undefined>;
+    /** Define a nested property via descriptor semantics (`a.b.c` dot notation). */
+    define(path: string, descriptor: PropertyDescriptor, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+    /** Check root value `instanceof` a constructor resolved from globalThis path. */
+    instanceOf(constructorPath: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+    /** Return true when root value (or nested path value) is callable. */
+    isCallable(path?: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+    /** Return true when root value (or nested path value) is promise-like (`then` function). */
+    isPromise(path?: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+    /** Call the handle root function with args. */
+    call(args?: any[], options?: DenoWorkerHandleExecOptions): Promise<any>;
+    /** Call a nested function path under the handle root with args (`a.b.c` dot notation). */
+    call(path: string, args?: any[], options?: DenoWorkerHandleExecOptions): Promise<any>;
+    /** Construct a new value with root function/class as constructor. */
+    construct(args?: any[], options?: DenoWorkerHandleExecOptions): Promise<any>;
+    /** Await root value and update handle root to the resolved value. */
+    await(options?: DenoWorkerHandleAwaitOptions & DenoWorkerHandleExecOptions): Promise<any>;
+    /** Clone this handle to a new handle id that references the same runtime value. */
+    clone(options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle>;
+    /** JSON snapshot for root or nested path value. */
+    toJSON(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any>;
+    /**
+     * Apply a sequence of operations in one runtime roundtrip.
+     * Supported op kinds: `get`, `set`, `call`, `has`, `delete`, `getType`, `toJSON`, `isCallable`, `isPromise`.
+     */
+    apply(ops: DenoWorkerHandleApplyOp[], options?: DenoWorkerHandleExecOptions): Promise<any[]>;
+    /** Return type metadata for the root value or nested property. */
+    getType(path?: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandleTypeInfo>;
+    /** Release runtime-side handle reference. Idempotent. */
+    dispose(options?: DenoWorkerHandleExecOptions): Promise<void>;
+};
+
+/** Handle namespace exposed on `DenoWorker.handle`. */
+export type DenoWorkerHandleApi = {
+    /**
+     * Create a handle to an existing runtime value path rooted at `globalThis` (`a.b.c` dot notation).
+     *
+     * `options.maxEvalMs` becomes the handle-level default timeout for subsequent handle calls.
+     */
+    get(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle>;
+    /**
+     * Best-effort variant of `get(path)`.
+     *
+     * Returns `undefined` when path is missing in runtime.
+     * `options.maxEvalMs` becomes the handle-level default timeout for subsequent handle calls.
+     */
+    tryGet(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle | undefined>;
+    /**
+     * Evaluate source and return a handle to the resulting runtime value.
+     *
+     * `options.maxEvalMs` is used both for creation and as the handle-level default timeout for subsequent handle calls.
+     */
+    eval(source: string, options?: Omit<EvalOptions, "args" | "type">): Promise<DenoWorkerHandle>;
 };
 
 /**
