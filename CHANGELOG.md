@@ -2,24 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.8.5] Mar 3, 2026
 
 ### Added
 - Added a stream regression spec in `test-ts/streams.spec.ts`:
   - `Node -> worker stream survives frames arriving before worker accepts`
   - Covers the race where `open/chunk/close` can arrive before `hostStreams.accept(...)` is called.
-
-### Fixed
-- Fixed stream frame ordering race on both sides of the bridge (`src/ts/worker.ts`, `src/worker/bootstrap.js`):
-  - `chunk/close/error/cancel` frames arriving before `open` are now queued per stream id and replayed after `open`.
-  - Prevents Node->worker stream hangs when producer closes quickly before consumer attaches.
-- Fixed README examples that were not directly runnable as written:
-  - corrected invalid/placeholder snippets (`getModule`, node-resolve example, console snippet variable naming, args section typo),
-  - updated streaming section to safer key/import usage and explicit worker task completion.
-
-## [0.8.5] - 2026-03-02
-
-### Added
+- Added a new bridge isolation test suite in `test-ts/bridge.isolation.spec.ts` covering:
+  - control-plane eval completion while data-plane traffic is saturated,
+  - data-plane dispatch under heavy queued eval load,
+  - force-close settling of mixed queued work,
+  - restart(force) stale-message isolation across runtime epochs,
+  - stream ordering under interleaved control/data traffic.
+- Added heavier contention coverage in `test-ts/contention.spec.ts`:
+  - `single runtime: 48 simultaneous stream pairs plus host-call storm`,
+  - `ABSURD contention: multi-wave runtime swarm with dense stream and host-call pressure`,
+  - environment-tunable stress knobs:
+    - `DENO_DIRECTOR_ABSURD_RUNTIMES`
+    - `DENO_DIRECTOR_ABSURD_WAVES`
+    - `DENO_DIRECTOR_ABSURD_STREAMS`
+    - `DENO_DIRECTOR_ABSURD_HOST_CALLS`.
+- Added native teardown helpers to the addon bridge API:
+  - `forceDispose()` for immediate best-effort native handle disposal,
+  - `__isRegistered()` internal registration probe used by teardown hardening.
+- Added dedicated contention scripts in `package.json`:
+  - `npm run test:contention`
+  - `npm run test:contention:absurd`
+  (both run with `--runInBand --forceExit` for deterministic CI/CLI completion under native open-handle warnings).
 - Added `moduleLoader.jsrResolve` to enable JSR-style specifier resolution (`jsr:@...` and `@std/...` mapping to `https://jsr.io/...`).
 - Added resolver tests for JSR mapping and updated TS tests for remote/module-loader behavior.
 - Added guard behavior/tests to prevent unresolved bare imports from stalling when Node/JSR resolution is disabled.
@@ -38,6 +47,15 @@ All notable changes to this project will be documented in this file.
 - Added messaging regression coverage to ensure plain-object Node->worker control messages still round-trip with ack responses (prevents `nodeToWorkerReset`-style stalls).
 
 ### Changed
+- Renamed module-specifier helper API from `getModule(specifier)` to `importModule(specifier)` with no compatibility alias.
+- Refactored Node->Deno bridge ingress into two queues:
+  - control plane (`eval`, `evalModule`, `evalSync`, `setGlobal`, `memory`, `close`)
+  - data plane (`postMessage`, including stream envelopes)
+  in `src/worker/state.rs`, `src/lib.rs`, `src/native_api/worker_api.rs`, and `src/worker/runtime.rs`.
+- Updated runtime scheduler to service both control/data queues and pre-drain queued data frames before executing a newly dequeued control message, reducing eval-vs-stream deadlock pressure on the single runtime lane.
+- Changed bridge enqueue behavior to queue-and-drain semantics under load instead of fail-fast-on-full for queued API surfaces.
+- Updated stress/limits/api assertions to reflect queue-and-drain semantics (no queue-full rejection expectation for in-flight overlap cases).
+- Enabled `forceExit: true` in Jest config for deterministic process termination while native-handle teardown hardening continues.
 - Migrated remote module toggle from `moduleLoader.denoRemote` to `moduleLoader.httpsResolve`.
 - Moved `nodeResolve` under `moduleLoader.nodeResolve`.
 - Replaced curl-based remote loading with async Tokio-friendly HTTP fetching via `reqwest` (with timeout and redirect limits).
@@ -65,8 +83,20 @@ All notable changes to this project will be documented in this file.
 - Reduced bridge conversion overhead for plain Deno objects/arrays by short-circuiting `serde_v8` output directly to `JsValueBridge::Json` when no wire markers are present (avoids an extra `wire::from_wire_json` pass).
 
 ### Fixed
+- Fixed stream frame ordering race on both sides of the bridge (`src/ts/worker.ts`, `src/worker/bootstrap.js`):
+  - `chunk/close/error/cancel` frames arriving before `open` are now queued per stream id and replayed after `open`.
+  - Prevents Node->worker stream hangs when producer closes quickly before consumer attaches.
+- Fixed runtime panic path introduced by blocking channel sends inside Tokio-driven runtime contexts by switching worker op send paths to bounded wait/retry semantics that avoid `blocking_send` panics on runtime threads.
+- Fixed stream and stream-edge test regressions caused by control-priority queueing by draining pending data-plane frames before running queued control work.
+- Hardened close/force-close teardown behavior in the TypeScript wrapper:
+  - bounded native close wait in force-close path,
+  - post-close native registration probe + best-effort hard-dispose fallback.
+- Fixed close cleanup fallback in `src/worker/dispatch/deno_commands.rs` so worker registry entries are removed even when close callback enqueue fails.
+- Fixed README examples that were not directly runnable as written:
+  - corrected invalid/placeholder snippets (`importModule`, node-resolve example, console snippet variable naming, args section typo),
+  - updated streaming section to safer key/import usage and explicit worker task completion.
 - Fixed promise settlement channel behavior to avoid dropped completions under load (`send` instead of non-blocking `try_send`).
-- Fixed synchronous eval request handling to fail fast when queue capacity is exceeded.
+- Fixed synchronous eval request handling under queue pressure (superseded by current queue-and-drain overlap behavior).
 - Fixed worker creation to propagate parse/config errors instead of silently continuing.
 - Hardened filesystem lexical path normalization to reduce traversal/escape risk.
 - Applied `maxMemoryBytes` to V8 runtime create params so memory limits are enforced.
@@ -104,5 +134,6 @@ All notable changes to this project will be documented in this file.
 
 ### Validation
 - Rust unit tests: `cargo test --lib` passed.
-- TypeScript tests: full Jest suite passed (`26 suites`, `205 tests`).
+- TypeScript tests: full Jest suite currently passes locally (`29 suites`, `224 tests`).
 - Stream-focused tests passed (`test-ts/streams.spec.ts`).
+- Focused high-contention/stream suites pass with the new queueing and scheduler behavior.

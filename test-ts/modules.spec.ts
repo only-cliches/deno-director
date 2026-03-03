@@ -79,7 +79,7 @@ describe("deno_worker: modules", () => {
     20_000
   );
 
-  it("getModule loads through imports callback and returns callable namespace", async () => {
+  it("importModule loads through imports callback and returns callable namespace", async () => {
     const seen: string[] = [];
     dw = createTestWorker({
       imports: (specifier: string) => {
@@ -98,7 +98,7 @@ describe("deno_worker: modules", () => {
       },
     });
 
-    const mod = await dw.getModule("virtual:math");
+    const mod = await dw.importModule("virtual:math");
     expect(seen).toContain("virtual:math");
     expect(mod.n).toBe(21);
     expect(mod.default).toBe("math-default");
@@ -106,8 +106,8 @@ describe("deno_worker: modules", () => {
     await expect(mod.plusOneAsync(41)).resolves.toBe(42);
   });
 
-  it("getModule propagates import rejection", async () => {
+  it("importModule propagates import rejection", async () => {
     dw = createTestWorker({ imports: false });
-    await expect(dw.getModule("virtual:nope")).rejects.toBeDefined();
+    await expect(dw.importModule("virtual:nope")).rejects.toBeDefined();
   });
 });

@@ -158,7 +158,7 @@ console.log(await mod.encrypt("secret")); // "c2VjcmV0"
 
 ```
 
-If you already have a module specifier, use `getModule` as a shorthand:
+If you already have a module specifier, use `importModule` as a shorthand:
 
 ```ts
 const worker = new DenoWorker({
@@ -170,7 +170,7 @@ const worker = new DenoWorker({
   },
 });
 
-const math = await worker.getModule("app:math");
+const math = await worker.importModule("app:math");
 console.log(await math.add(2, 3)); // 5
 
 await worker.close();
@@ -521,7 +521,7 @@ Evaluates JavaScript or TypeScript asynchronously.
 Evaluates JavaScript or TypeScript synchronously (blocks Node event loop while waiting).
 * `evalModule<T>(src: string, options?: EvalOptions): Promise<T>`
 Evaluates the source as an ES Module and returns a callable Proxy namespace to the exports.
-* `getModule<T>(specifier: string): Promise<T>`
+* `importModule<T>(specifier: string): Promise<T>`
 Imports a module specifier through the runtime import pipeline and returns a callable Proxy namespace to the exports.
 * `stream.create(key?: string): DenoWorkerStreamWriter`
 Creates a byte stream from Node -> worker. If `key` is omitted, a cryptographically secure random key is generated.

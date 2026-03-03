@@ -362,6 +362,7 @@ export class DenoWorker {
     private readonly lifecycleHandlers = new Set<DenoWorkerLifecycleHandler>();
     private readonly inFlightRejectors = new Set<(reason: unknown) => void>();
     private nativeEpoch = 0;
+    private closeNotified = false;
     private startupPromise: Promise<void> = Promise.resolve();
     private startupReady = true;
     private startupError: unknown = null;
@@ -547,7 +548,7 @@ export class DenoWorker {
             if (epoch !== this.nativeEpoch) return;
             this.closed = true;
             this.failAllStreams("DenoWorker closed unexpectedly");
-            this.emitCloseHandlers();
+            this.emitCloseHandlersIfNeeded();
             if (!this.closeRequested) {
                 this.invokeHook("onCrash", {
                     reason: new Error("Worker closed unexpectedly"),
@@ -566,6 +567,12 @@ export class DenoWorker {
                 // ignore subscriber errors
             }
         }
+    }
+
+    private emitCloseHandlersIfNeeded(): void {
+        if (this.closeNotified) return;
+        this.closeNotified = true;
+        this.emitCloseHandlers();
     }
 
     private nextStreamId(prefix: "n" | "w" = "n"): string {
@@ -640,11 +647,14 @@ export class DenoWorker {
 
     private waitForWriterCredit(id: string, minBytes: number): Promise<void> {
         if ((this.streamWriterCredits.get(id) || 0) >= minBytes) return Promise.resolve();
-        return new Promise<void>((resolve, reject) => {
+        const pending = new Promise<void>((resolve, reject) => {
             const arr = this.streamWriterWaiters.get(id) || [];
             arr.push({ minBytes, resolve, reject });
             this.streamWriterWaiters.set(id, arr);
         });
+        // Prevent teardown-triggered rejections from surfacing as unhandled before callers attach handlers.
+        void pending.catch(() => {});
+        return pending;
     }
 
     private registerStream(name: string, id: string): void {
@@ -1094,82 +1104,91 @@ export class DenoWorker {
             this.streamWriterWaiters.delete(id);
             this.streamWriterCredits.delete(id);
         };
+        const withHandledRejection = <T>(promise: Promise<T>): Promise<T> => {
+            void promise.catch(() => {});
+            return promise;
+        };
 
         return {
             getKey: () => finalKey,
-            ready: async (minBytes = 1) => {
-                ensureOpen();
-                const need = Math.max(1, Math.trunc(minBytes || 1));
-                await this.waitForWriterCredit(id, need);
-            },
-            write: async (chunk: Uint8Array | ArrayBuffer) => {
-                ensureOpen();
-                const u8 = toBinaryChunk(chunk);
-                await this.waitForWriterCredit(id, u8.byteLength);
-                this.emitStreamFrame({
-                    t: "chunk",
-                    id,
-                    chunk: u8,
-                });
-                this.consumeWriterCredit(id, u8.byteLength);
-            },
-            writeMany: async (chunks: Array<Uint8Array | ArrayBuffer>) => {
-                ensureOpen();
-                if (!Array.isArray(chunks) || chunks.length === 0) return 0;
-                const prepared: Uint8Array[] = [];
-                for (const chunk of chunks) {
+            ready: (minBytes = 1) => withHandledRejection((async () => {
+                    ensureOpen();
+                    const need = Math.max(1, Math.trunc(minBytes || 1));
+                    await this.waitForWriterCredit(id, need);
+                })()),
+            write: (chunk: Uint8Array | ArrayBuffer) =>
+                withHandledRejection((async () => {
+                    ensureOpen();
                     const u8 = toBinaryChunk(chunk);
-                    prepared.push(u8);
-                }
-                let sent = 0;
-                let batchBytes = 0;
-                let batch: Array<Omit<StreamFrame, typeof STREAM_BRIDGE_TAG>> = [];
-                for (const chunk of prepared) {
-                    await this.waitForWriterCredit(id, chunk.byteLength);
-                    batch.push({ t: "chunk", id, chunk });
-                    batchBytes += chunk.byteLength;
-                    sent += 1;
-                    if (batch.length >= 64) {
+                    await this.waitForWriterCredit(id, u8.byteLength);
+                    this.emitStreamFrame({
+                        t: "chunk",
+                        id,
+                        chunk: u8,
+                    });
+                    this.consumeWriterCredit(id, u8.byteLength);
+                })()),
+            writeMany: (chunks: Array<Uint8Array | ArrayBuffer>) =>
+                withHandledRejection((async () => {
+                    ensureOpen();
+                    if (!Array.isArray(chunks) || chunks.length === 0) return 0;
+                    const prepared: Uint8Array[] = [];
+                    for (const chunk of chunks) {
+                        const u8 = toBinaryChunk(chunk);
+                        prepared.push(u8);
+                    }
+                    let sent = 0;
+                    let batchBytes = 0;
+                    let batch: Array<Omit<StreamFrame, typeof STREAM_BRIDGE_TAG>> = [];
+                    for (const chunk of prepared) {
+                        await this.waitForWriterCredit(id, chunk.byteLength);
+                        batch.push({ t: "chunk", id, chunk });
+                        batchBytes += chunk.byteLength;
+                        sent += 1;
+                        if (batch.length >= 64) {
+                            this.emitStreamFrames(batch);
+                            this.consumeWriterCredit(id, batchBytes);
+                            batch = [];
+                            batchBytes = 0;
+                        }
+                    }
+                    if (batch.length > 0) {
                         this.emitStreamFrames(batch);
                         this.consumeWriterCredit(id, batchBytes);
-                        batch = [];
-                        batchBytes = 0;
                     }
-                }
-                if (batch.length > 0) {
-                    this.emitStreamFrames(batch);
-                    this.consumeWriterCredit(id, batchBytes);
-                }
-                return sent;
-            },
-            close: async () => {
-                if (done) return;
-                done = true;
-                try {
-                    this.emitStreamFrame({ t: "close", id });
-                } catch {
-                    // ignore during close race
-                }
-                this.markRemoteDiscard(id);
-                this.markLocalDiscard(id);
-                rejectWriterWaiters(`Stream closed: ${finalKey}`);
-            },
-            error: async (message: string) => {
-                if (done) return;
-                done = true;
-                this.emitStreamFrame({ t: "error", id, error: String(message || "stream error") });
-                this.markRemoteDiscard(id);
-                this.markLocalDiscard(id);
-                rejectWriterWaiters(`Stream errored: ${finalKey}`);
-            },
-            cancel: async (reason?: string) => {
-                if (done) return;
-                done = true;
-                this.emitStreamFrame({ t: "cancel", id, reason });
-                this.markRemoteDiscard(id);
-                this.markLocalDiscard(id);
-                rejectWriterWaiters(`Stream cancelled: ${finalKey}`);
-            },
+                    return sent;
+                })()),
+            close: () =>
+                withHandledRejection((async () => {
+                    if (done) return;
+                    done = true;
+                    try {
+                        this.emitStreamFrame({ t: "close", id });
+                    } catch {
+                        // ignore during close race
+                    }
+                    this.markRemoteDiscard(id);
+                    this.markLocalDiscard(id);
+                    rejectWriterWaiters(`Stream closed: ${finalKey}`);
+                })()),
+            error: (message: string) =>
+                withHandledRejection((async () => {
+                    if (done) return;
+                    done = true;
+                    this.emitStreamFrame({ t: "error", id, error: String(message || "stream error") });
+                    this.markRemoteDiscard(id);
+                    this.markLocalDiscard(id);
+                    rejectWriterWaiters(`Stream errored: ${finalKey}`);
+                })()),
+            cancel: (reason?: string) =>
+                withHandledRejection((async () => {
+                    if (done) return;
+                    done = true;
+                    this.emitStreamFrame({ t: "cancel", id, reason });
+                    this.markRemoteDiscard(id);
+                    this.markLocalDiscard(id);
+                    rejectWriterWaiters(`Stream cancelled: ${finalKey}`);
+                })()),
         };
     }
 
@@ -1275,7 +1294,7 @@ export class DenoWorker {
             }
 
             this.closePromise = Promise.resolve().then(() => {
-                this.emitCloseHandlers();
+                this.emitCloseHandlersIfNeeded();
                 this.invokeHook("afterStop", { requested: true });
             });
 
@@ -1299,6 +1318,7 @@ export class DenoWorker {
             .then(() => {
                 this.closed = true;
                 this.failAllStreams("DenoWorker closed");
+                this.emitCloseHandlersIfNeeded();
                 this.invokeHook("afterStop", { requested: true });
             })
             .catch(async (e: any) => {
@@ -1335,6 +1355,7 @@ export class DenoWorker {
         this.closePromise = null;
         this.closed = false;
         this.closeRequested = false;
+        this.closeNotified = false;
 
         this.invokeHook("beforeStart", { options: this.creationOptions });
         this.native = this.createNative(true);
@@ -1456,7 +1477,7 @@ export class DenoWorker {
      * This routes through the runtime's normal import resolution pipeline
      * (including imports callbacks and permission policy).
      */
-    async getModule<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T> {
+    async importModule<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T> {
         await this.startupPromise;
 
         const specJson = JSON.stringify(String(specifier));
