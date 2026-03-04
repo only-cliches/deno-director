@@ -113,18 +113,20 @@ describe("deno_worker: modules", () => {
   });
 
   test(
-  "permissions.wasm=false blocks .wasm module loading",
-  async () => {
-      const dir = await makeTempDir();
-      const wasmPath = path.join(dir, "mod.wasm");
-      await fs.writeFile(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+    "permissions.wasm=false blocks .wasm module loading",
+    async () => {
+      await withTempDir(async (dir) => {
+        const wasmPath = path.join(dir, "mod.wasm");
+        // Minimal valid wasm binary (magic + version).
+        await fs.writeFile(wasmPath, Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
 
-      dw = createTestWorker({ cwd: dir, imports: true, permissions: { wasm: false } });
-      const spec = pathToFileURL(wasmPath).href;
-      await expect(dw.importModule(spec)).rejects.toThrow(/WASM module loading is disabled by permissions\.wasm/i);
-  },
-  20_000,
-  );
-
+        dw = createTestWorker({ cwd: dir, imports: true, permissions: { wasm: false } });
+        const spec = pathToFileURL(wasmPath).href;
+        await expect(dw.importModule(spec)).rejects.toThrow(
+          /WASM module loading is disabled by permissions\.wasm/i
+        );
+      });
+    },
+    20_000
   );
 });

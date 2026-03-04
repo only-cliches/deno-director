@@ -2174,8 +2174,12 @@ export class DenoWorker {
      */
     async importModule<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T> {
         await this.startupPromise;
+        const spec = String(specifier);
+        if (this.creationOptions?.permissions?.wasm === false && this.isWasmSpecifier(spec)) {
+            throw new Error(`WASM module loading is disabled by permissions.wasm: ${spec}`);
+        }
 
-        const specJson = JSON.stringify(String(specifier));
+        const specJson = JSON.stringify(spec);
         const source = `(async () => {
             const spec = ${specJson};
             const m = await import(spec);
@@ -2215,6 +2219,17 @@ export class DenoWorker {
 
         const raw = await this.eval(source);
         return wrapModuleNamespace<T>(this, raw);
+    }
+
+    private isWasmSpecifier(specifier: string): boolean {
+        try {
+            const parsed = new URL(specifier);
+            return parsed.pathname.toLowerCase().endsWith(".wasm");
+        } catch {
+            const base = specifier.split("#")[0] ?? specifier;
+            const pathOnly = base.split("?")[0] ?? base;
+            return pathOnly.toLowerCase().endsWith(".wasm");
+        }
     }
 }
 
