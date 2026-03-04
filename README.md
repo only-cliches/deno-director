@@ -619,6 +619,7 @@ type DenoWorkerOptions = {
   limits?: {
     maxHandle?: number;         // Active handle cap (default 128)
     maxEvalMs?: number;         // Default timeout for eval + handle runtime operations
+    maxCpuMs?: number;          // Default CPU-budget timeout for eval + handle runtime operations
     maxMemoryBytes?: number;    // V8 Heap limit
     wasm?: boolean;             // Enable/disable .wasm module loading (default true)
   };

@@ -221,6 +221,24 @@ describe("deno_worker: handles", () => {
     }
   });
 
+  test("handle.call can override worker maxCpuMs per operation", async () => {
+    const limited = createTestWorker({ limits: { maxCpuMs: 25 } });
+    try {
+      const h = await limited.handle.eval(`({
+        burn(ms) {
+          const start = Date.now();
+          while (Date.now() - start < ms) {}
+          return ms;
+        }
+      })`);
+
+      await expect(h.call("burn", [80])).rejects.toThrow();
+      await expect(h.call("burn", [80], { maxCpuMs: 250 })).resolves.toBe(80);
+    } finally {
+      if (!limited.isClosed()) await limited.close();
+    }
+  });
+
   test("handle.call supports options in root-call form", async () => {
     const limited = createTestWorker({ limits: { maxEvalMs: 25 } });
     try {
@@ -418,6 +436,37 @@ describe("deno_worker: handles", () => {
 
       await expect(h.get("slow", { maxEvalMs: 30 })).rejects.toThrow();
       await expect(h.apply([{ op: "call", path: "slowFn" }], { maxEvalMs: 30 })).rejects.toThrow();
+    } finally {
+      if (!limited.isClosed()) await limited.close();
+    }
+  });
+
+  test("handle maxCpuMs precedence matrix across methods", async () => {
+    const limited = createTestWorker({ limits: { maxCpuMs: 25 } });
+    try {
+      const h = await limited.handle.eval(
+        `({
+          get slow() {
+            const start = Date.now();
+            while (Date.now() - start < 80) {}
+            return 7;
+          },
+          slowFn() {
+            const start = Date.now();
+            while (Date.now() - start < 80) {}
+            return 8;
+          }
+        })`,
+        { maxCpuMs: 200 },
+      );
+
+      await expect(h.get("slow")).resolves.toBe(7);
+      await expect(h.getType("slowFn")).resolves.toMatchObject({ type: "function" });
+      await expect(h.toJSON("slow")).resolves.toBe(7);
+      await expect(h.apply([{ op: "get", path: "slow" }, { op: "call", path: "slowFn" }])).resolves.toEqual([7, 8]);
+
+      await expect(h.get("slow", { maxCpuMs: 30 })).rejects.toThrow();
+      await expect(h.apply([{ op: "call", path: "slowFn" }], { maxCpuMs: 30 })).rejects.toThrow();
     } finally {
       if (!limited.isClosed()) await limited.close();
     }

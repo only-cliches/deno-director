@@ -148,6 +148,20 @@ describe("deno_worker: eval", () => {
   );
 
   it(
+    "per-eval maxCpuMs overrides global maxCpuMs for that call only",
+    async () => {
+      await dw.close();
+      dw = createTestWorker({ limits: { maxCpuMs: 5_000 } });
+
+      const err1 = await dw.eval("while (true) {}", { maxCpuMs: 25 }).catch((e) => e);
+      expect(err1).toBeTruthy();
+
+      await expect(dw.eval("1 + 1")).resolves.toBe(2);
+    },
+    20_000
+  );
+
+  it(
     "per-eval maxEvalMs can be longer than global (overrides for that call)",
     async () => {
       await dw.close();

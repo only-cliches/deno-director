@@ -7,6 +7,13 @@ All notable changes to this project will be documented in this file.
 ### Changes
 - Moved `wasm` option from `limits` to `permissions` worker config object.
 - Added `ray-bench`.
+- Added `maxCpuMs` everywhere `maxEvalMs` is supported:
+  - `limits.maxCpuMs` for worker defaults,
+  - `EvalOptions.maxCpuMs` for per-call overrides (`eval` / `evalSync` / `evalModule`),
+  - `DenoWorkerHandleExecOptions.maxCpuMs` for handle operations.
+- Wired `maxCpuMs` through TS option normalization and native bridge parsing/runtime limits.
+- Enforced combined timeout behavior: when both `maxEvalMs` and `maxCpuMs` are set, runtime uses the stricter value (`min(maxEvalMs, maxCpuMs)`).
+- Updated docs/tests to cover `maxCpuMs` merge and per-call override behavior.
 
 ## [0.9.0] Mar 3, 2026
 

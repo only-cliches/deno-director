@@ -1,19 +1,27 @@
 export type WorkerCount = 1 | 4 | 8 | 12 | 16 | 32;
 
 export type ScenarioKey =
-    | "node-fn"
-    | "node-async-fn"
-    | "node-postmessage"
-    | "node-http"
-    | "deno-postmessage"
-    | "deno-streams"
-    | "deno-streams-reused"
-    | "deno-eval"
-    | "deno-evalsync"
-    | "deno-handle"
-    | "deno-postmessage-batched"
-    | "deno-handle-apply"
-    | "deno-eval-binary";
+    | "node+node-fn"
+    | "node+node-async-fn"
+    | "node+node-postmessage"
+    | "node+node-http"
+    | "node+deno-postmessage"
+    | "node+deno-streams"
+    | "node+deno-streams-reused"
+    | "node+deno-eval"
+    | "node+deno-evalsync"
+    | "node+deno-handle"
+    | "node+deno-postmessage-batched"
+    | "node+deno-handle-apply"
+    | "node+deno-eval-binary"
+    | "deno+deno-fn"
+    | "deno+deno-async-fn"
+    | "deno+deno-postmessage"
+    | "deno+deno-http"
+    | "bun+bun-fn"
+    | "bun+bun-async-fn"
+    | "bun+bun-postmessage"
+    | "bun+bun-http";
 
 export type BenchConfig = {
     width: number;
@@ -45,26 +53,35 @@ export type RenderResult = {
 export type ScenarioDef = {
     key: ScenarioKey;
     label: string;
-    main: "Node";
+    main: "Node" | "Deno" | "Bun";
     ipc: string;
-    worker: "Node" | "Node Worker" | "Deno";
+    worker: "Node" | "Node Worker" | "Deno" | "Bun";
+    requires?: ("node" | "deno" | "bun")[];
     setup?: (workerCount: number) => Promise<any>;
     run: (tasks: RenderTask[], workerCount: number, context?: any) => Promise<number>;
     teardown?: (context: any) => Promise<void>;
 };
 
 export const scenarioOrder: ScenarioKey[] = [
-    "node-fn",
-    "node-async-fn",
-    "node-postmessage",
-    "node-http",
-    "deno-postmessage",
-    "deno-streams",
-    "deno-streams-reused",
-    "deno-eval",
-    "deno-evalsync",
-    "deno-handle",
-    "deno-postmessage-batched",
-    "deno-handle-apply",
-    "deno-eval-binary",
+    "node+node-fn",
+    "node+node-async-fn",
+    "node+node-postmessage",
+    "node+node-http",
+    "node+deno-postmessage",
+    "node+deno-streams",
+    "node+deno-streams-reused",
+    "node+deno-eval",
+    "node+deno-evalsync",
+    "node+deno-handle",
+    "node+deno-postmessage-batched",
+    "node+deno-handle-apply",
+    "node+deno-eval-binary",
+    "deno+deno-fn",
+    "deno+deno-async-fn",
+    "deno+deno-postmessage",
+    "deno+deno-http",
+    "bun+bun-fn",
+    "bun+bun-async-fn",
+    "bun+bun-postmessage",
+    "bun+bun-http",
 ];

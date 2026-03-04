@@ -22,7 +22,7 @@ describe("deno_worker: limits", () => {
     });
   }
 
-    test(
+  test(
     "limits: per-eval maxEvalMs overrides worker default (and recovery works)",
     async () => {
       const dw = createTestWorker({ limits: { maxEvalMs: 30 }, bridge: { channelSize: 256 } });
@@ -38,6 +38,30 @@ describe("deno_worker: limits", () => {
       await expect(dw.eval(burn80ms)).rejects.toBeDefined();
 
       await expect(dw.eval(burn80ms, { maxEvalMs: 200 })).resolves.toBe(7);
+
+      await expect(dw.eval("40 + 2")).resolves.toBe(42);
+
+      await dw.close();
+    },
+    20_000
+  );
+
+  test(
+    "limits: per-eval maxCpuMs overrides worker default (and recovery works)",
+    async () => {
+      const dw = createTestWorker({ limits: { maxCpuMs: 30 }, bridge: { channelSize: 256 } });
+
+      const burn80ms = `
+        (() => {
+          const end = Date.now() + 80;
+          while (Date.now() < end) {}
+          return 7;
+        })()
+      `;
+
+      await expect(dw.eval(burn80ms)).rejects.toBeDefined();
+
+      await expect(dw.eval(burn80ms, { maxCpuMs: 200 })).resolves.toBe(7);
 
       await expect(dw.eval("40 + 2")).resolves.toBe(42);
 

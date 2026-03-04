@@ -42,6 +42,9 @@ export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undef
     if (typeof options.maxEvalMs === "number" && Number.isFinite(options.maxEvalMs) && options.maxEvalMs > 0) {
         out.maxEvalMs = options.maxEvalMs;
     }
+    if (typeof options.maxCpuMs === "number" && Number.isFinite(options.maxCpuMs) && options.maxCpuMs > 0) {
+        out.maxCpuMs = options.maxCpuMs;
+    }
     return out;
 }
 
@@ -212,6 +215,9 @@ function normalizeLimitsOption(x: unknown): unknown {
     if (typeof o.maxEvalMs === "number" && Number.isFinite(o.maxEvalMs) && o.maxEvalMs > 0) {
         out.maxEvalMs = o.maxEvalMs;
     }
+    if (typeof o.maxCpuMs === "number" && Number.isFinite(o.maxCpuMs) && o.maxCpuMs > 0) {
+        out.maxCpuMs = o.maxCpuMs;
+    }
     if (typeof o.maxMemoryBytes === "number" && Number.isFinite(o.maxMemoryBytes) && o.maxMemoryBytes > 0) {
         out.maxMemoryBytes = Math.trunc(o.maxMemoryBytes);
     }
@@ -233,6 +239,7 @@ export function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerW
     delete o.limits;
     if (limits) {
         if (typeof limits.maxEvalMs === "number") o.maxEvalMs = limits.maxEvalMs;
+        if (typeof limits.maxCpuMs === "number") o.maxCpuMs = limits.maxCpuMs;
         if (typeof limits.maxMemoryBytes === "number") o.maxMemoryBytes = limits.maxMemoryBytes;
     }
 

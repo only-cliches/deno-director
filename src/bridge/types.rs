@@ -60,6 +60,7 @@ pub struct EvalOptions {
     pub args: Vec<JsValueBridge>,
     pub args_provided: bool,
     pub max_eval_ms: Option<u64>,
+    pub max_cpu_ms: Option<u64>,
 }
 
 impl Default for EvalOptions {
@@ -71,6 +72,7 @@ impl Default for EvalOptions {
             args: vec![],
             args_provided: false,
             max_eval_ms: None,
+            max_cpu_ms: None,
         }
     }
 }
@@ -122,6 +124,14 @@ impl EvalOptions {
                 let ms = n.value(cx);
                 if ms.is_finite() && ms > 0.0 {
                     out.max_eval_ms = Some(ms as u64);
+                }
+            }
+        }
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxCpuMs") {
+            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
+                let ms = n.value(cx);
+                if ms.is_finite() && ms > 0.0 {
+                    out.max_cpu_ms = Some(ms as u64);
                 }
             }
         }

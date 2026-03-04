@@ -3,12 +3,13 @@ import { mergeWorkerOptions } from "../src/ts/options";
 describe("options.mergeWorkerOptions", () => {
   test("deep merges limits instead of replacing object", () => {
     const merged = mergeWorkerOptions(
-      { limits: { maxEvalMs: 25, maxHandle: 2 } },
+      { limits: { maxEvalMs: 25, maxCpuMs: 30, maxHandle: 2 } },
       { limits: { maxMemoryBytes: 1024 * 1024 }, permissions: { wasm: false } },
     );
 
     expect(merged?.limits).toMatchObject({
       maxEvalMs: 25,
+      maxCpuMs: 30,
       maxHandle: 2,
       maxMemoryBytes: 1024 * 1024,
     });
@@ -37,7 +38,7 @@ describe("options.mergeWorkerOptions", () => {
         permissions: { read: true, env: ["A"] },
         lifecycle: { afterStart: () => undefined },
         bridge: { channelSize: 32 },
-        limits: { maxEvalMs: 25 },
+        limits: { maxEvalMs: 25, maxCpuMs: 30 },
         moduleLoader: { httpsResolve: true },
       },
       {
@@ -55,7 +56,7 @@ describe("options.mergeWorkerOptions", () => {
       beforeStop: expect.any(Function),
     });
     expect(merged?.bridge).toMatchObject({ channelSize: 32, streamWindowBytes: 1024 });
-    expect(merged?.limits).toMatchObject({ maxEvalMs: 25, maxHandle: 10 });
+    expect(merged?.limits).toMatchObject({ maxEvalMs: 25, maxCpuMs: 30, maxHandle: 10 });
     expect(merged?.moduleLoader).toMatchObject({ httpsResolve: true, jsrResolve: true });
   });
 });

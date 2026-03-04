@@ -479,8 +479,15 @@ pub async fn eval_in_runtime(
     let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     let cancel = Arc::new(AtomicBool::new(false));
     let effective_max_eval_ms = options.max_eval_ms.or(limits.max_eval_ms);
+    let effective_max_cpu_ms = options.max_cpu_ms.or(limits.max_cpu_ms);
+    let effective_termination_ms = match (effective_max_eval_ms, effective_max_cpu_ms) {
+        (Some(eval_ms), Some(cpu_ms)) => Some(eval_ms.min(cpu_ms)),
+        (Some(eval_ms), None) => Some(eval_ms),
+        (None, Some(cpu_ms)) => Some(cpu_ms),
+        (None, None) => None,
+    };
 
-    let timeout_id = effective_max_eval_ms.map(|ms| {
+    let timeout_id = effective_termination_ms.map(|ms| {
         EvalTimerService::global().arm(ms, cancel.clone(), isolate_handle.clone())
     });
 

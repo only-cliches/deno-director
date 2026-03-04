@@ -817,6 +817,7 @@ export class DenoWorker {
             if (!value || typeof value !== "object") return defaultExecOptions ? { ...defaultExecOptions } : undefined;
             const out: Omit<EvalOptions, "args" | "type"> = {};
             if (typeof value.maxEvalMs === "number") out.maxEvalMs = value.maxEvalMs;
+            if (typeof value.maxCpuMs === "number") out.maxCpuMs = value.maxCpuMs;
             if (typeof (value as Omit<EvalOptions, "args" | "type">).filename === "string") {
                 out.filename = (value as Omit<EvalOptions, "args" | "type">).filename;
             }
@@ -2057,7 +2058,12 @@ export class DenoWorker {
         this.ensureHandleCapacity();
         const id = this.nextHandleId();
         const defaultExecOptions: Omit<EvalOptions, "args" | "type"> | undefined =
-            typeof options?.maxEvalMs === "number" ? { maxEvalMs: options.maxEvalMs } : undefined;
+            typeof options?.maxEvalMs === "number" || typeof options?.maxCpuMs === "number"
+                ? {
+                    ...(typeof options?.maxEvalMs === "number" ? { maxEvalMs: options.maxEvalMs } : {}),
+                    ...(typeof options?.maxCpuMs === "number" ? { maxCpuMs: options.maxCpuMs } : {}),
+                }
+                : undefined;
         await this.runHandleOp({ op: "createFromPath", id, path: p }, defaultExecOptions);
         const rootType = (await this.runHandleOp({ op: "getType", id, path: "" }, defaultExecOptions)) as DenoWorkerHandleTypeInfo;
         this.activeHandleIds.add(id);
@@ -2082,8 +2088,15 @@ export class DenoWorker {
         this.ensureHandleCapacity();
         const id = this.nextHandleId();
         const defaultExecOptions: Omit<EvalOptions, "args" | "type"> | undefined =
-            options && (typeof options.maxEvalMs === "number" || typeof options.filename === "string")
-                ? { ...(typeof options.maxEvalMs === "number" ? { maxEvalMs: options.maxEvalMs } : {}), ...(typeof options.filename === "string" ? { filename: options.filename } : {}) }
+            options &&
+            (typeof options.maxEvalMs === "number" ||
+                typeof options.maxCpuMs === "number" ||
+                typeof options.filename === "string")
+                ? {
+                    ...(typeof options.maxEvalMs === "number" ? { maxEvalMs: options.maxEvalMs } : {}),
+                    ...(typeof options.maxCpuMs === "number" ? { maxCpuMs: options.maxCpuMs } : {}),
+                    ...(typeof options.filename === "string" ? { filename: options.filename } : {}),
+                }
                 : undefined;
         await this.runHandleOp({ op: "createFromEval", id, source: src }, defaultExecOptions);
         const rootType = (await this.runHandleOp({ op: "getType", id, path: "" }, defaultExecOptions)) as DenoWorkerHandleTypeInfo;

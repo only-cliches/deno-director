@@ -375,6 +375,17 @@ export type DenoWorkerLimits = {
      */
     maxEvalMs?: number;
     /**
+     * Description: default CPU-budget timeout in milliseconds.
+     * Applies to the same execution surfaces as `maxEvalMs`.
+     * Can be overridden per call via:
+     * - `EvalOptions.maxCpuMs` on `eval`/`evalSync`/`evalModule`
+     * - `DenoWorkerHandleExecOptions.maxCpuMs` on handle methods
+     * Default: unset (no default timeout).
+     * Min recommended: `10`.
+     * Max recommended: `120000`.
+     */
+    maxCpuMs?: number;
+    /**
      * Description: maximum V8 heap size in bytes.
      * Default: unset (runtime default).
      * Min recommended: `33554432` (32 MiB).
@@ -602,6 +613,8 @@ export type EvalOptions = {
     args?: any[];
     /** Per-call timeout override in milliseconds. */
     maxEvalMs?: number;
+    /** Per-call CPU-budget timeout override in milliseconds. */
+    maxCpuMs?: number;
 };
 
 export type ExecStats = {
@@ -771,6 +784,8 @@ export type DenoWorkerHandleAwaitOptions = {
 export type DenoWorkerHandleExecOptions = {
     /** Per-call timeout override in milliseconds for this handle operation. */
     maxEvalMs?: number;
+    /** Per-call CPU-budget timeout override in milliseconds for this handle operation. */
+    maxCpuMs?: number;
 };
 
 /**

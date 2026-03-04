@@ -116,6 +116,7 @@ impl Default for ModuleLoaderConfig {
 pub struct RuntimeLimits {
     pub max_memory_bytes: Option<u64>,
     pub max_eval_ms: Option<u64>,
+    pub max_cpu_ms: Option<u64>,
     pub wasm: bool,
 
     pub imports: ImportsPolicy,
@@ -145,6 +146,7 @@ impl Default for RuntimeLimits {
         Self {
             max_memory_bytes: None,
             max_eval_ms: None,
+            max_cpu_ms: None,
             wasm: true,
             imports: ImportsPolicy::default(),
             cwd: None,
@@ -569,6 +571,16 @@ impl WorkerCreateOptions {
                 let ms = n.value(cx);
                 if ms.is_finite() && ms > 0.0 {
                     out.runtime_options.max_eval_ms = Some(ms as u64);
+                }
+            }
+        }
+
+        // `maxCpuMs`.
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "maxCpuMs") {
+            if let Ok(n) = v.downcast::<JsNumber, _>(cx) {
+                let ms = n.value(cx);
+                if ms.is_finite() && ms > 0.0 {
+                    out.runtime_options.max_cpu_ms = Some(ms as u64);
                 }
             }
         }

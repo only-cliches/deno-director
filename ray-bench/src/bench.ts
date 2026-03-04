@@ -1,4 +1,5 @@
 import { performance } from "node:perf_hooks";
+import { spawnSync } from "node:child_process";
 import { printMarkdownTable, printPlainTable } from "./format";
 import { allScenarios } from "./scenarios";
 import type { BenchConfig } from "./types";
@@ -51,15 +52,45 @@ function parseArgs(): BenchConfig {
     return out;
 }
 
+function isRuntimeOnPath(runtimeBin: string): boolean {
+    try {
+        const result = spawnSync(runtimeBin, ["--version"], { stdio: "ignore" });
+        return result.status === 0;
+    } catch {
+        return false;
+    }
+}
+
 async function main(): Promise<void> {
     const config = parseArgs();
-    const scenarios = allScenarios.filter((s) => config.scenarios.includes(s.key));
+    const hasBun = isRuntimeOnPath("bun");
+    const selectedScenarios = allScenarios.filter((s) => config.scenarios.includes(s.key));
+    const requiresBun = selectedScenarios.some((s) => s.requires?.includes("bun"));
+    const scenarios = selectedScenarios.filter((scenario) => {
+        if (!scenario.requires || scenario.requires.length === 0) return true;
+        if (scenario.requires.includes("bun") && !hasBun) return false;
+        return true;
+    });
     const tasks = buildTasks(config.width, config.height, config.tileHeight);
 
     console.log("# Ray Bench");
     console.log(
         `config: width=${config.width} height=${config.height} tileHeight=${config.tileHeight} tasks=${tasks.length} iterations=${config.iterations} warmup=${config.warmup}`,
     );
+    if (requiresBun) {
+        if (hasBun) console.log("runtime: bun detected");
+        else console.log("runtime: bun not found in PATH (Bun scenarios skipped)");
+    }
+
+    const skipped = selectedScenarios.filter((scenario) => !scenarios.includes(scenario));
+    for (const scenario of skipped) {
+        if (scenario.requires?.includes("bun") && !hasBun) {
+            console.log(`skip: ${scenario.label} (requires bun in PATH)`);
+        }
+    }
+    if (scenarios.length === 0) {
+        throw new Error("No runnable scenarios selected for current runtime availability");
+    }
 
     const times = new Map<string, number>();
     let baselineChecksum: number | undefined;
