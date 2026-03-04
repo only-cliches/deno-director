@@ -482,7 +482,15 @@ on("message", (msg) => {
 
         const flat = (await Promise.all(allPromises)).flat();
         if (flat.length !== tasks.length) throw new Error(`Missing batched postMessage results (${flat.length}/${tasks.length})`);
-        return mergeChecksums(flat);
+
+        const byId = new Map<number, RenderResult>();
+        for (const r of flat) byId.set(r.id, r);
+        const out = tasks.map((t) => {
+            const r = byId.get(t.id);
+            if (!r) throw new Error(`Missing batched postMessage result for task ${t.id}`);
+            return r;
+        });
+        return mergeChecksums(out);
     } finally {
         pending.clear();
         await Promise.all(workers.map((w) => w.close({ force: true })));
