@@ -332,42 +332,62 @@ async function runDenoHandle(tasks: RenderTask[], workerCount: number): Promise<
 
 async function runDenoStreamPersistent(tasks: RenderTask[], workerCount: number): Promise<number> {
     const workers = Array.from({ length: workerCount }, () => new DenoWorker());
-    const responses = new Map<number, RenderResult>();
+    const results = new Map<number, RenderResult>();
     const byWorker = groupTasksByWorker(tasks, workerCount);
-    const active = byWorker
-        .map((workerTasks, idx) => ({ workerTasks, idx }))
-        .filter((x) => x.workerTasks.length > 0);
+    const active = byWorker.map((workerTasks, idx) => ({ workerTasks, idx })).filter((x) => x.workerTasks.length > 0);
 
     try {
-        await Promise.all(workers.map((w) => w.eval(denoStreamPersistentScript())));
-        const requestWriters = active.map(({ idx }) =>
-            workers[idx].stream.create(`rb:req:${idx}:${Date.now()}:${Math.random()}`),
-        );
-        const responseKeys = active.map(({ idx }) => `rb:res:${idx}:${Date.now()}:${Math.random()}`);
-        const responseReaderPromises = active.map(({ idx }, i) => workers[idx].stream.accept(responseKeys[i]));
-        const servePromises = active.map(({ idx }, i) =>
-            workers[idx].eval("__serveStreamRender", { args: [requestWriters[i].getKey(), responseKeys[i]] }),
-        );
-        const readerPromises = responseReaderPromises.map(async (readerPromise) => {
-            const reader = await readerPromise;
-            for await (const frame of decodeFrames(reader)) {
-                for (const r of decodeResultBatch(frame)) responses.set(r.id, r);
-            }
-        });
+        await Promise.all(workers.map((w) => w.eval(denoBootstrapScript())));
 
         await Promise.all(
-            active.map(async ({ workerTasks }, i) => {
-                const writer = requestWriters[i];
-                const batches = chunk(workerTasks, 4);
-                for (const b of batches) await writer.write(encodeTaskBatch(b));
-                await writer.close();
+            active.map(async ({ idx, workerTasks }) => {
+                const w = workers[idx];
+                const streamKey = `rb:stream:reused:${idx}:${Date.now()}:${Math.random()}`;
+                const readerPromise = w.stream.accept(streamKey);
+                const workerPromise = w.eval(
+                    `
+                    async (renderTasks, responseKey) => {
+                        const out = hostStreams.create(responseKey);
+                        try {
+                            const enc = new TextEncoder();
+                            for (const task of renderTasks) {
+                                const result = globalThis.__computeTask(task);
+                                await out.write(enc.encode(JSON.stringify(result) + "\\n"));
+                            }
+                        } finally {
+                            await out.close();
+                        }
+                    }
+                    `,
+                    { args: [workerTasks, streamKey] },
+                );
+
+                const reader = await readerPromise;
+                const chunks: Uint8Array[] = [];
+                for await (const c of reader) chunks.push(c);
+                await workerPromise;
+
+                const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+                const merged = new Uint8Array(total);
+                let off = 0;
+                for (const c of chunks) {
+                    merged.set(c, off);
+                    off += c.byteLength;
+                }
+                const lines = new TextDecoder()
+                    .decode(merged)
+                    .split("\n")
+                    .map((x) => x.trim())
+                    .filter((x) => x.length > 0);
+                for (const line of lines) {
+                    const r = JSON.parse(line) as RenderResult;
+                    results.set(r.id, r);
+                }
             }),
         );
-        await Promise.all(readerPromises);
-        await Promise.all(servePromises);
 
         const out = tasks.map((t) => {
-            const r = responses.get(t.id);
+            const r = results.get(t.id);
             if (!r) throw new Error(`Missing stream result for task ${t.id}`);
             return r;
         });
@@ -384,21 +404,29 @@ async function runDenoStreamPerRequest(tasks: RenderTask[], workerCount: number)
     const nextKey = (prefix: string) => `${prefix}:${Date.now()}:${Math.random()}:${keyCounter++}`;
 
     try {
-        await Promise.all(workers.map((w) => w.eval(denoStreamPersistentScript())));
+        await Promise.all(workers.map((w) => w.eval(denoBootstrapScript())));
         const byWorker = groupTasksByWorker(tasks, workerCount);
 
         await Promise.all(
             byWorker.map(async (workerTasks, workerIdx) => {
                 const w = workers[workerIdx];
                 for (const task of workerTasks) {
-                    const reqKey = nextKey(`rb:req:${workerIdx}`);
                     const resKey = nextKey(`rb:res:${workerIdx}`);
-                    const writer = w.stream.create(reqKey);
                     const readerPromise = w.stream.accept(resKey);
-                    const workerPromise = w.eval("__streamRenderOnce", { args: [reqKey, resKey] });
-
-                    await writer.write(encodeTaskBatch([task]));
-                    await writer.close();
+                    const workerPromise = w.eval(
+                        `
+                        async (renderTask, responseKey) => {
+                            const out = hostStreams.create(responseKey);
+                            try {
+                                const result = globalThis.__computeTask(renderTask);
+                                await out.write(new TextEncoder().encode(JSON.stringify(result)));
+                            } finally {
+                                await out.close();
+                            }
+                        }
+                        `,
+                        { args: [task, resKey] },
+                    );
 
                     const reader = await readerPromise;
                     const chunks: Uint8Array[] = [];
@@ -409,13 +437,9 @@ async function runDenoStreamPerRequest(tasks: RenderTask[], workerCount: number)
                         merged.set(c, off);
                         off += c.byteLength;
                     }
-
-                    const bodyBytes = new DataView(merged.buffer, merged.byteOffset, UINT32).getUint32(0, true);
-                    const frame = merged.subarray(UINT32, UINT32 + bodyBytes);
-                    const decoded = decodeResultBatch(frame);
-                    if (decoded.length !== 1) throw new Error("Expected one result for per-request stream");
-                    results.set(decoded[0].id, decoded[0]);
                     await workerPromise;
+                    const decoded = JSON.parse(new TextDecoder().decode(merged)) as RenderResult;
+                    results.set(decoded.id, decoded);
                 }
             }),
         );
@@ -606,6 +630,22 @@ export const allScenarios: ScenarioDef[] = [
         ipc: "postMessage",
         worker: "Deno",
         run: runDenoPostMessage,
+    },
+    {
+        key: "deno-streams",
+        label: "Node | streams | Deno",
+        main: "Node",
+        ipc: "streams",
+        worker: "Deno",
+        run: runDenoStreamPerRequest,
+    },
+    {
+        key: "deno-streams-reused",
+        label: "Node | streams(reused) | Deno",
+        main: "Node",
+        ipc: "streams(reused)",
+        worker: "Deno",
+        run: runDenoStreamPersistent,
     },
     {
         key: "deno-eval",

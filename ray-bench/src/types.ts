@@ -6,6 +6,8 @@ export type ScenarioKey =
     | "node-postmessage"
     | "node-http"
     | "deno-postmessage"
+    | "deno-streams"
+    | "deno-streams-reused"
     | "deno-eval"
     | "deno-evalsync"
     | "deno-handle"
@@ -55,6 +57,8 @@ export const scenarioOrder: ScenarioKey[] = [
     "node-postmessage",
     "node-http",
     "deno-postmessage",
+    "deno-streams",
+    "deno-streams-reused",
     "deno-eval",
     "deno-evalsync",
     "deno-handle",

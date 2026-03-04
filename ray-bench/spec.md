@@ -11,6 +11,8 @@ Help me fill out these question marks:
 | Node | postMessage     | Node Worker | ?                    | ?                    | ?                     | ?                     | ?                     |
 | Node | HTTP            | Node        | ?                    | ?                    | ?                     | ?                     | ?                     |
 | Node | postMessage     | Deno        | ?                    | ?                    | ?                     | ?                     | ?                     |
+| Node | streams         | Deno        | ?                    | ?                    | ?                     | ?                     | ?                     |
+| Node | streams(reused) | Deno        | ?                    | ?                    | ?                     | ?                     | ?                     |
 | Node | worker.eval     | Deno        | ?                    | ?                    | ?                     | ?                     | ?                     |
 | Node | worker.evalSync | Deno        | ?                    | ?                    | ?                     | ?                     | ?                     |
 | Node | worker.handle   | Deno        | ?                    | ?                    | ?                     | ?                     | ?                     |
