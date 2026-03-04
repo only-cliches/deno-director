@@ -57,10 +57,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/only-cliches/deno-director/quickjs-worker.git"
+    "url": "git+https://github.com/only-cliches/deno-director.git"
   },
   "bugs": {
-    "url": "https://github.com/only-cliches/deno-director/quickjs-worker/issues"
+    "url": "https://github.com/only-cliches/deno-director/issues"
   },
-  "homepage": "https://github.com/only-cliches/deno-director/quickjs-worker#readme"
+  "homepage": "https://github.com/only-cliches/deno-director#readme"
 }

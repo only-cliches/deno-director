@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.9.0] Future
+## [0.9.0] Mar 3, 2026
 
 ### Added
 - Added a new runtime handle API surface under `worker.handle` with rich value operations:
@@ -51,7 +51,7 @@ All notable changes to this project will be documented in this file.
 - Kept handle batching path (`handle.apply`) and timeout controls aligned for lower roundtrip overhead under heavy handle usage.
 
 
-## [0.8.5] Mar 3, 2026
+## [0.8.5] Mar 2, 2026
 
 ### Added
 - Added a stream regression spec in `test-ts/streams.spec.ts`:
