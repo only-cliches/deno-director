@@ -25,6 +25,17 @@ pub async fn handle_deno_msg(
             id,
             payload,
         } => handle_post_message_typed_msg(worker, message_type, id, payload),
+        DenoMsg::PostStreamChunk { stream_id, payload } => {
+            handle_post_stream_chunk_msg(worker, stream_id, payload)
+        }
+        DenoMsg::PostStreamChunks { stream_id, payloads } => {
+            handle_post_stream_chunks_msg(worker, stream_id, payloads)
+        }
+        DenoMsg::PostStreamControl {
+            kind,
+            stream_id,
+            aux,
+        } => handle_post_stream_control_msg(worker, kind, stream_id, aux),
         DenoMsg::SetGlobal {
             key,
             value,
@@ -177,6 +188,48 @@ fn handle_post_message_typed_msg(
     id: u32,
     payload: JsValueBridge,
 ) -> bool {
+    let dispatched_fast = {
+        deno_core::scope!(scope, &mut worker.js_runtime);
+        if let Some(key) = v8::String::new(scope, "__dispatchNodeTypedMessage") {
+            let ctx = scope.get_current_context();
+            let global = ctx.global(scope);
+            if let Some(fn_any) = global.get(scope, key.into()) {
+                if let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_any) {
+                    if let Some(type_val) = v8::String::new(scope, message_type.as_str()) {
+                        let id_val = v8::Integer::new_from_unsigned(scope, id);
+                        if let Ok(payload_val) = crate::bridge::v8_codec::to_v8(scope, &payload) {
+                            let ok = dispatch_fn
+                                .call(
+                                    scope,
+                                    global.into(),
+                                    &[type_val.into(), id_val.into(), payload_val],
+                                )
+                                .is_some();
+                            if ok {
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if dispatched_fast {
+        return false;
+    }
+
     let dispatched = {
         deno_core::scope!(scope, &mut worker.js_runtime);
         let Some(key) = v8::String::new(scope, "__dispatchNodeMessage") else {
@@ -223,6 +276,140 @@ fn handle_post_message_typed_msg(
             "payload": crate::bridge::wire::to_wire_json(&payload),
         }));
         return handle_post_message_msg(worker, value);
+    }
+    false
+}
+
+// Handle post stream chunk msg.
+fn handle_post_stream_chunk_msg(
+    worker: &mut MainWorker,
+    stream_id: String,
+    payload: JsValueBridge,
+) -> bool {
+    let dispatched = {
+        deno_core::scope!(scope, &mut worker.js_runtime);
+        let Some(key) = v8::String::new(scope, "__dispatchNodeStreamChunk") else {
+            return false;
+        };
+        let ctx = scope.get_current_context();
+        let global = ctx.global(scope);
+        let Some(fn_any) = global.get(scope, key.into()) else {
+            return false;
+        };
+        let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_any) else {
+            return false;
+        };
+        let Some(id_val) = v8::String::new(scope, stream_id.as_str()) else {
+            return false;
+        };
+        let Ok(payload_val) = crate::bridge::v8_codec::to_v8(scope, &payload) else {
+            return false;
+        };
+        dispatch_fn
+            .call(scope, global.into(), &[id_val.into(), payload_val])
+            .is_some()
+    };
+
+    if !dispatched {
+        return handle_post_message_typed_msg(
+            worker,
+            format!("__denojs_worker_stream_chunk_v1:{stream_id}"),
+            0,
+            payload,
+        );
+    }
+    false
+}
+
+// Handle post stream chunks msg.
+fn handle_post_stream_chunks_msg(
+    worker: &mut MainWorker,
+    stream_id: String,
+    payloads: Vec<JsValueBridge>,
+) -> bool {
+    let dispatched = {
+        deno_core::scope!(scope, &mut worker.js_runtime);
+        let Some(key) = v8::String::new(scope, "__dispatchNodeStreamChunks") else {
+            return false;
+        };
+        let ctx = scope.get_current_context();
+        let global = ctx.global(scope);
+        let Some(fn_any) = global.get(scope, key.into()) else {
+            return false;
+        };
+        let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_any) else {
+            return false;
+        };
+        let Some(id_val) = v8::String::new(scope, stream_id.as_str()) else {
+            return false;
+        };
+        let arr = v8::Array::new(scope, payloads.len() as i32);
+        for (i, payload) in payloads.iter().enumerate() {
+            let Ok(payload_val) = crate::bridge::v8_codec::to_v8(scope, payload) else {
+                return false;
+            };
+            let _ = arr.set_index(scope, i as u32, payload_val);
+        }
+        dispatch_fn
+            .call(scope, global.into(), &[id_val.into(), arr.into()])
+            .is_some()
+    };
+
+    if !dispatched {
+        for payload in payloads {
+            let _ = handle_post_stream_chunk_msg(worker, stream_id.clone(), payload);
+        }
+    }
+    false
+}
+
+// Handle post stream control msg.
+fn handle_post_stream_control_msg(
+    worker: &mut MainWorker,
+    kind: String,
+    stream_id: String,
+    aux: Option<String>,
+) -> bool {
+    let dispatched = {
+        deno_core::scope!(scope, &mut worker.js_runtime);
+        let Some(key) = v8::String::new(scope, "__dispatchNodeStreamControl") else {
+            return false;
+        };
+        let ctx = scope.get_current_context();
+        let global = ctx.global(scope);
+        let Some(fn_any) = global.get(scope, key.into()) else {
+            return false;
+        };
+        let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_any) else {
+            return false;
+        };
+        let Some(kind_val) = v8::String::new(scope, kind.as_str()) else {
+            return false;
+        };
+        let Some(id_val) = v8::String::new(scope, stream_id.as_str()) else {
+            return false;
+        };
+        let aux_val: v8::Local<v8::Value> = if let Some(a) = aux.as_deref() {
+            let Some(s) = v8::String::new(scope, a) else {
+                return false;
+            };
+            s.into()
+        } else {
+            v8::undefined(scope).into()
+        };
+        dispatch_fn
+            .call(scope, global.into(), &[kind_val.into(), id_val.into(), aux_val])
+            .is_some()
+    };
+
+    if !dispatched {
+        let message_type = format!("__denojs_worker_stream_control_v1:{kind}:{stream_id}");
+        return handle_post_message_typed_msg(
+            worker,
+            message_type,
+            0,
+            JsValueBridge::String(aux.unwrap_or_default()),
+        );
     }
     false
 }

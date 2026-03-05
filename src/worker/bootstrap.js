@@ -126,7 +126,42 @@ function wireNum(tag) {
   return { __num: tag };
 }
 
+function isPlainJsonFast(value) {
+  if (value === null) return true;
+  const t = typeof value;
+  if (t === "string" || t === "boolean") return true;
+  if (t === "number") return Number.isFinite(value);
+  if (t !== "object") return false;
+
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) {
+      const v = value[i];
+      if (v === null) continue;
+      const vt = typeof v;
+      if (vt === "string" || vt === "boolean") continue;
+      if (vt === "number" && Number.isFinite(v)) continue;
+      return false;
+    }
+    return true;
+  }
+
+  const proto = Object.getPrototypeOf(value);
+  if (!(proto === Object.prototype || proto === null)) return false;
+  const entries = Object.entries(value);
+  if (entries.length > 32) return false;
+  for (const [k, v] of entries) {
+    if (k === "__proto__") return false;
+    if (v === null) continue;
+    const vt = typeof v;
+    if (vt === "string" || vt === "boolean") continue;
+    if (vt === "number" && Number.isFinite(v)) continue;
+    return false;
+  }
+  return true;
+}
+
 function dehydrateAny(v) {
+  if (isPlainJsonFast(v)) return v;
   const seen = typeof WeakMap !== "undefined" ? new WeakMap() : null;
   let nextGraphId = 1;
   const GRAPH_ID_KEY = "__denojs_worker_graph_id";
@@ -520,6 +555,8 @@ try {
 globalThis.__nodeOnMessageHandlers = [];
 globalThis.__nodeMessageEventListeners = [];
 const STREAM_BRIDGE_TAG = "__denojs_worker_stream_v1";
+const STREAM_TYPED_CHUNK_PREFIX = "__denojs_worker_stream_chunk_v1:";
+const STREAM_TYPED_CONTROL_PREFIX = "__denojs_worker_stream_control_v1:";
 const STREAM_CHUNK_MAGIC = [0x44, 0x44, 0x53, 0x54, 0x52, 0x4d, 0x31, 0x00];
 const streamTextEncoder = new TextEncoder();
 const streamTextDecoder = new TextDecoder();
@@ -655,6 +692,57 @@ function decodeStreamFrameEnvelope(payload) {
   else if (t === "cancel" && aux) out.reason = aux;
   else if (t === "credit") out.credit = Number(aux || "0");
   else if (t === "chunk") out.chunk = u8.subarray(off);
+  return out;
+}
+
+function decodeTypedStreamChunkMessage(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const type = payload.type;
+  if (typeof type !== "string" || !type.startsWith(STREAM_TYPED_CHUNK_PREFIX)) return null;
+  const id = type.slice(STREAM_TYPED_CHUNK_PREFIX.length);
+  if (!id) return null;
+  let chunk = toStreamChunk(payload.payload);
+  if (!chunk && payload.payload && typeof payload.payload === "object") {
+    try {
+      const hydrate =
+        globalThis && typeof globalThis.__hydrate === "function"
+          ? globalThis.__hydrate(payload.payload)
+          : payload.payload;
+      chunk = toStreamChunk(hydrate);
+    } catch {
+      // ignore
+    }
+  }
+  if (!chunk) return null;
+  return {
+    [STREAM_BRIDGE_TAG]: true,
+    t: "chunk",
+    id,
+    chunk,
+  };
+}
+
+function decodeTypedStreamControlMessage(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const type = payload.type;
+  if (typeof type !== "string" || !type.startsWith(STREAM_TYPED_CONTROL_PREFIX)) return null;
+  const rest = type.slice(STREAM_TYPED_CONTROL_PREFIX.length);
+  const sep = rest.indexOf(":");
+  if (sep <= 0) return null;
+  const kind = rest.slice(0, sep);
+  const id = rest.slice(sep + 1);
+  if (!id) return null;
+  const out = {
+    [STREAM_BRIDGE_TAG]: true,
+    t: kind,
+    id,
+  };
+  const auxRaw = payload && typeof payload.payload === "string" ? payload.payload : "";
+  if (kind === "open") out.key = auxRaw;
+  else if (kind === "error") out.error = auxRaw;
+  else if (kind === "cancel") out.reason = auxRaw;
+  else if (kind === "credit") out.credit = Number(auxRaw || "0");
+  else if (kind !== "close" && kind !== "discard") return null;
   return out;
 }
 
@@ -1223,6 +1311,42 @@ const addEventListenerImpl = (name, fn) => {
   }
 };
 
+function dispatchNodeMessagePayload(payload) {
+  const onHandlers = globalThis.__nodeOnMessageHandlers;
+  if (onHandlers.length === 1) {
+    try {
+      onHandlers[0](payload);
+    } catch {
+      // ignore
+    }
+  } else {
+    for (const fn of onHandlers) {
+      try {
+        fn(payload);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const evtHandlers = globalThis.__nodeMessageEventListeners;
+  if (evtHandlers.length === 1) {
+    try {
+      evtHandlers[0](payload);
+    } catch {
+      // ignore
+    }
+  } else {
+    for (const fn of evtHandlers) {
+      try {
+        fn(payload);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
 try {
   Object.defineProperty(globalThis, "on", {
     value: onImpl,
@@ -1259,28 +1383,73 @@ globalThis.__dispatchNodeMessage = (payload) => {
     handleIncomingStreamFrame(frame);
     return;
   }
+  const typedStreamFrame = decodeTypedStreamChunkMessage(payload);
+  if (typedStreamFrame) {
+    handleIncomingStreamFrame(typedStreamFrame);
+    return;
+  }
+  const typedControlFrame = decodeTypedStreamControlMessage(payload);
+  if (typedControlFrame) {
+    handleIncomingStreamFrame(typedControlFrame);
+    return;
+  }
   if (isStreamFrame(payload)) {
     handleIncomingStreamFrame(payload);
     return;
   }
 
-  // on('message'): payload
-  for (const fn of globalThis.__nodeOnMessageHandlers) {
-    try {
-      fn(payload);
-    } catch {
-      // ignore
-    }
-  }
-
   // addEventListener('message'): payload (test expects payload, not { data })
-  for (const fn of globalThis.__nodeMessageEventListeners) {
-    try {
-      fn(payload);
-    } catch {
-      // ignore
-    }
+  dispatchNodeMessagePayload(payload);
+};
+
+globalThis.__dispatchNodeTypedMessage = (type, id, payload) => {
+  dispatchNodeMessagePayload({ type, id, payload });
+};
+
+globalThis.__dispatchNodeStreamChunk = (streamId, payload) => {
+  const id = typeof streamId === "string" ? streamId : String(streamId || "");
+  if (!id) return;
+  const chunk = toStreamChunk(payload);
+  if (!chunk) return;
+  handleIncomingStreamFrame({
+    [STREAM_BRIDGE_TAG]: true,
+    t: "chunk",
+    id,
+    chunk,
+  });
+};
+
+globalThis.__dispatchNodeStreamChunks = (streamId, payloads) => {
+  const id = typeof streamId === "string" ? streamId : String(streamId || "");
+  if (!id) return;
+  if (!Array.isArray(payloads) || payloads.length === 0) return;
+  for (const payload of payloads) {
+    const chunk = toStreamChunk(payload);
+    if (!chunk) continue;
+    handleIncomingStreamFrame({
+      [STREAM_BRIDGE_TAG]: true,
+      t: "chunk",
+      id,
+      chunk,
+    });
   }
+};
+
+globalThis.__dispatchNodeStreamControl = (kind, streamId, aux) => {
+  const t = typeof kind === "string" ? kind : String(kind || "");
+  const id = typeof streamId === "string" ? streamId : String(streamId || "");
+  if (!t || !id) return;
+  const frame = {
+    [STREAM_BRIDGE_TAG]: true,
+    t,
+    id,
+  };
+  if (t === "open") frame.key = aux == null ? "" : String(aux);
+  else if (t === "error") frame.error = aux == null ? "" : String(aux);
+  else if (t === "cancel") frame.reason = aux == null ? "" : String(aux);
+  else if (t === "credit") frame.credit = Number(aux || "0");
+  else if (t !== "close" && t !== "discard") return;
+  handleIncomingStreamFrame(frame);
 };
 
 // --------------------

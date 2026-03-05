@@ -877,6 +877,12 @@ export type NativeWorker = {
     postMessage(msg: any): boolean;
     /** Fast-path for { type, id, payload } envelopes with binary payloads. */
     postMessageTyped?: (type: string, id: number, payload: any) => boolean;
+    /** Fast-path stream chunk transport keyed by stream id. */
+    postStreamChunk?: (streamId: string, payload: any) => boolean;
+    /** Fast-path batched stream chunk transport keyed by stream id. */
+    postStreamChunks?: (streamId: string, payloads: any[]) => number;
+    /** Fast-path stream control transport for open/close/error/cancel/discard/credit. */
+    postStreamControl?: (kind: string, streamId: string, aux?: string) => boolean;
     /** Batch post messages; returns accepted count. */
     postMessages?: (msgs: any[]) => number;
     /** Register a low-level event listener on native worker bridge. */

@@ -595,6 +595,138 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         api.set(&mut cx, "postMessageTyped", f)?;
     }
 
+    // postStreamChunk(streamId, payload) -> boolean
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let stream_id = cx.argument::<JsString>(0)?.value(&mut cx);
+            if stream_id.trim().is_empty() {
+                return cx.throw_error("postStreamChunk streamId must be non-empty");
+            }
+            let payload_js = cx.argument::<JsValue>(1)?;
+            let payload = crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?;
+
+            let tx = deno_data_tx_for_worker(id2);
+            let Some(tx) = tx else {
+                if strict_channel() {
+                    return cx.throw_error("Runtime is closed (postStreamChunk)");
+                }
+                return Ok(cx.boolean(false));
+            };
+
+            let msg = DenoMsg::PostStreamChunk { stream_id, payload };
+
+            match tx.blocking_send(msg) {
+                Ok(()) => Ok(cx.boolean(true)),
+                Err(_) => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime is closed (postStreamChunk)")
+                    } else {
+                        Ok(cx.boolean(false))
+                    }
+                }
+            }
+        })?;
+        api.set(&mut cx, "postStreamChunk", f)?;
+    }
+
+    // postStreamChunks(streamId, payloads) -> number
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let stream_id = cx.argument::<JsString>(0)?.value(&mut cx);
+            if stream_id.trim().is_empty() {
+                return cx.throw_error("postStreamChunks streamId must be non-empty");
+            }
+            let values = cx.argument::<JsValue>(1)?;
+            let arr = match values.downcast::<JsArray, _>(&mut cx) {
+                Ok(a) => a,
+                Err(_) => return Ok(cx.number(0.0)),
+            };
+
+            let tx = deno_data_tx_for_worker(id2);
+            let Some(tx) = tx else {
+                if strict_channel() {
+                    return cx.throw_error("Runtime is closed (postStreamChunks)");
+                }
+                return Ok(cx.number(0.0));
+            };
+
+            let mut payloads: Vec<crate::bridge::types::JsValueBridge> =
+                Vec::with_capacity(arr.len(&mut cx) as usize);
+            for i in 0..arr.len(&mut cx) {
+                let v = arr.get_value(&mut cx, i)?;
+                let msg = crate::bridge::neon_codec::from_neon_value(&mut cx, v)?;
+                payloads.push(msg);
+            }
+            let count = payloads.len();
+
+            let msg = DenoMsg::PostStreamChunks { stream_id, payloads };
+            match tx.blocking_send(msg) {
+                Ok(()) => Ok(cx.number(count as f64)),
+                Err(_) => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime is closed (postStreamChunks)")
+                    } else {
+                        Ok(cx.number(0.0))
+                    }
+                }
+            }
+        })?;
+        api.set(&mut cx, "postStreamChunks", f)?;
+    }
+
+    // postStreamControl(kind, streamId, aux?) -> boolean
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let kind = cx.argument::<JsString>(0)?.value(&mut cx);
+            if kind.trim().is_empty() {
+                return cx.throw_error("postStreamControl kind must be non-empty");
+            }
+            let stream_id = cx.argument::<JsString>(1)?.value(&mut cx);
+            if stream_id.trim().is_empty() {
+                return cx.throw_error("postStreamControl streamId must be non-empty");
+            }
+            let aux = if cx.len() >= 3 {
+                let aux_js = cx.argument::<JsValue>(2)?;
+                if aux_js.is_a::<JsUndefined, _>(&mut cx) || aux_js.is_a::<JsNull, _>(&mut cx) {
+                    None
+                } else {
+                    Some(aux_js.to_string(&mut cx)?.value(&mut cx))
+                }
+            } else {
+                None
+            };
+
+            let tx = deno_data_tx_for_worker(id2);
+            let Some(tx) = tx else {
+                if strict_channel() {
+                    return cx.throw_error("Runtime is closed (postStreamControl)");
+                }
+                return Ok(cx.boolean(false));
+            };
+
+            let msg = DenoMsg::PostStreamControl {
+                kind,
+                stream_id,
+                aux,
+            };
+
+            match tx.blocking_send(msg) {
+                Ok(()) => Ok(cx.boolean(true)),
+                Err(_) => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime is closed (postStreamControl)")
+                    } else {
+                        Ok(cx.boolean(false))
+                    }
+                }
+            }
+        })?;
+        api.set(&mut cx, "postStreamControl", f)?;
+    }
+
     // on(event, cb)
     {
         let id2 = id;

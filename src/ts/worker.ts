@@ -32,6 +32,8 @@ import type {
 } from "./types";
 
 const STREAM_BRIDGE_TAG = "__denojs_worker_stream_v1";
+const STREAM_TYPED_CHUNK_PREFIX = "__denojs_worker_stream_chunk_v1:";
+const STREAM_TYPED_CHUNK_MIN_BYTES = 1;
 const STREAM_CHUNK_MAGIC = [0x44, 0x44, 0x53, 0x54, 0x52, 0x4d, 0x31, 0x00] as const;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -61,7 +63,32 @@ const STREAM_DEFAULT_WINDOW_BYTES = 16 * 1024 * 1024;
 // keeping writers responsive under sustained transfer.
 const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
 const STREAM_BACKLOG_DEFAULT_LIMIT = 256;
+const STREAM_SLOT_POOL_MIN = 16;
+const STREAM_SLOT_POOL_MAX = 1024;
+const STREAM_SLOT_POOL_HEADROOM = 8;
+const STREAM_SLOT_POOL_SCALE_NUM = 3;
+const STREAM_SLOT_POOL_SCALE_DEN = 2;
+const STREAM_SLOT_POOL_HYSTERESIS = 8;
+const STREAM_SLOT_POOL_TUNE_INTERVAL = 16;
 const HANDLE_DEFAULT_MAX = 128;
+const WIRE_MARKER_KEY_SET = new Set([
+    "__undef",
+    "__num",
+    "__denojs_worker_num",
+    "__date",
+    "__bigint",
+    "__regexp",
+    "__url",
+    "__urlSearchParams",
+    "__buffer",
+    "__map",
+    "__set",
+    "__denojs_worker_type",
+    "__denojs_worker_graph_id",
+    "__denojs_worker_graph_ref",
+    "__denojs_worker_graph_kind",
+    "__denojs_worker_graph_value",
+]);
 const HANDLE_RUNTIME_KEY = "__denojs_worker_handle_v1";
 const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
     const mkErr = (code, message) => {
@@ -406,6 +433,12 @@ type StreamFrame = {
     error?: string;
     reason?: string;
     credit?: number;
+};
+
+type StreamSlotMeta = {
+    name: string;
+    localDiscarded: boolean;
+    remoteDiscarded: boolean;
 };
 
 /** Checks whether a payload matches the structured stream-frame envelope shape. */
@@ -756,10 +789,7 @@ export class DenoWorker {
     private startupError: unknown = null;
     private streamCounter = 0;
     private readonly streamIncoming = new Map<string, StreamReaderImpl>();
-    private readonly streamById = new Map<
-        string,
-        { name: string; localDiscarded: boolean; remoteDiscarded: boolean }
-    >();
+    private readonly streamById = new Map<string, StreamSlotMeta>();
     private readonly streamNameToId = new Map<string, string>();
     private readonly streamPendingAccepts = new Map<
         string,
@@ -774,6 +804,10 @@ export class DenoWorker {
     private readonly pendingCreditFrames = new Map<string, number>();
     private readonly pendingIncomingStreamFrames = new Map<string, StreamFrame[]>();
     private streamCreditFlushQueued = false;
+    private readonly streamSlotPool: StreamSlotMeta[] = [];
+    private streamSlotsInUse = 0;
+    private streamSlotPoolTarget = STREAM_SLOT_POOL_MIN;
+    private streamSlotPoolOps = 0;
     private readonly streamWindowBytes: number;
     private readonly streamCreditFlushBytes: number;
     private readonly streamBacklogLimit: number;
@@ -1074,15 +1108,15 @@ export class DenoWorker {
         return false;
     }
 
-    /** Detects { type, id, payload } message envelopes that can use a native binary fast path. */
+    /** Detects { type, id, payload } message envelopes that can use a native typed fast path. */
     private extractTypedMessageEnvelope(value: any): { type: string; id: number; payload: any } | null {
         if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-        const keys = Object.keys(value);
-        if (keys.length !== 3 || !keys.includes("type") || !keys.includes("id") || !keys.includes("payload")) return null;
-        if (typeof value.type !== "string" || !value.type) return null;
-        if (typeof value.id !== "number" || !Number.isFinite(value.id) || value.id < 0) return null;
-        if (!this.isBinaryLikeValue(value.payload)) return null;
-        return { type: value.type, id: Math.trunc(value.id), payload: value.payload };
+        const type = (value as any).type;
+        if (typeof type !== "string" || !type) return null;
+        const id = (value as any).id;
+        if (typeof id !== "number" || !Number.isFinite(id) || id < 0) return null;
+        const payload = (value as any).payload;
+        return { type, id: Math.trunc(id), payload };
     }
 
     /** Conservative binary fast path for setGlobal to preserve typed-array class fidelity. */
@@ -1216,6 +1250,42 @@ export class DenoWorker {
         }
     }
 
+    /** Returns true when incoming payload can skip wire rehydration safely. */
+    private canBypassWireHydration(value: any): boolean {
+        if (value === null) return true;
+        const t = typeof value;
+        if (t === "string" || t === "boolean") return true;
+        if (t === "number") return Number.isFinite(value);
+        if (t !== "object") return false;
+        if (this.isBinaryLikeValue(value)) return false;
+
+        if (Array.isArray(value)) {
+            if (value.length > 32) return false;
+            for (const item of value) {
+                if (item === null) continue;
+                const it = typeof item;
+                if (it === "string" || it === "boolean") continue;
+                if (it === "number" && Number.isFinite(item)) continue;
+                return false;
+            }
+            return true;
+        }
+
+        const proto = Object.getPrototypeOf(value);
+        if (!(proto === Object.prototype || proto === null)) return false;
+        const entries = Object.entries(value);
+        if (entries.length > 32) return false;
+        for (const [k, v] of entries) {
+            if (k === "__proto__" || WIRE_MARKER_KEY_SET.has(k)) return false;
+            if (v === null) continue;
+            const vt = typeof v;
+            if (vt === "string" || vt === "boolean") continue;
+            if (vt === "number" && Number.isFinite(v)) continue;
+            return false;
+        }
+        return true;
+    }
+
     /** Wires native message/close events to wrapper message routing, stream handling, and lifecycle flow. */
     private bindNativeEvents(native: NativeWorker, epoch: number): void {
         native.on("message", (msg: any) => {
@@ -1223,7 +1293,7 @@ export class DenoWorker {
             const frame = decodeStreamFrameEnvelope(msg);
             if (frame && this.handleIncomingStreamFrame(frame)) return;
             if (this.handleIncomingStreamFrame(msg)) return;
-            const hydrated = hydrateFromWire(msg);
+            const hydrated = this.canBypassWireHydration(msg) ? msg : hydrateFromWire(msg);
             if (this.handleIncomingStreamFrame(hydrated)) return;
             if (this.messageHandlers.size === 0) return;
             for (const cb of [...this.messageHandlers]) {
@@ -1277,12 +1347,30 @@ export class DenoWorker {
 
     /** Sends one logical stream frame to runtime after envelope encoding. */
     private emitStreamFrame(frame: Omit<StreamFrame, typeof STREAM_BRIDGE_TAG>): void {
+        const postControl = (this.native as any).postStreamControl;
+        if (typeof postControl === "function" && frame.t !== "chunk") {
+            const kind = frame.t;
+            const id = frame.id;
+            let aux: string | undefined;
+            if (kind === "open") aux = frame.key ?? "";
+            else if (kind === "error") aux = frame.error ?? "";
+            else if (kind === "cancel") aux = frame.reason ?? "";
+            else if (kind === "credit") aux = String(Math.max(0, Math.trunc(frame.credit ?? 0)));
+            const ok = postControl(kind, id, aux);
+            if (!ok) throw new Error("DenoWorker.postStreamControl failed: worker is closed");
+            return;
+        }
         this.postMessageRaw(encodeStreamFrameEnvelope(frame));
     }
 
     /** Sends a batch of logical stream frames using native bulk-post when available. */
     private emitStreamFrames(frames: Array<Omit<StreamFrame, typeof STREAM_BRIDGE_TAG>>): void {
         if (frames.length === 0) return;
+        const postControl = (this.native as any).postStreamControl;
+        if (typeof postControl === "function" && frames.every((f) => f.t !== "chunk")) {
+            for (const frame of frames) this.emitStreamFrame(frame);
+            return;
+        }
         const raw = frames.map((f) => encodeStreamFrameEnvelope(f));
         if (typeof (this.native as any).postMessages === "function") {
             const sent = (this.native as any).postMessages(raw);
@@ -1359,6 +1447,62 @@ export class DenoWorker {
         return pending;
     }
 
+    /** Returns desired free slot pool size based on current in-use stream count. */
+    private desiredStreamSlotPoolTarget(): number {
+        const scaled = Math.ceil((this.streamSlotsInUse * STREAM_SLOT_POOL_SCALE_NUM) / STREAM_SLOT_POOL_SCALE_DEN);
+        const target = scaled + STREAM_SLOT_POOL_HEADROOM;
+        if (target < STREAM_SLOT_POOL_MIN) return STREAM_SLOT_POOL_MIN;
+        if (target > STREAM_SLOT_POOL_MAX) return STREAM_SLOT_POOL_MAX;
+        return target;
+    }
+
+    /** Grows or trims the preallocated stream slot pool to a target free-slot count. */
+    private resizeStreamSlotPool(target: number): void {
+        if (target < 0) target = 0;
+        while (this.streamSlotPool.length < target) {
+            this.streamSlotPool.push({ name: "", localDiscarded: false, remoteDiscarded: false });
+        }
+        if (this.streamSlotPool.length > target) {
+            this.streamSlotPool.length = target;
+        }
+    }
+
+    /** Periodically retunes stream slot preallocation with hysteresis to avoid thrash. */
+    private tuneStreamSlotPool(force = false): void {
+        if (!force) {
+            this.streamSlotPoolOps += 1;
+            if (this.streamSlotPoolOps < STREAM_SLOT_POOL_TUNE_INTERVAL) return;
+            this.streamSlotPoolOps = 0;
+        }
+        const desired = this.desiredStreamSlotPoolTarget();
+        if (!force && Math.abs(desired - this.streamSlotPoolTarget) < STREAM_SLOT_POOL_HYSTERESIS) return;
+        this.streamSlotPoolTarget = desired;
+        this.resizeStreamSlotPool(this.streamSlotPoolTarget);
+    }
+
+    /** Borrows a reusable stream slot from pool (or allocates one) for a newly opened stream. */
+    private acquireStreamSlot(name: string): StreamSlotMeta {
+        const slot = this.streamSlotPool.pop() || { name: "", localDiscarded: false, remoteDiscarded: false };
+        slot.name = name;
+        slot.localDiscarded = false;
+        slot.remoteDiscarded = false;
+        this.streamSlotsInUse += 1;
+        this.tuneStreamSlotPool();
+        return slot;
+    }
+
+    /** Returns a stream slot to pool after resetting mutable fields. */
+    private releaseStreamSlot(slot: StreamSlotMeta): void {
+        slot.name = "";
+        slot.localDiscarded = false;
+        slot.remoteDiscarded = false;
+        if (this.streamSlotsInUse > 0) this.streamSlotsInUse -= 1;
+        this.tuneStreamSlotPool();
+        if (this.streamSlotPool.length < this.streamSlotPoolTarget) {
+            this.streamSlotPool.push(slot);
+        }
+    }
+
     /** Registers a newly opened stream key/id pair and guards against duplicates. */
     private registerStream(name: string, id: string): void {
         if (this.streamById.has(id)) {
@@ -1367,7 +1511,7 @@ export class DenoWorker {
         if (this.streamNameToId.has(name)) {
             throw new Error(`Stream key already in use: ${name}`);
         }
-        this.streamById.set(id, { name, localDiscarded: false, remoteDiscarded: false });
+        this.streamById.set(id, this.acquireStreamSlot(name));
         this.streamNameToId.set(name, id);
     }
 
@@ -1409,6 +1553,7 @@ export class DenoWorker {
         this.streamWriterWaiters.delete(id);
         const current = this.streamNameToId.get(meta.name);
         if (current === id) this.streamNameToId.delete(meta.name);
+        this.releaseStreamSlot(meta);
     }
 
     /** Rejects an incoming stream open request by emitting error+discard control frames. */
@@ -1539,6 +1684,9 @@ export class DenoWorker {
             reader.errorRemote(new Error(reason));
         }
         this.streamIncoming.clear();
+        for (const meta of this.streamById.values()) {
+            this.releaseStreamSlot(meta);
+        }
         this.streamById.clear();
         this.streamNameToId.clear();
         this.streamBacklog.clear();
@@ -1554,6 +1702,7 @@ export class DenoWorker {
             waiter.reject(new Error(reason));
         }
         this.streamPendingAccepts.clear();
+        this.tuneStreamSlotPool(true);
     }
 
     /** Tracks in-flight async operations so they can be force-rejected during shutdown. */
@@ -1638,6 +1787,8 @@ export class DenoWorker {
             Number.isFinite(parsedBacklogLimit) && parsedBacklogLimit >= 1
                 ? Math.trunc(parsedBacklogLimit)
                 : STREAM_BACKLOG_DEFAULT_LIMIT;
+        this.streamSlotPoolTarget = STREAM_SLOT_POOL_MIN;
+        this.resizeStreamSlotPool(this.streamSlotPoolTarget);
         this.invokeHook("beforeStart", { options });
         this.native = this.createNative(false);
         this.nativeEpoch += 1;
@@ -1821,6 +1972,10 @@ export class DenoWorker {
         }
 
         const id = this.nextStreamId("n");
+        const typedChunkType = `${STREAM_TYPED_CHUNK_PREFIX}${id}`;
+        const canPostNativeChunk = typeof (this.native as any).postStreamChunk === "function";
+        const canPostNativeChunks = typeof (this.native as any).postStreamChunks === "function";
+        const canPostTypedChunk = typeof this.native.postMessageTyped === "function";
         this.registerStream(finalKey, id);
         const encodeChunkEnvelope = createChunkEnvelopeEncoder(id);
         let done = false;
@@ -1844,20 +1999,75 @@ export class DenoWorker {
             return promise;
         };
         let queuedPayloads: Uint8Array[] = [];
-        let queuedWaiters: Array<{ resolve: () => void; reject: (e: unknown) => void }> = [];
         let flushQueued = false;
+        let flushPromise: Promise<void> | null = null;
+        let flushResolve: (() => void) | null = null;
+        let flushReject: ((e: unknown) => void) | null = null;
+        let queuedFastChunks: Uint8Array[] = [];
+        let queuedFastBytes = 0;
+        let fastFlushQueued = false;
+        let fastFlushPromise: Promise<void> | null = null;
+        let fastFlushResolve: (() => void) | null = null;
+        let fastFlushReject: ((e: unknown) => void) | null = null;
+        const settleFlush = (err?: unknown): void => {
+            if (!flushPromise) return;
+            const resolve = flushResolve;
+            const reject = flushReject;
+            flushPromise = null;
+            flushResolve = null;
+            flushReject = null;
+            if (err !== undefined) {
+                if (reject) reject(err);
+                return;
+            }
+            if (resolve) resolve();
+        };
+        const settleFastFlush = (err?: unknown): void => {
+            if (!fastFlushPromise) return;
+            const resolve = fastFlushResolve;
+            const reject = fastFlushReject;
+            fastFlushPromise = null;
+            fastFlushResolve = null;
+            fastFlushReject = null;
+            if (err !== undefined) {
+                if (reject) reject(err);
+                return;
+            }
+            if (resolve) resolve();
+        };
         const flushQueuedWrites = (): void => {
             flushQueued = false;
-            if (queuedPayloads.length === 0) return;
+            if (queuedPayloads.length === 0) {
+                settleFlush();
+                return;
+            }
             const payloads = queuedPayloads;
-            const waiters = queuedWaiters;
             queuedPayloads = [];
-            queuedWaiters = [];
             try {
                 postRawBatch(payloads);
-                for (const waiter of waiters) waiter.resolve();
+                settleFlush();
             } catch (err) {
-                for (const waiter of waiters) waiter.reject(err);
+                settleFlush(err);
+            }
+        };
+        const flushFastChunks = (): void => {
+            fastFlushQueued = false;
+            if (queuedFastChunks.length === 0) {
+                settleFastFlush();
+                return;
+            }
+            const chunks = queuedFastChunks;
+            queuedFastChunks = [];
+            queuedFastBytes = 0;
+            try {
+                if (chunks.length === 1) {
+                    postChunkFast(chunks[0]);
+                } else {
+                    postChunksFast(chunks);
+                }
+                settleFastFlush();
+            } catch (err) {
+                settleFastFlush(err);
             }
         };
         const scheduleFlushQueuedWrites = (): void => {
@@ -1866,6 +2076,44 @@ export class DenoWorker {
             queueMicrotask(() => {
                 flushQueuedWrites();
             });
+        };
+        const scheduleFastFlush = (): void => {
+            if (fastFlushQueued) return;
+            fastFlushQueued = true;
+            queueMicrotask(() => {
+                flushFastChunks();
+            });
+        };
+        const queuePayloads = (payloads: Uint8Array[]): Promise<void> => {
+            if (payloads.length === 0) return Promise.resolve();
+            queuedPayloads.push(...payloads);
+            if (!flushPromise) {
+                flushPromise = new Promise<void>((resolve, reject) => {
+                    flushResolve = resolve;
+                    flushReject = reject;
+                });
+                // Avoid unhandled rejection if stream teardown races before caller awaits.
+                void flushPromise.catch(() => {});
+            }
+            const pendingFlush = flushPromise;
+            if (queuedPayloads.length >= 32) flushQueuedWrites();
+            else scheduleFlushQueuedWrites();
+            return pendingFlush;
+        };
+        const queueFastChunk = (chunk: Uint8Array): Promise<void> => {
+            queuedFastChunks.push(chunk);
+            queuedFastBytes += chunk.byteLength;
+            if (!fastFlushPromise) {
+                fastFlushPromise = new Promise<void>((resolve, reject) => {
+                    fastFlushResolve = resolve;
+                    fastFlushReject = reject;
+                });
+                void fastFlushPromise.catch(() => {});
+            }
+            const pending = fastFlushPromise;
+            if (queuedFastChunks.length >= 512 || queuedFastBytes >= 1024 * 1024) flushFastChunks();
+            else scheduleFastFlush();
+            return pending;
         };
         const postRawBatch = (payloads: Uint8Array[]): void => {
             if (payloads.length === 0) return;
@@ -1878,6 +2126,39 @@ export class DenoWorker {
                 return;
             }
             for (const payload of payloads) this.postMessageRaw(payload);
+        };
+        const postChunkFast = (chunk: Uint8Array): void => {
+            if (canPostNativeChunk) {
+                const ok = (this.native as any).postStreamChunk(id, chunk);
+                if (!ok) throw new Error("DenoWorker.postStreamChunk failed: worker is closed");
+                return;
+            }
+            if (canPostTypedChunk) {
+                if (!this.native.postMessageTyped!(typedChunkType, 0, chunk)) {
+                    throw new Error("DenoWorker.postMessageTyped failed: worker is closed");
+                }
+                return;
+            }
+            const payload = encodeChunkEnvelope(chunk);
+            this.postMessageRaw(payload);
+        };
+        const postChunksFast = (chunks: Uint8Array[]): void => {
+            if (chunks.length === 0) return;
+            if (chunks.length === 1) {
+                postChunkFast(chunks[0]);
+                return;
+            }
+            // Coalesce many small chunks into one transport packet so runtime stream
+            // parser work scales with bytes, not chunk count.
+            let total = 0;
+            for (const chunk of chunks) total += chunk.byteLength;
+            const merged = new Uint8Array(total);
+            let off = 0;
+            for (const chunk of chunks) {
+                merged.set(chunk, off);
+                off += chunk.byteLength;
+            }
+            postChunkFast(merged);
         };
 
         return {
@@ -1894,28 +2175,26 @@ export class DenoWorker {
                 ensureOpen();
                 const u8 = toBinaryChunk(chunk);
                 const have = this.streamWriterCredits.get(id) || 0;
+                const useTypedChunk = (canPostNativeChunk || canPostTypedChunk) && u8.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES;
                 if (have >= u8.byteLength) {
                     this.consumeWriterCredit(id, u8.byteLength);
-                    const payload = encodeChunkEnvelope(u8);
-                    const p = new Promise<void>((resolve, reject) => {
-                        queuedPayloads.push(payload);
-                        queuedWaiters.push({ resolve, reject });
-                        if (queuedPayloads.length >= 32) flushQueuedWrites();
-                        else scheduleFlushQueuedWrites();
-                    });
-                    return withHandledRejection(p);
+                    if (useTypedChunk) {
+                        return withHandledRejection(queueFastChunk(u8));
+                    } else {
+                        const payload = encodeChunkEnvelope(u8);
+                        this.postMessageRaw(payload);
+                        return Promise.resolve();
+                    }
                 }
                 return withHandledRejection((async () => {
                     await this.waitForWriterCredit(id, u8.byteLength);
                     this.consumeWriterCredit(id, u8.byteLength);
-                    const payload = encodeChunkEnvelope(u8);
-                    const p = new Promise<void>((resolve, reject) => {
-                        queuedPayloads.push(payload);
-                        queuedWaiters.push({ resolve, reject });
-                        if (queuedPayloads.length >= 32) flushQueuedWrites();
-                        else scheduleFlushQueuedWrites();
-                    });
-                    await p;
+                    if (useTypedChunk) {
+                        await queueFastChunk(u8);
+                    } else {
+                        const payload = encodeChunkEnvelope(u8);
+                        this.postMessageRaw(payload);
+                    }
                 })());
             },
             writeMany: (chunks: Array<Uint8Array | ArrayBuffer>) =>
@@ -1929,16 +2208,17 @@ export class DenoWorker {
                         prepared.push(u8);
                         totalBytes += u8.byteLength;
                     }
+                    const useTypedForAll =
+                        (canPostNativeChunk || canPostTypedChunk) &&
+                        prepared.every((chunk) => chunk.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES);
                     if ((this.streamWriterCredits.get(id) || 0) >= totalBytes) {
-                        const payloads = prepared.map((chunk) => encodeChunkEnvelope(chunk));
                         this.consumeWriterCredit(id, totalBytes);
-                        const p = new Promise<void>((resolve, reject) => {
-                            queuedPayloads.push(...payloads);
-                            queuedWaiters.push({ resolve, reject });
-                            if (queuedPayloads.length >= 32) flushQueuedWrites();
-                            else scheduleFlushQueuedWrites();
-                        });
-                        await p;
+                        if (useTypedForAll) {
+                            postChunksFast(prepared);
+                        } else {
+                            const payloads = prepared.map((chunk) => encodeChunkEnvelope(chunk));
+                            await queuePayloads(payloads);
+                        }
                         return prepared.length;
                     }
                     let sent = 0;
@@ -1947,8 +2227,15 @@ export class DenoWorker {
                     for (const chunk of prepared) {
                         await this.waitForWriterCredit(id, chunk.byteLength);
                         this.consumeWriterCredit(id, chunk.byteLength);
-                        batch.push(encodeChunkEnvelope(chunk));
-                        batchBytes += chunk.byteLength;
+                        const useTypedChunk =
+                            (canPostNativeChunk || canPostTypedChunk) &&
+                            chunk.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES;
+                        if (useTypedChunk) {
+                            await queueFastChunk(chunk);
+                        } else {
+                            batch.push(encodeChunkEnvelope(chunk));
+                            batchBytes += chunk.byteLength;
+                        }
                         sent += 1;
                         if (batch.length >= 64) {
                             postRawBatch(batch);
@@ -1966,6 +2253,7 @@ export class DenoWorker {
                     if (done) return;
                     done = true;
                     flushQueuedWrites();
+                    flushFastChunks();
                     try {
                         this.emitStreamFrame({ t: "close", id });
                     } catch {
@@ -1979,6 +2267,7 @@ export class DenoWorker {
                 withHandledRejection((async () => {
                     if (done) return;
                     done = true;
+                    flushFastChunks();
                     this.emitStreamFrame({ t: "error", id, error: String(message || "stream error") });
                     this.markRemoteDiscard(id);
                     this.markLocalDiscard(id);
@@ -1988,6 +2277,7 @@ export class DenoWorker {
                 withHandledRejection((async () => {
                     if (done) return;
                     done = true;
+                    flushFastChunks();
                     this.emitStreamFrame({ t: "cancel", id, reason });
                     this.markRemoteDiscard(id);
                     this.markLocalDiscard(id);

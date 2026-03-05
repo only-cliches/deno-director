@@ -59,6 +59,19 @@ pub enum DenoMsg {
         id: u32,
         payload: JsValueBridge,
     },
+    PostStreamChunk {
+        stream_id: String,
+        payload: JsValueBridge,
+    },
+    PostStreamChunks {
+        stream_id: String,
+        payloads: Vec<JsValueBridge>,
+    },
+    PostStreamControl {
+        kind: String,
+        stream_id: String,
+        aux: Option<String>,
+    },
     Memory {
         deferred: PromiseSettler,
     },
@@ -72,7 +85,11 @@ impl DenoMsg {
     pub fn is_data_plane(&self) -> bool {
         matches!(
             self,
-            DenoMsg::PostMessage { .. } | DenoMsg::PostMessageTyped { .. }
+            DenoMsg::PostMessage { .. }
+                | DenoMsg::PostMessageTyped { .. }
+                | DenoMsg::PostStreamChunk { .. }
+                | DenoMsg::PostStreamChunks { .. }
+                | DenoMsg::PostStreamControl { .. }
         )
     }
 }

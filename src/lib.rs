@@ -44,7 +44,10 @@ pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
             | DenoMsg::SetGlobal { deferred, .. } => deferred.reject_with_error("Runtime is closed"),
             DenoMsg::Eval { deferred: None, .. }
             | DenoMsg::PostMessage { .. }
-            | DenoMsg::PostMessageTyped { .. } => {}
+            | DenoMsg::PostMessageTyped { .. }
+            | DenoMsg::PostStreamChunk { .. }
+            | DenoMsg::PostStreamChunks { .. }
+            | DenoMsg::PostStreamControl { .. } => {}
         }
     }
 }
@@ -93,7 +96,10 @@ where
             }
             DenoMsg::Eval { deferred: None, .. }
             | DenoMsg::PostMessage { .. }
-            | DenoMsg::PostMessageTyped { .. } => {}
+            | DenoMsg::PostMessageTyped { .. }
+            | DenoMsg::PostStreamChunk { .. }
+            | DenoMsg::PostStreamChunks { .. }
+            | DenoMsg::PostStreamControl { .. } => {}
         }
     }
 }
