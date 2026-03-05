@@ -34,6 +34,11 @@ pub async fn handle_deno_msg(
             payload,
             credit,
         } => handle_post_stream_chunk_raw_msg(worker, stream_id, payload, credit),
+        DenoMsg::PostStreamChunkRawBin {
+            stream_id,
+            payload,
+            credit,
+        } => handle_post_stream_chunk_raw_bin_msg(worker, stream_id, payload, credit),
         DenoMsg::PostStreamChunks { stream_id, payloads } => {
             handle_post_stream_chunks_msg(worker, stream_id, payloads)
         }
@@ -449,6 +454,50 @@ fn handle_post_stream_chunk_raw_msg(
 
     if !dispatched {
         return handle_post_stream_chunk_msg(worker, stream_id.to_string(), payload);
+    }
+    false
+}
+
+fn handle_post_stream_chunk_raw_bin_msg(
+    worker: &mut MainWorker,
+    stream_id: u32,
+    payload: Vec<u8>,
+    credit: Option<u32>,
+) -> bool {
+    let dispatched = {
+        deno_core::scope!(scope, &mut worker.js_runtime);
+        let Some(key) = v8::String::new(scope, "__dispatchNodeStreamChunkRaw") else {
+            return false;
+        };
+        let ctx = scope.get_current_context();
+        let global = ctx.global(scope);
+        let Some(fn_any) = global.get(scope, key.into()) else {
+            return false;
+        };
+        let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_any) else {
+            return false;
+        };
+        let id_val = v8::Integer::new_from_unsigned(scope, stream_id);
+        let ab = if payload.is_empty() {
+            v8::ArrayBuffer::new(scope, 0)
+        } else {
+            let bs = v8::ArrayBuffer::new_backing_store_from_vec(payload).make_shared();
+            v8::ArrayBuffer::with_backing_store(scope, &bs)
+        };
+        let Some(payload_val) = v8::Uint8Array::new(scope, ab, 0, ab.byte_length()).map(|v| v.into()) else {
+            return false;
+        };
+        let credit_val: v8::Local<v8::Value> = match credit {
+            Some(v) => v8::Integer::new_from_unsigned(scope, v).into(),
+            None => v8::undefined(scope).into(),
+        };
+        dispatch_fn
+            .call(scope, global.into(), &[id_val.into(), payload_val, credit_val])
+            .is_some()
+    };
+
+    if !dispatched {
+        return false;
     }
     false
 }

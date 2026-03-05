@@ -887,6 +887,8 @@ export type NativeWorker = {
     postStreamChunk?: (streamId: string, payload: any) => boolean;
     /** Fast-path stream chunk transport keyed by numeric stream id with optional piggyback credit. */
     postStreamChunkRaw?: (streamId: number, payload: any, credit?: number) => boolean;
+    /** Fast-path stream chunk transport using raw binary payload keyed by numeric stream id. */
+    postStreamChunkRawBin?: (streamId: number, payload: Uint8Array | ArrayBuffer, credit?: number) => boolean;
     /** Fast-path batched stream chunk transport keyed by stream id. */
     postStreamChunks?: (streamId: string, payloads: any[]) => number;
     /** Fast-path vectorized stream chunk transport keyed by numeric stream id. */

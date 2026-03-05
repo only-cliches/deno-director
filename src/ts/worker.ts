@@ -35,6 +35,7 @@ const STREAM_BRIDGE_TAG = "__denojs_worker_stream_v1";
 const STREAM_TYPED_CHUNK_PREFIX = "__denojs_worker_stream_chunk_v1:";
 const STREAM_TYPED_CHUNK_MIN_BYTES = 1;
 const STREAM_V2_ENABLED = process.env.DENO_DIRECTOR_STREAM_V2 !== "0";
+const STREAM_V2_STATS_DEBUG = process.env.DENO_DIRECTOR_STREAM_V2_STATS_DEBUG === "1";
 const STREAM_CHUNK_MAGIC = [0x44, 0x44, 0x53, 0x54, 0x52, 0x4d, 0x31, 0x00] as const;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -58,7 +59,7 @@ const STREAM_FRAME_CODE_TO_TYPE: Record<number, StreamFrameType> = {
 };
 
 // Default stream flow-control window.
-const STREAM_DEFAULT_WINDOW_BYTES = 16 * 1024 * 1024;
+const STREAM_DEFAULT_WINDOW_BYTES = 256 * 1024 * 1024;
 // Default credit flush threshold (256 KiB): avoids chatty credit updates while
 // keeping writers responsive under sustained transfer.
 const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
@@ -2015,6 +2016,7 @@ export class DenoWorker {
         const typedChunkType = `${STREAM_TYPED_CHUNK_PREFIX}${id}`;
         const canPostNativeChunk = typeof (this.native as any).postStreamChunk === "function";
         const canPostNativeChunkRaw = typeof (this.native as any).postStreamChunkRaw === "function";
+        const canPostNativeChunkRawBin = typeof (this.native as any).postStreamChunkRawBin === "function";
         const canPostNativeChunksRaw = typeof (this.native as any).postStreamChunksRaw === "function";
         const canPostTypedChunk = typeof this.native.postMessageTyped === "function";
         this.registerStream(finalKey, id);
@@ -2115,6 +2117,11 @@ export class DenoWorker {
         const postChunkFast = (chunk: Uint8Array): void => {
             const piggybackCredit = this.pendingCreditFrames.get(id) || 0;
             if (piggybackCredit > 0) this.pendingCreditFrames.delete(id);
+            if (canPostNativeChunkRawBin && useRawStreamId !== null) {
+                const ok = (this.native as any).postStreamChunkRawBin(useRawStreamId, chunk, piggybackCredit || undefined);
+                if (!ok) throw new Error("DenoWorker.postStreamChunkRawBin failed: worker is closed");
+                return;
+            }
             if (canPostNativeChunkRaw && useRawStreamId !== null) {
                 const ok = (this.native as any).postStreamChunkRaw(useRawStreamId, chunk, piggybackCredit || undefined);
                 if (!ok) throw new Error("DenoWorker.postStreamChunkRaw failed: worker is closed");
@@ -2186,6 +2193,10 @@ export class DenoWorker {
         let queuedFastBytes = 0;
         let fastFlushQueued = false;
         let fastFlushError: unknown = null;
+        let fastFlushCount = 0;
+        let fastFlushChunks = 0;
+        let fastFlushBytes = 0;
+        let writerCreditWaits = 0;
         const flushFastChunks = (): void => {
             fastFlushQueued = false;
             if (queuedFastChunks.length === 0) {
@@ -2195,6 +2206,9 @@ export class DenoWorker {
             queuedFastChunks = [];
             queuedFastBytes = 0;
             try {
+                fastFlushCount += 1;
+                fastFlushChunks += chunks.length;
+                for (const c of chunks) fastFlushBytes += c.byteLength;
                 postChunksFast(chunks);
             } catch (err) {
                 fastFlushError = err;
@@ -2260,6 +2274,7 @@ export class DenoWorker {
                     }
                 }
                 return withHandledRejection((async () => {
+                    writerCreditWaits += 1;
                     await this.waitForWriterCredit(id, u8.byteLength);
                     this.consumeWriterCredit(id, u8.byteLength);
                     if (useTypedChunk) {
@@ -2298,6 +2313,7 @@ export class DenoWorker {
                     let batchBytes = 0;
                     let batch: Uint8Array[] = [];
                     for (const chunk of prepared) {
+                        writerCreditWaits += 1;
                         await this.waitForWriterCredit(id, chunk.byteLength);
                         this.consumeWriterCredit(id, chunk.byteLength);
                         const useTypedChunk =
@@ -2327,6 +2343,16 @@ export class DenoWorker {
                     done = true;
                     flushQueuedWrites();
                     flushFastChunks();
+                    if (STREAM_V2_STATS_DEBUG) {
+                        try {
+                            // eslint-disable-next-line no-console
+                            console.log(
+                                `[streamV2stats] key=${finalKey} flushes=${fastFlushCount} chunks=${fastFlushChunks} bytes=${fastFlushBytes} creditWaits=${writerCreditWaits}`,
+                            );
+                        } catch {
+                            // ignore
+                        }
+                    }
                     try {
                         this.emitStreamFrame({ t: "close", id });
                     } catch {
