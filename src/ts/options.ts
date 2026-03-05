@@ -14,8 +14,8 @@ export type DenoWorkerWorkerOptions = DenoWorkerOptions;
 /**
  * Sanitizes user-provided eval options before crossing the native boundary.
  *
- * This strips invalid fields and dehydrates typed-array views so native can
- * rehydrate values consistently in the target runtime.
+ * This strips invalid fields and preserves binary views as raw payloads so
+ * hot data paths avoid avoidable byte expansion.
  */
 export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undefined {
     if (!options) return undefined;
@@ -27,13 +27,13 @@ export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undef
             ? options.args.map((a) => {
                     if (typeof Buffer !== "undefined" && Buffer.isBuffer(a)) return a;
                     if (typeof ArrayBuffer !== "undefined" && a instanceof ArrayBuffer) return a;
-                    if (typeof Uint8Array !== "undefined" && a instanceof Uint8Array) return a;
+                    if (typeof SharedArrayBuffer !== "undefined" && a instanceof SharedArrayBuffer) return a;
                     if (
                         typeof ArrayBuffer !== "undefined" &&
                         typeof ArrayBuffer.isView === "function" &&
                         ArrayBuffer.isView(a)
                     ) {
-                        return dehydrateForWire(a);
+                        return a;
                     }
                     return dehydrateForWire(a);
                 })

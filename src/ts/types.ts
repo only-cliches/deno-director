@@ -875,6 +875,8 @@ export type DenoWorkerHandleApi = {
 export type NativeWorker = {
     /** Post a message into runtime `onmessage` handlers. */
     postMessage(msg: any): boolean;
+    /** Fast-path for { type, id, payload } envelopes with binary payloads. */
+    postMessageTyped?: (type: string, id: number, payload: any) => boolean;
     /** Batch post messages; returns accepted count. */
     postMessages?: (msgs: any[]) => number;
     /** Register a low-level event listener on native worker bridge. */

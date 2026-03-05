@@ -53,6 +53,17 @@ describe("deno_worker: handles", () => {
     await expect(fn.call([20, 22])).resolves.toBe(42);
   });
 
+  test("handle.call preserves binary args without degrading bytes", async () => {
+    const fn = await dw.handle.eval(`(u8) => ({ len: u8.length >>> 0, first: u8[0] ?? -1, last: u8[u8.length - 1] ?? -1 })`);
+    const payload = new Uint8Array(1024);
+    for (let i = 0; i < payload.length; i += 1) payload[i] = i & 255;
+    await expect(fn.call([payload])).resolves.toEqual({
+      len: payload.length,
+      first: payload[0],
+      last: payload[payload.length - 1],
+    });
+  });
+
   test("dispose is idempotent and prevents further operations", async () => {
     const h = await dw.handle.eval(`({ a: 1 })`);
     await h.dispose();

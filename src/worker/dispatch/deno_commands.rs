@@ -20,6 +20,11 @@ pub async fn handle_deno_msg(
         DenoMsg::Close { deferred } => handle_close_msg(worker_id, deferred),
         DenoMsg::Memory { deferred } => handle_memory_msg(worker, worker_id, deferred).await,
         DenoMsg::PostMessage { value } => handle_post_message_msg(worker, value),
+        DenoMsg::PostMessageTyped {
+            message_type,
+            id,
+            payload,
+        } => handle_post_message_typed_msg(worker, message_type, id, payload),
         DenoMsg::SetGlobal {
             key,
             value,
@@ -161,6 +166,63 @@ fn handle_post_message_msg(worker: &mut MainWorker, value: JsValueBridge) -> boo
             .unwrap_or_else(|_| "null".into());
         let script = format!("globalThis.__dispatchNodeMessage(globalThis.__hydrate({payload}))");
         let _ = worker.js_runtime.execute_script("<postMessage>", script);
+    }
+    false
+}
+
+// Handle post message typed msg.
+fn handle_post_message_typed_msg(
+    worker: &mut MainWorker,
+    message_type: String,
+    id: u32,
+    payload: JsValueBridge,
+) -> bool {
+    let dispatched = {
+        deno_core::scope!(scope, &mut worker.js_runtime);
+        let Some(key) = v8::String::new(scope, "__dispatchNodeMessage") else {
+            return false;
+        };
+        let ctx = scope.get_current_context();
+        let global = ctx.global(scope);
+        let Some(fn_any) = global.get(scope, key.into()) else {
+            return false;
+        };
+        let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_any) else {
+            return false;
+        };
+
+        let msg_obj = v8::Object::new(scope);
+        let Some(type_key) = v8::String::new(scope, "type") else {
+            return false;
+        };
+        let Some(id_key) = v8::String::new(scope, "id") else {
+            return false;
+        };
+        let Some(payload_key) = v8::String::new(scope, "payload") else {
+            return false;
+        };
+        let Some(type_val) = v8::String::new(scope, message_type.as_str()) else {
+            return false;
+        };
+        let id_val = v8::Integer::new_from_unsigned(scope, id);
+
+        let Ok(payload_val) = crate::bridge::v8_codec::to_v8(scope, &payload) else {
+            return false;
+        };
+
+        let _ = msg_obj.set(scope, type_key.into(), type_val.into());
+        let _ = msg_obj.set(scope, id_key.into(), id_val.into());
+        let _ = msg_obj.set(scope, payload_key.into(), payload_val);
+        dispatch_fn.call(scope, global.into(), &[msg_obj.into()]).is_some()
+    };
+
+    if !dispatched {
+        let value = JsValueBridge::Json(serde_json::json!({
+            "type": message_type,
+            "id": id,
+            "payload": crate::bridge::wire::to_wire_json(&payload),
+        }));
+        return handle_post_message_msg(worker, value);
     }
     false
 }

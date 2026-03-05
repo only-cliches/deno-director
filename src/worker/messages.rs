@@ -54,6 +54,11 @@ pub enum DenoMsg {
     PostMessage {
         value: JsValueBridge,
     },
+    PostMessageTyped {
+        message_type: String,
+        id: u32,
+        payload: JsValueBridge,
+    },
     Memory {
         deferred: PromiseSettler,
     },
@@ -65,7 +70,10 @@ pub enum DenoMsg {
 impl DenoMsg {
     /// Checks whether data plane and returns the boolean result for runtime bridge internals.
     pub fn is_data_plane(&self) -> bool {
-        matches!(self, DenoMsg::PostMessage { .. })
+        matches!(
+            self,
+            DenoMsg::PostMessage { .. } | DenoMsg::PostMessageTyped { .. }
+        )
     }
 }
 

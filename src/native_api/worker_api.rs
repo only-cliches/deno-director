@@ -555,6 +555,46 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         api.set(&mut cx, "postMessages", f)?;
     }
 
+    // postMessageTyped(type, id, payload) -> boolean
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let message_type = cx.argument::<JsString>(0)?.value(&mut cx);
+            let id_num = cx.argument::<JsNumber>(1)?.value(&mut cx);
+            if !id_num.is_finite() || id_num < 0.0 || id_num > (u32::MAX as f64) {
+                return cx.throw_error("postMessageTyped id must be a finite uint32");
+            }
+            let payload_js = cx.argument::<JsValue>(2)?;
+            let payload = crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?;
+
+            let tx = deno_data_tx_for_worker(id2);
+            let Some(tx) = tx else {
+                if strict_channel() {
+                    return cx.throw_error("Runtime is closed (postMessageTyped)");
+                }
+                return Ok(cx.boolean(false));
+            };
+
+            let msg = DenoMsg::PostMessageTyped {
+                message_type,
+                id: id_num as u32,
+                payload,
+            };
+
+            match tx.blocking_send(msg) {
+                Ok(()) => Ok(cx.boolean(true)),
+                Err(_) => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime is closed (postMessageTyped)")
+                    } else {
+                        Ok(cx.boolean(false))
+                    }
+                }
+            }
+        })?;
+        api.set(&mut cx, "postMessageTyped", f)?;
+    }
+
     // on(event, cb)
     {
         let id2 = id;

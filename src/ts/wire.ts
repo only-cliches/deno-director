@@ -5,7 +5,25 @@ const GRAPH_ID_KEY = "__denojs_worker_graph_id";
 const GRAPH_REF_KEY = "__denojs_worker_graph_ref";
 const GRAPH_KIND_KEY = "__denojs_worker_graph_kind";
 const GRAPH_VALUE_KEY = "__denojs_worker_graph_value";
-const FORBIDDEN_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const FORBIDDEN_PROTO_KEYS = new Set(["__proto__"]);
+const WIRE_MARKER_KEYS = new Set([
+    "__undef",
+    "__num",
+    "__denojs_worker_num",
+    "__date",
+    "__bigint",
+    "__regexp",
+    "__url",
+    "__urlSearchParams",
+    "__buffer",
+    "__map",
+    "__set",
+    "__denojs_worker_type",
+    GRAPH_ID_KEY,
+    GRAPH_REF_KEY,
+    GRAPH_KIND_KEY,
+    GRAPH_VALUE_KEY,
+]);
 
 /** Canonical wire sentinel for `undefined` values. */
 function wireUndef(): WireJson {
@@ -17,6 +35,81 @@ function wireNum(tag: string): WireJson {
     return { __num: tag };
 }
 
+/** Fast check for plain acyclic JSON values that need no wire tags. */
+function isPlainJsonAcyclic(value: any): boolean {
+    if (value === null) return true;
+    const t = typeof value;
+    if (t === "string" || t === "boolean") return true;
+    if (t === "number") return Number.isFinite(value);
+    if (t !== "object") return false;
+    if (typeof Date !== "undefined" && value instanceof Date) return false;
+    if (typeof RegExp !== "undefined" && value instanceof RegExp) return false;
+    if (typeof Map !== "undefined" && value instanceof Map) return false;
+    if (typeof Set !== "undefined" && value instanceof Set) return false;
+    if (typeof URL !== "undefined" && value instanceof URL) return false;
+    if (typeof URLSearchParams !== "undefined" && value instanceof URLSearchParams) return false;
+    if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return false;
+    if (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) return false;
+    if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value)) return false;
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) return false;
+
+    if (!Array.isArray(value)) {
+        const proto = Object.getPrototypeOf(value);
+        if (proto === Object.prototype || proto === null) {
+            const entries = Object.entries(value);
+            if (entries.length <= 16) {
+                let shallowOk = true;
+                for (const [k, v] of entries) {
+                    if (FORBIDDEN_PROTO_KEYS.has(k) || WIRE_MARKER_KEYS.has(k)) {
+                        shallowOk = false;
+                        break;
+                    }
+                    if (v === null) continue;
+                    const vt = typeof v;
+                    if (vt === "string" || vt === "boolean") continue;
+                    if (vt === "number" && Number.isFinite(v)) continue;
+                    shallowOk = false;
+                    break;
+                }
+                if (shallowOk) return true;
+            }
+        }
+    }
+
+    const seen = typeof WeakSet !== "undefined" ? new WeakSet<object>() : null;
+    if (!seen) return false;
+    const stack: any[] = [value];
+    let nodes = 0;
+    while (stack.length > 0) {
+        const cur = stack.pop();
+        if (cur === null) continue;
+        const ct = typeof cur;
+        if (ct === "string" || ct === "boolean") continue;
+        if (ct === "number") {
+            if (!Number.isFinite(cur)) return false;
+            continue;
+        }
+        if (ct !== "object") return false;
+        if (seen.has(cur)) return false;
+        seen.add(cur);
+        nodes += 1;
+        if (nodes > 50_000) return false;
+
+        if (Array.isArray(cur)) {
+            for (let i = 0; i < cur.length; i += 1) stack.push(cur[i]);
+            continue;
+        }
+
+        const proto = Object.getPrototypeOf(cur);
+        if (proto !== Object.prototype && proto !== null) return false;
+        for (const [k, v] of Object.entries(cur)) {
+            if (FORBIDDEN_PROTO_KEYS.has(k) || WIRE_MARKER_KEYS.has(k)) return false;
+            stack.push(v);
+        }
+    }
+    return true;
+}
+
 /**
  * Converts host values into a JSON-safe wire representation.
  *
@@ -24,6 +117,7 @@ function wireNum(tag: string): WireJson {
  * keeps object graph identity for cyclic/shared references via graph ids.
  */
 export function dehydrateForWire(value: any): WireJson {
+    if (isPlainJsonAcyclic(value)) return value;
     const seen = typeof WeakMap !== "undefined" ? new WeakMap<object, number>() : null;
     let nextGraphId = 1;
 
@@ -269,6 +363,7 @@ function bufferViewFromWire(obj: any): any {
  * This is the inverse of `dehydrateForWire` for supported value categories.
  */
 export function hydrateFromWire(v: any): any {
+    if (isPlainJsonAcyclic(v)) return v;
     const graph = new Map<number, any>();
     const isForbiddenProtoKey = (k: string): boolean => FORBIDDEN_PROTO_KEYS.has(k);
 
