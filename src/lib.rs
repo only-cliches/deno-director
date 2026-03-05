@@ -34,8 +34,13 @@ pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
     tx: tokio::sync::mpsc::Sender<DenoMsg>,
     msg: DenoMsg,
 ) {
-    if let Err(err) = tx.blocking_send(msg) {
-        match err.0 {
+    let send_result = match tx.try_send(msg) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => tx.blocking_send(msg).map_err(|e| e.0),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(msg)) => Err(msg),
+    };
+    if let Err(err) = send_result {
+        match err {
             DenoMsg::Eval {
                 deferred: Some(deferred),
                 ..

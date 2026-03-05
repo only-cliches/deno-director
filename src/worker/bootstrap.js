@@ -608,7 +608,6 @@ globalThis.__nodeIncomingStreamsByNumeric = new Map();
 globalThis.__nodeStreamWriterCredits = new Map();
 globalThis.__nodeStreamWriterWaiters = new Map();
 globalThis.__nodePendingStreamCredits = new Map();
-globalThis.__nodeStreamCreditFlushQueued = false;
 globalThis.__nodeNativeStreamReadWaiters = new Map();
 
 function streamBridgeConfig() {
@@ -630,6 +629,11 @@ function streamBridgeConfig() {
       : streamWindowBytes;
   return { streamWindowBytes, streamCreditFlushBytes, streamHighWaterMarkBytes };
 }
+const STREAM_BRIDGE_CFG = streamBridgeConfig();
+const STREAM_CREDIT_FLUSH_EFFECTIVE_BYTES = Math.max(
+  1,
+  Math.min(STREAM_BRIDGE_CFG.streamCreditFlushBytes, STREAM_BRIDGE_CFG.streamWindowBytes),
+);
 
 function isStreamFrame(payload) {
   return (
@@ -775,16 +779,9 @@ function queueStreamCredit(id, bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return;
   const next = (globalThis.__nodePendingStreamCredits.get(id) || 0) + Math.trunc(bytes);
   globalThis.__nodePendingStreamCredits.set(id, next);
-  if (next >= streamBridgeConfig().streamCreditFlushBytes) {
+  if (next >= STREAM_CREDIT_FLUSH_EFFECTIVE_BYTES) {
     flushStreamCredits();
-    return;
   }
-  if (globalThis.__nodeStreamCreditFlushQueued) return;
-  globalThis.__nodeStreamCreditFlushQueued = true;
-  queueMicrotask(() => {
-    globalThis.__nodeStreamCreditFlushQueued = false;
-    flushStreamCredits();
-  });
 }
 
 function tryReleaseStream(id) {
@@ -871,7 +868,7 @@ function makeStreamReader(id) {
   const waiting = [];
   let bufferedBytes = 0;
   let pendingCreditBytes = 0;
-  const highWaterMarkBytes = streamBridgeConfig().streamHighWaterMarkBytes;
+  const highWaterMarkBytes = STREAM_BRIDGE_CFG.streamHighWaterMarkBytes;
   let closed = false;
   let done = false;
   let discarded = false;
@@ -1278,7 +1275,7 @@ const hostStreams = {
 
     const id = String(nextWorkerStreamId++);
     registerStream(finalKey, id);
-    globalThis.__nodeStreamWriterCredits.set(id, streamBridgeConfig().streamWindowBytes);
+    globalThis.__nodeStreamWriterCredits.set(id, STREAM_BRIDGE_CFG.streamWindowBytes);
     let done = false;
     const rejectWriterWaiters = (reason) => {
       const waiters = globalThis.__nodeStreamWriterWaiters.get(id);

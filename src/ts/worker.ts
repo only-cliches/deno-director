@@ -59,6 +59,7 @@ const STREAM_DEFAULT_WINDOW_BYTES = 256 * 1024 * 1024;
 const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
 const STREAM_V2_MAX_QUEUED_CHUNKS = 2048;
 const STREAM_V2_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
+const STREAM_V2_BATCH_MAX_CHUNK_BYTES = 1024 * 1024;
 const NATIVE_STREAM_DEBUG = process.env.DENO_DIRECTOR_NATIVE_STREAM_DEBUG === "1";
 const STREAM_READER_DEFAULT_HIGH_WATER_MARK_BYTES = STREAM_DEFAULT_WINDOW_BYTES;
 const STREAM_BACKLOG_DEFAULT_LIMIT = 256;
@@ -525,6 +526,9 @@ type StreamReadEvent =
     | { kind: "chunk"; chunk: Uint8Array }
     | { kind: "close" }
     | { kind: "error"; error: unknown };
+type InternalStreamWriterFastPath = {
+    __writeWithCallbacks?: (chunk: Uint8Array, onDone: () => void, onError: (err: unknown) => void) => void;
+};
 
 class StreamReaderImpl implements DenoWorkerStreamReader {
     private queue: StreamReadEvent[] = [];
@@ -717,7 +721,6 @@ export class DenoWorker {
     >();
     private readonly pendingCreditFrames = new Map<string, number>();
     private readonly pendingIncomingStreamFrames = new Map<string, StreamFrame[]>();
-    private streamCreditFlushQueued = false;
     private readonly streamSlotPool: StreamSlotMeta[] = [];
     private streamSlotsInUse = 0;
     private streamSlotPoolTarget = STREAM_SLOT_POOL_MIN;
@@ -1393,17 +1396,12 @@ export class DenoWorker {
     private queueCreditFrame(id: string, bytes: number): void {
         if (!Number.isFinite(bytes) || bytes <= 0) return;
         const prev = this.pendingCreditFrames.get(id) || 0;
-        this.pendingCreditFrames.set(id, prev + Math.trunc(bytes));
-        if (prev + bytes >= this.streamCreditFlushBytes) {
+        const next = prev + Math.trunc(bytes);
+        this.pendingCreditFrames.set(id, next);
+        const flushThreshold = Math.max(1, Math.min(this.streamCreditFlushBytes, this.streamWindowBytes));
+        if (next >= flushThreshold) {
             this.flushCreditFrames();
-            return;
         }
-        if (this.streamCreditFlushQueued) return;
-        this.streamCreditFlushQueued = true;
-        queueMicrotask(() => {
-            this.streamCreditFlushQueued = false;
-            this.flushCreditFrames();
-        });
     }
 
     /** Flushes queued stream credit updates to the remote writer side. */
@@ -2013,6 +2011,15 @@ export class DenoWorker {
                     return;
                 }
                 const payload = normalizeChunk(chunk as string | Buffer | Uint8Array);
+                const fastWriter = writer as DenoWorkerStreamWriter & InternalStreamWriterFastPath;
+                if (typeof fastWriter.__writeWithCallbacks === "function") {
+                    fastWriter.__writeWithCallbacks(
+                        payload,
+                        () => cb(),
+                        (err) => cb(toError(err)),
+                    );
+                    return;
+                }
                 writer.write(payload).then(
                     () => cb(),
                     (err) => cb(toError(err)),
@@ -2312,8 +2319,9 @@ export class DenoWorker {
             }
             postChunkFast(merged);
         };
-        const streamV2 =
-            STREAM_V2_ENABLED && (canPostNativeChunkRaw || canPostNativeChunk || canPostTypedChunk);
+        const canUseFastChunkPosting =
+            canPostNativeChunkRawBin || canPostNativeChunkRaw || canPostNativeChunk || canPostTypedChunk;
+        const streamV2 = STREAM_V2_ENABLED && canUseFastChunkPosting;
         let queuedFastChunks: Uint8Array[] = [];
         let queuedFastBytes = 0;
         let fastFlushQueued = false;
@@ -2365,8 +2373,51 @@ export class DenoWorker {
             }
             else scheduleFastFlush();
         };
+        const shouldBatchFastChunk = (byteLength: number): boolean =>
+            streamV2 && byteLength > 0 && byteLength <= STREAM_V2_BATCH_MAX_CHUNK_BYTES;
+        const writeChunkWithCallbacks = (u8: Uint8Array, onDone: () => void, onError: (err: unknown) => void): void => {
+            try {
+                ensureOpen();
+                const have = this.streamWriterCredits.get(id) || 0;
+                const useTypedChunk = canUseFastChunkPosting && u8.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES;
+                if (have >= u8.byteLength) {
+                    this.consumeWriterCredit(id, u8.byteLength);
+                    if (useTypedChunk) {
+                        if (shouldBatchFastChunk(u8.byteLength)) queueFastChunk(u8);
+                        else postChunkFast(u8);
+                    } else {
+                        const payload = encodeChunkEnvelope(u8);
+                        this.postMessageRaw(payload);
+                    }
+                    onDone();
+                    return;
+                }
+                writerCreditWaits += 1;
+                this.waitForWriterCredit(id, u8.byteLength).then(
+                    () => {
+                        try {
+                            this.consumeWriterCredit(id, u8.byteLength);
+                            if (useTypedChunk) {
+                                if (shouldBatchFastChunk(u8.byteLength)) queueFastChunk(u8);
+                                else postChunkFast(u8);
+                            } else {
+                                const payload = encodeChunkEnvelope(u8);
+                                this.postMessageRaw(payload);
+                            }
+                            onDone();
+                        } catch (err) {
+                            onError(err);
+                        }
+                    },
+                    (err) => onError(err),
+                );
+            } catch (err) {
+                onError(err);
+            }
+        };
 
-        return {
+        const writerApi: DenoWorkerStreamWriter & InternalStreamWriterFastPath = {
+            __writeWithCallbacks: writeChunkWithCallbacks,
             getKey: () => finalKey,
             ready: (minBytes = 1) => {
                 ensureOpen();
@@ -2377,40 +2428,10 @@ export class DenoWorker {
                 })());
             },
             write: (chunk: Uint8Array | ArrayBuffer) => {
-                ensureOpen();
                 const u8 = toBinaryChunk(chunk);
-                const have = this.streamWriterCredits.get(id) || 0;
-                const useTypedChunk =
-                    (canPostNativeChunkRaw || canPostNativeChunk || canPostTypedChunk) &&
-                    u8.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES;
-                if (have >= u8.byteLength) {
-                    this.consumeWriterCredit(id, u8.byteLength);
-                    if (useTypedChunk) {
-                        try {
-                            // `write()` is latency-sensitive; flush immediately so callers do not
-                            // wait on an ack for data that is still parked in JS microtask queues.
-                            postChunkFast(u8);
-                            return Promise.resolve();
-                        } catch (err) {
-                            return Promise.reject(err);
-                        }
-                    } else {
-                        const payload = encodeChunkEnvelope(u8);
-                        this.postMessageRaw(payload);
-                        return Promise.resolve();
-                    }
-                }
-                return withHandledRejection((async () => {
-                    writerCreditWaits += 1;
-                    await this.waitForWriterCredit(id, u8.byteLength);
-                    this.consumeWriterCredit(id, u8.byteLength);
-                    if (useTypedChunk) {
-                        postChunkFast(u8);
-                    } else {
-                        const payload = encodeChunkEnvelope(u8);
-                        this.postMessageRaw(payload);
-                    }
-                })());
+                return withHandledRejection(new Promise<void>((resolve, reject) => {
+                    writeChunkWithCallbacks(u8, resolve, reject);
+                }));
             },
             writeMany: (chunks: Array<Uint8Array | ArrayBuffer>) =>
                 withHandledRejection((async () => {
@@ -2424,7 +2445,7 @@ export class DenoWorker {
                         totalBytes += u8.byteLength;
                     }
                     const useTypedForAll =
-                        (canPostNativeChunkRaw || canPostNativeChunk || canPostTypedChunk) &&
+                        canUseFastChunkPosting &&
                         prepared.every((chunk) => chunk.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES);
                     if ((this.streamWriterCredits.get(id) || 0) >= totalBytes) {
                         this.consumeWriterCredit(id, totalBytes);
@@ -2444,10 +2465,10 @@ export class DenoWorker {
                         await this.waitForWriterCredit(id, chunk.byteLength);
                         this.consumeWriterCredit(id, chunk.byteLength);
                         const useTypedChunk =
-                            (canPostNativeChunkRaw || canPostNativeChunk || canPostTypedChunk) &&
-                            chunk.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES;
+                            canUseFastChunkPosting && chunk.byteLength >= STREAM_TYPED_CHUNK_MIN_BYTES;
                         if (useTypedChunk) {
-                            queueFastChunk(chunk);
+                            if (shouldBatchFastChunk(chunk.byteLength)) queueFastChunk(chunk);
+                            else postChunkFast(chunk);
                         } else {
                             batch.push(encodeChunkEnvelope(chunk));
                             batchBytes += chunk.byteLength;
@@ -2512,6 +2533,7 @@ export class DenoWorker {
                     rejectWriterWaiters(`Stream cancelled: ${finalKey}`);
                 })()),
         };
+        return writerApi;
     }
 
     /** Waits for an incoming stream reader for the provided key (or returns queued backlog immediately). */
