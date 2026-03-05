@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { randomBytes, randomUUID } from "node:crypto";
+import { Duplex } from "node:stream";
 import { nativeAddon } from "./native";
 import { wrapModuleNamespace } from "./module-namespace";
 import { buildImportModuleSource } from "./module-source";
@@ -61,6 +62,8 @@ const STREAM_V2_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
 const NATIVE_STREAM_DEBUG = process.env.DENO_DIRECTOR_NATIVE_STREAM_DEBUG === "1";
 const STREAM_READER_DEFAULT_HIGH_WATER_MARK_BYTES = STREAM_DEFAULT_WINDOW_BYTES;
 const STREAM_BACKLOG_DEFAULT_LIMIT = 256;
+const STREAM_CONNECT_HOST_TO_WORKER_SUFFIX = "::h2w";
+const STREAM_CONNECT_WORKER_TO_HOST_SUFFIX = "::w2h";
 const STREAM_SLOT_POOL_MIN = 16;
 const STREAM_SLOT_POOL_MAX = 1024;
 const STREAM_SLOT_POOL_HEADROOM = 8;
@@ -732,6 +735,7 @@ export class DenoWorker {
     private readonly maxHandle: number;
     /** Stream transport API for creating writers and accepting incoming readers. */
     readonly stream: DenoWorkerStreamApi = {
+        connect: (key: string) => this.streamConnect(key),
         create: (key?: string) => this.streamCreate(key),
         accept: (key: string) => this.streamAccept(key),
     };
@@ -743,10 +747,12 @@ export class DenoWorker {
     };
     /** Module API for source evaluation and named module registry operations. */
     readonly module: DenoWorkerModuleApi = {
+        import: <T extends Record<string, any> = Record<string, any>>(specifier: string) =>
+            this.moduleApiImport<T>(specifier),
         eval: <T extends Record<string, any> = Record<string, any>>(source: string, options?: DenoWorkerModuleEvalOptions) =>
-            this.moduleEval<T>(source, options),
-        register: (moduleName: string, source: string) => this.moduleRegister(moduleName, source),
-        clear: (moduleName: string) => this.moduleClear(moduleName),
+            this.moduleApiEval<T>(source, options),
+        register: (moduleName: string, source: string) => this.moduleApiRegister(moduleName, source),
+        clear: (moduleName: string) => this.moduleApiClear(moduleName),
     };
 
     /** Allocates the next unique handle id scoped to the current native epoch. */
@@ -1961,6 +1967,132 @@ export class DenoWorker {
         return this.native.postMessage(payload);
     }
 
+    /** Returns stable directional keys for bidirectional `stream.connect(key)` sessions. */
+    private connectDirectionalKeys(key: string): { hostToWorker: string; workerToHost: string } {
+        const base = String(key || "").trim();
+        if (!base) throw new Error("stream.connect(key) requires a non-empty key");
+        return {
+            hostToWorker: `${base}${STREAM_CONNECT_HOST_TO_WORKER_SUFFIX}`,
+            workerToHost: `${base}${STREAM_CONNECT_WORKER_TO_HOST_SUFFIX}`,
+        };
+    }
+
+    /** Creates a Node.js Duplex over paired stream writer/reader endpoints. */
+    private createDuplexBridge(
+        writer: DenoWorkerStreamWriter,
+        startReader: () => Promise<DenoWorkerStreamReader>,
+        name: string,
+    ): Duplex {
+        let destroyed = false;
+        let writableClosed = false;
+        let readerRef: DenoWorkerStreamReader | null = null;
+        let readStartRequested = false;
+        let triggerReadStart: (() => void) | null = null;
+        const readStartPromise = new Promise<void>((resolve) => {
+            triggerReadStart = resolve;
+        });
+        let waitingReadableResume: (() => void) | null = null;
+        const consumeWait = async (): Promise<void> => {
+            if (!waitingReadableResume) return;
+            const waiter = waitingReadableResume;
+            waitingReadableResume = null;
+            waiter();
+            await Promise.resolve();
+        };
+        const normalizeChunk = (chunk: string | Buffer | Uint8Array): Uint8Array => {
+            if (typeof chunk === "string") return Buffer.from(chunk);
+            if (chunk instanceof Uint8Array) return chunk;
+            return Buffer.from(chunk);
+        };
+        const toError = (e: unknown): Error => (e instanceof Error ? e : new Error(String(e)));
+
+        const duplex = new Duplex({
+            write: (chunk, _enc, cb) => {
+                if (destroyed || writableClosed) {
+                    cb(new Error(`Stream already closed: ${name}`));
+                    return;
+                }
+                const payload = normalizeChunk(chunk as string | Buffer | Uint8Array);
+                writer.write(payload).then(
+                    () => cb(),
+                    (err) => cb(toError(err)),
+                );
+            },
+            final: (cb) => {
+                if (destroyed || writableClosed) {
+                    cb();
+                    return;
+                }
+                writableClosed = true;
+                writer.close().then(
+                    () => cb(),
+                    (err) => cb(toError(err)),
+                );
+            },
+            destroy: (err, cb) => {
+                destroyed = true;
+                const readerCancel = readerRef
+                    ? readerRef.cancel(err ? String(err) : "duplex destroyed")
+                    : Promise.resolve();
+                Promise.allSettled([
+                    readerCancel,
+                    writer.cancel(err ? String(err) : "duplex destroyed"),
+                ]).then(() => cb(err || null));
+            },
+            read: () => {
+                if (!readStartRequested) {
+                    readStartRequested = true;
+                    const trigger = triggerReadStart;
+                    triggerReadStart = null;
+                    if (trigger) trigger();
+                }
+                void consumeWait();
+            },
+        });
+
+        (async () => {
+            try {
+                await readStartPromise;
+                if (destroyed) return;
+                const reader = await startReader();
+                readerRef = reader;
+                if (destroyed) {
+                    await reader.cancel("duplex destroyed");
+                    return;
+                }
+                for await (const chunk of reader) {
+                    if (destroyed) break;
+                    const canContinue = duplex.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+                    if (!canContinue && !destroyed) {
+                        await new Promise<void>((resolve) => {
+                            waitingReadableResume = resolve;
+                        });
+                    }
+                }
+                if (!duplex.destroyed) duplex.push(null);
+            } catch (err) {
+                if (!duplex.destroyed) duplex.destroy(toError(err));
+            }
+        })();
+
+        duplex.once("close", () => {
+            destroyed = true;
+            if (waitingReadableResume) {
+                const waiter = waitingReadableResume;
+                waitingReadableResume = null;
+                waiter();
+            }
+        });
+        return duplex;
+    }
+
+    /** Connects a bidirectional Node.js duplex stream over paired stream lanes. */
+    private async streamConnect(key: string): Promise<Duplex> {
+        const { hostToWorker, workerToHost } = this.connectDirectionalKeys(key);
+        const writer = this.streamCreate(hostToWorker);
+        return this.createDuplexBridge(writer, () => this.streamAccept(workerToHost), key);
+    }
+
     /** Creates an outgoing stream writer and manages writer-side flow-control + lifecycle. */
     private streamCreate(key?: string): DenoWorkerStreamWriter {
         const provided = key != null;
@@ -2726,7 +2858,7 @@ export class DenoWorker {
         }
     }
 
-    private async moduleEval<T extends Record<string, any> = Record<string, any>>(
+    private async moduleApiEval<T extends Record<string, any> = Record<string, any>>(
         source: string,
         options?: DenoWorkerModuleEvalOptions,
     ): Promise<T> {
@@ -2734,7 +2866,7 @@ export class DenoWorker {
         const moduleName = typeof options?.moduleName === "string" ? options.moduleName.trim() : "";
         if (moduleName) {
             await this.registerModuleInternal(moduleName, source);
-            return this.importModule<T>(moduleName);
+            return this.moduleApiImport<T>(moduleName);
         }
 
         let raw: any;
@@ -2753,13 +2885,13 @@ export class DenoWorker {
     }
 
     /** Module API entrypoint: register module source under a stable module name. */
-    private async moduleRegister(moduleName: string, source: string): Promise<void> {
+    private async moduleApiRegister(moduleName: string, source: string): Promise<void> {
         await this.startupPromise;
         await this.registerModuleInternal(moduleName, source);
     }
 
     /** Module API entrypoint: clear a previously registered module by name. */
-    private async moduleClear(moduleName: string): Promise<boolean> {
+    private async moduleApiClear(moduleName: string): Promise<boolean> {
         await this.startupPromise;
         return await this.clearModuleInternal(moduleName);
     }
@@ -2770,7 +2902,7 @@ export class DenoWorker {
      * This routes through the runtime's normal import resolution pipeline
      * (including imports callbacks and permission policy).
      */
-    async importModule<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T> {
+    private async moduleApiImport<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T> {
         await this.startupPromise;
         const spec = String(specifier);
         if (this.creationOptions?.permissions?.wasm === false && this.isWasmSpecifier(spec)) {

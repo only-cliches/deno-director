@@ -158,23 +158,26 @@ console.log(await mod.encrypt("secret")); // "c2VjcmV0"
 
 ```
 
-If you already have a module specifier, use `importModule` as a shorthand:
+If you already have a module specifier, use `worker.module.import(...)`:
 
 ```ts
 const worker = new DenoWorker({
-  imports: (specifier) => {
-    if (specifier === "app:math") {
-      return { ts: "export const add = (a: number, b: number) => a + b;" };
-    }
-    return false;
+  modules: { // declare available modules
+    "app:math": "export const add = (a: number, b: number) => a + b;",
   },
+  imports: false, // block all non-registered imports; only `modules` entries are resolvable
 });
 
-const math = await worker.importModule("app:math");
+const math = await worker.module.import("app:math");
 console.log(await math.add(2, 3)); // 5
+
+// throws:
+const another_module = await worker.module.import("another_module");
 
 await worker.close();
 ```
+
+When you need dynamic resolution (instead of a fixed allowlist in `modules`), use the `imports` interceptor.
 
 ### 🪄 Magic Module Resolution: The `imports` Interceptor
 
@@ -433,31 +436,28 @@ import { DenoWorker } from "deno-director";
 import { randomUUID } from "node:crypto";
 
 const worker = new DenoWorker();
-const upload = worker.stream.create();
-const uploadKey = upload.getKey();
-const downloadKey = randomUUID();
-const readerPromise = worker.stream.accept(downloadKey);
+const key = randomUUID();
+const duplex = await worker.stream.connect(key);
 
 await worker.eval(`
-  // Launch a task that consumes Node -> worker bytes and then emits worker -> Node bytes.
-  globalThis.__streamTask = (async () => {
-    const inStream = await hostStreams.accept(uploadKey);
+  // Consume Node -> worker bytes on "<key>::h2w", then write response on "<key>::w2h".
+  globalThis.__streamTask = (async (key) => {
+    const inStream = await hostStreams.accept(String(key) + "::h2w");
     for await (const _chunk of inStream) {}
 
-    const outStream = hostStreams.create(downloadKey);
+    const outStream = hostStreams.create(String(key) + "::w2h");
     await outStream.write(new TextEncoder().encode("ok"));
     await outStream.close();
-  })();
-`, { args: [uploadKey, downloadKey] });
+  })(key);
+`, { args: [key] });
 
 // Node -> worker
-await upload.write(new TextEncoder().encode("hello "));
-await upload.write(new TextEncoder().encode("world"));
-await upload.close();
+await new Promise<void>((resolve, reject) => {
+  duplex.end(Buffer.from("hello world"), (err?: Error | null) => (err ? reject(err) : resolve()));
+});
 
 // worker -> Node
-const reader = await readerPromise;
-for await (const chunk of reader) {
+for await (const chunk of duplex) {
   console.log("download chunk bytes:", chunk.byteLength);
 }
 
@@ -472,14 +472,13 @@ Inside worker code:
 ```ts
 // Keys can be injected via eval args.
 // Example eval src:
-// async (uploadKey, downloadKey) => { ... }
-const inStream = await hostStreams.accept(uploadKey);
+// async (key) => { ... }
+const inStream = await hostStreams.accept(String(key) + "::h2w");
 for await (const chunk of inStream) {
   // chunk is Uint8Array
 }
 
-// Use the generated download key passed in from host
-const outStream = hostStreams.create(downloadKey);
+const outStream = hostStreams.create(String(key) + "::w2h");
 await outStream.write(new TextEncoder().encode("ok"));
 await outStream.close();
 ```
@@ -560,34 +559,12 @@ Evaluates the source as an ES Module and returns a callable Proxy namespace to t
 Registers source under a module name for future imports.
 * `module.clear(moduleName: string): Promise<boolean>`
 Clears a previously registered module by name.
-* `importModule<T>(specifier: string): Promise<T>`
+* `module.import<T>(specifier: string): Promise<T>`
 Imports a module specifier through the runtime import pipeline and returns a callable Proxy namespace to the exports.
-* `stream.create(key?: string): DenoWorkerStreamWriter`
-Creates a byte stream from Node -> worker. If `key` is omitted, a cryptographically secure random key is generated.
-* `stream.accept(key: string): Promise<DenoWorkerStreamReader>`
-Accepts a byte stream opened from worker -> Node.
+* `stream.connect(key: string): Promise<Duplex>`
+Opens a bidirectional stream session and returns a Node.js `Duplex` stream.
 
 When `transpileTs: true` is enabled, all three evaluation entrypoints (`eval`, `evalSync`, `module.eval`) run source through the TS/JSX transpiler before execution.
-
-Stream writer methods:
-
-- `getKey(): string`
-- `ready(minBytes?: number): Promise<void>`
-- `write(chunk: Uint8Array | ArrayBuffer): Promise<void>`
-- `writeMany(chunks: Array<Uint8Array | ArrayBuffer>): Promise<number>`
-- `close(): Promise<void>`
-- `error(message: string): Promise<void>`
-- `cancel(reason?: string): Promise<void>`
-
-Default stream flow-control tuning:
-
-- per-stream send window: `16 MiB`
-- credit flush threshold: `256 KiB`
-
-Stream reader methods:
-
-- `read(): Promise<IteratorResult<Uint8Array>>`
-- `cancel(reason?: string): Promise<void>`
 - async iteration: `for await (const chunk of reader) { ... }`
 
 #### **Environment & Memory**
@@ -671,7 +648,7 @@ type DenoWorkerOptions = {
 ```
 
 `bridge.channelSize` applies independently to multiple internal queues (control-plane, data-plane, and node callback dispatch), not a single shared queue. Under heavy load, total buffered slots can approach roughly `3 * channelSize`.
-`bridge.streamBacklogLimit` caps worker->Node stream opens that arrive before Node calls `stream.accept(key)`; excess opens are rejected to bound host memory growth.
+`bridge.streamBacklogLimit` caps worker->Node stream opens that arrive before the host side accepts the lane; excess opens are rejected to bound host memory growth.
 
 ### 🧩 `nodeCompat` vs `moduleLoader.nodeResolve`
 

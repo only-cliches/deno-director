@@ -80,7 +80,7 @@ describe("deno_worker: modules", () => {
     20_000
   );
 
-  it("importModule loads through imports callback and returns callable namespace", async () => {
+  it("module.import loads through imports callback and returns callable namespace", async () => {
     const seen: string[] = [];
     dw = createTestWorker({
       imports: (specifier: string) => {
@@ -99,7 +99,7 @@ describe("deno_worker: modules", () => {
       },
     });
 
-    const mod = await dw.importModule("virtual:math");
+    const mod = await dw.module.import("virtual:math");
     expect(seen).toContain("virtual:math");
     expect(mod.n).toBe(21);
     expect(mod.default).toBe("math-default");
@@ -107,24 +107,24 @@ describe("deno_worker: modules", () => {
     await expect(mod.plusOneAsync(41)).resolves.toBe(42);
   });
 
-  it("importModule propagates import rejection", async () => {
+  it("module.import propagates import rejection", async () => {
     dw = createTestWorker({ imports: false });
-    await expect(dw.importModule("virtual:nope")).rejects.toBeDefined();
+    await expect(dw.module.import("virtual:nope")).rejects.toBeDefined();
   });
 
   it("worker.module.register and worker.module.clear manage named modules", async () => {
     dw = createTestWorker();
     await dw.module.register("named:api", "export const v = 123;");
-    await expect(dw.importModule("named:api")).resolves.toMatchObject({ v: 123 });
+    await expect(dw.module.import("named:api")).resolves.toMatchObject({ v: 123 });
     await expect(dw.module.clear("named:api")).resolves.toBe(true);
-    await expect(dw.importModule("named:api")).rejects.toBeDefined();
+    await expect(dw.module.import("named:api")).rejects.toBeDefined();
   });
 
   it("worker.module.eval can pin moduleName for future imports", async () => {
     dw = createTestWorker();
     const mod = await dw.module.eval("export const out = 77;", { moduleName: "named:pin" });
     expect(mod.out).toBe(77);
-    await expect(dw.importModule("named:pin")).resolves.toMatchObject({ out: 77 });
+    await expect(dw.module.import("named:pin")).resolves.toMatchObject({ out: 77 });
   });
 
   it("constructor modules are registered during startup", async () => {
@@ -133,7 +133,7 @@ describe("deno_worker: modules", () => {
         "named:startup": "export const boot = 1;",
       },
     });
-    await expect(dw.importModule("named:startup")).resolves.toMatchObject({ boot: 1 });
+    await expect(dw.module.import("named:startup")).resolves.toMatchObject({ boot: 1 });
   });
 
   it("constructor modules are re-applied on restart", async () => {
@@ -142,11 +142,35 @@ describe("deno_worker: modules", () => {
         "named:restart": "export const v = 55;",
       },
     });
-    await expect(dw.importModule("named:restart")).resolves.toMatchObject({ v: 55 });
+    await expect(dw.module.import("named:restart")).resolves.toMatchObject({ v: 55 });
     await expect(dw.module.clear("named:restart")).resolves.toBe(true);
-    await expect(dw.importModule("named:restart")).rejects.toBeDefined();
+    await expect(dw.module.import("named:restart")).rejects.toBeDefined();
     await dw.restart();
-    await expect(dw.importModule("named:restart")).resolves.toMatchObject({ v: 55 });
+    await expect(dw.module.import("named:restart")).resolves.toMatchObject({ v: 55 });
+  });
+
+  it("imports:false allows declared modules and blocks everything else", async () => {
+    dw = createTestWorker({
+      imports: false,
+      modules: {
+        "named:only": "export const ok = 1;",
+      },
+    });
+
+    await expect(dw.module.import("named:only")).resolves.toMatchObject({ ok: 1 });
+    await expect(dw.module.import("named:missing")).rejects.toBeDefined();
+    await expect(
+      dw.module.eval(`
+        import { ok } from "named:only";
+        export const out = ok;
+      `),
+    ).resolves.toMatchObject({ out: 1 });
+    await expect(
+      dw.module.eval(`
+        import "./not-allowed.js";
+        export const out = 0;
+      `),
+    ).rejects.toBeDefined();
   });
 
   test(
@@ -159,7 +183,7 @@ describe("deno_worker: modules", () => {
 
         dw = createTestWorker({ cwd: dir, imports: true, permissions: { wasm: false } });
         const spec = pathToFileURL(wasmPath).href;
-        await expect(dw.importModule(spec)).rejects.toThrow(
+        await expect(dw.module.import(spec)).rejects.toThrow(
           /WASM module loading is disabled by permissions\.wasm/i
         );
       });

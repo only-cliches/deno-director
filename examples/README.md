@@ -14,7 +14,7 @@ Simple usage examples for `deno-director`.
 - `08-limits.ts`: `limits.maxEvalMs` and memory limits.
 - `09-console-routing.ts`: custom console handlers.
 - `10-director.ts`: manage multiple workers with `DenoDirector`.
-- `11-streams.ts`: byte-stream bridge (`stream.create` / `stream.accept`).
+- `11-streams.ts`: byte-stream bridge with `stream.connect(...)` (Node `Duplex` + worker stream lanes).
 - `12-handles.ts`: runtime value handles (`handle.get` / `handle.eval` / `handle.tryGet`).
 
 ## Running

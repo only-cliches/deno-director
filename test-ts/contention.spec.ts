@@ -109,7 +109,7 @@ describe("deno_worker: contention", () => {
           );
 
           const nodeReadTask = (async () => {
-            const reader = await dw.stream.accept(downloadKey);
+            const reader = await dw.stream.connect(downloadKey);
             const chunks: Uint8Array[] = [];
             for await (const chunk of reader) chunks.push(chunk);
             return decodeChunks(chunks);
@@ -120,7 +120,7 @@ describe("deno_worker: contention", () => {
               async (targetTs, downloadKey, payload) => {
                 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
                 while (Date.now() < targetTs) await wait(1);
-                const s = hostStreams.create(downloadKey);
+                const s = hostStreams.create(String(downloadKey) + "::w2h");
                 await s.write(new TextEncoder().encode(payload));
                 await s.close();
                 return true;
@@ -191,7 +191,7 @@ describe("deno_worker: contention", () => {
           const nodeReaders = streamKeys.map((key) =>
             withHardTimeout(
               (async () => {
-                const reader = await dw.stream.accept(key);
+                const reader = await dw.stream.connect(key);
                 const chunks: Uint8Array[] = [];
                 for await (const chunk of reader) chunks.push(chunk);
                 return decodeChunks(chunks);
@@ -227,7 +227,7 @@ describe("deno_worker: contention", () => {
                 while (Date.now() < targetTs) await wait(1);
                 await Promise.all(
                   keys.map(async (k, i) => {
-                    const s = hostStreams.create(k);
+                    const s = hostStreams.create(String(k) + "::w2h");
                     await s.write(new TextEncoder().encode(String(payloads[i])));
                     await s.close();
                   })
@@ -289,7 +289,7 @@ describe("deno_worker: contention", () => {
         const nodeDownReaders = pairData.map((d) =>
           withHardTimeout(
             (async () => {
-              const reader = await dw.stream.accept(d.down);
+              const reader = await dw.stream.connect(d.down);
               const chunks: Uint8Array[] = [];
               for await (const chunk of reader) chunks.push(chunk);
               return decodeChunks(chunks);
@@ -303,9 +303,13 @@ describe("deno_worker: contention", () => {
           withHardTimeout(
             (async () => {
               await sleep(i % 8);
-              const writer = dw.stream.create(d.up);
-              await writer.write(new TextEncoder().encode(d.payload));
-              await writer.close();
+              const writer = await dw.stream.connect(d.up);
+              await new Promise<void>((resolve, reject) => {
+                writer.end(Buffer.from(d.payload), (err?: Error | null) => {
+                  if (err) reject(err);
+                  else resolve();
+                });
+              });
               return true;
             })(),
             20_000,
@@ -327,11 +331,11 @@ describe("deno_worker: contention", () => {
 
               const streamWork = Promise.all(
                 pairs.map(async (p) => {
-                  const incoming = await hostStreams.accept(p.up);
+                  const incoming = await hostStreams.accept(String(p.up) + "::h2w");
                   const chunks = [];
                   for await (const chunk of incoming) chunks.push(chunk);
                   const total = chunks.reduce((n, c) => n + c.byteLength, 0);
-                  const out = hostStreams.create(p.down);
+                  const out = hostStreams.create(String(p.down) + "::w2h");
                   await out.write(new TextEncoder().encode(String(p.down + ":" + total)));
                   await out.close();
                 })
@@ -397,7 +401,7 @@ describe("deno_worker: contention", () => {
             const nodeReaders = keys.map((key) =>
               withHardTimeout(
                 (async () => {
-                  const r = await dw.stream.accept(key);
+                  const r = await dw.stream.connect(key);
                   const chunks: Uint8Array[] = [];
                   for await (const c of r) chunks.push(c);
                   return decodeChunks(chunks);
@@ -433,7 +437,7 @@ describe("deno_worker: contention", () => {
                   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
                   while (Date.now() < targetTs) await wait(1);
                   await Promise.all(keys.map(async (k, i) => {
-                    const s = hostStreams.create(k);
+                    const s = hostStreams.create(String(k) + "::w2h");
                     const payload = String(payloads[i]);
                     await s.write(new TextEncoder().encode(payload.slice(0, payload.length / 2)));
                     await s.write(new TextEncoder().encode(payload.slice(payload.length / 2)));

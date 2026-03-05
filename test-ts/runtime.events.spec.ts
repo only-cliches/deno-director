@@ -28,7 +28,7 @@ describe("DenoWorker runtime events", () => {
 
     try {
       await dw.module.register("named:math", "export const n = 9;");
-      await expect(dw.importModule("named:math")).resolves.toMatchObject({ n: 9 });
+      await expect(dw.module.import("named:math")).resolves.toMatchObject({ n: 9 });
 
       const requested = events.find((e) => e.kind === "import.requested");
       const resolved = events.find((e) => e.kind === "import.resolved");

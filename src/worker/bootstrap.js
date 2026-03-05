@@ -594,6 +594,8 @@ globalThis.__nodeMessageEventListeners = [];
 const STREAM_DEFAULT_WINDOW_BYTES = 256 * 1024 * 1024;
 const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
 const STREAM_READER_DEFAULT_HIGH_WATER_MARK_BYTES = STREAM_DEFAULT_WINDOW_BYTES;
+const STREAM_CONNECT_HOST_TO_WORKER_SUFFIX = "::h2w";
+const STREAM_CONNECT_WORKER_TO_HOST_SUFFIX = "::w2h";
 let nextWorkerStreamId = 1;
 globalThis.__nodeIncomingStreams = new Map();
 globalThis.__nodePendingStreamAccepts = new Map();
@@ -706,6 +708,21 @@ function resolveStreamId(streamId) {
   }
   const s = String(streamId || "");
   return s;
+}
+
+function connectDirectionalKeys(baseKey, role) {
+  const base = String(baseKey || "").trim();
+  if (!base) throw new Error("hostStreams.connect(key) requires a non-empty key");
+  if (role === "host") {
+    return {
+      writeKey: `${base}${STREAM_CONNECT_HOST_TO_WORKER_SUFFIX}`,
+      readKey: `${base}${STREAM_CONNECT_WORKER_TO_HOST_SUFFIX}`,
+    };
+  }
+  return {
+    writeKey: `${base}${STREAM_CONNECT_WORKER_TO_HOST_SUFFIX}`,
+    readKey: `${base}${STREAM_CONNECT_HOST_TO_WORKER_SUFFIX}`,
+  };
 }
 
 function addWriterCredit(id, credit) {
@@ -1364,6 +1381,44 @@ const hostStreams = {
         rejectWriterWaiters(`Stream cancelled: ${finalKey}`);
       },
     };
+  },
+
+  async connect(key, options) {
+    const roleRaw = options && options.role;
+    const role = roleRaw === "host" ? "host" : "worker";
+    const keys = connectDirectionalKeys(key, role);
+    const writer = hostStreams.create(keys.writeKey);
+    const reader = await hostStreams.accept(keys.readKey);
+
+    const readable = new ReadableStream({
+      async pull(controller) {
+        const out = await reader.read();
+        if (out.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(out.value);
+      },
+      async cancel(reason) {
+        await reader.cancel(reason == null ? undefined : String(reason));
+      },
+    });
+
+    const writable = new WritableStream({
+      async write(chunk) {
+        const u8 = toStreamChunk(chunk);
+        if (!u8) throw new Error("hostStreams.connect(...).writable expects Uint8Array or ArrayBuffer");
+        await writer.write(u8);
+      },
+      async close() {
+        await writer.close();
+      },
+      async abort(reason) {
+        await writer.cancel(reason == null ? undefined : String(reason));
+      },
+    });
+
+    return { readable, writable };
   },
 
   async accept(key) {

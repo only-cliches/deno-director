@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import type { DenoWorker } from "./worker";
+import type { Duplex } from "node:stream";
 
 /**
  * Event names supported by {@link DenoWorker.on}.
@@ -391,7 +392,7 @@ export type DenoWorkerLimits = {
     maxHandle?: number;
     /**
      * Description: default per-evaluation timeout in milliseconds.
-     * Applies to runtime execution surfaces including `eval`, `evalSync`, `module.eval`, `importModule`, and handle operations that execute code in runtime (for example `handle.call`, `handle.apply`, `handle.await`).
+     * Applies to runtime execution surfaces including `eval`, `evalSync`, `module.eval`, `module.import`, and handle operations that execute code in runtime (for example `handle.call`, `handle.apply`, `handle.await`).
      * Can be overridden per call via:
      * - `EvalOptions.maxEvalMs` on `eval`/`evalSync`/`module.eval`
      * - `DenoWorkerHandleExecOptions.maxEvalMs` on handle methods
@@ -519,7 +520,7 @@ export type DenoWorkerOptions = {
     /**
      * Module sources registered during worker startup.
      *
-     * Keys are module names/specifiers used by `importModule(...)` or
+     * Keys are module names/specifiers used by `worker.module.import(...)` or
      * `worker.module.eval(..., { moduleName })` resolution paths.
      */
     modules?: Record<string, string>;
@@ -756,7 +757,16 @@ export type DenoWorkerStreamReader = AsyncIterable<Uint8Array> & {
 };
 
 export type DenoWorkerStreamApi = {
+    /**
+     * Connects a bidirectional stream pair under `key` and returns a Node.js `Duplex`.
+     *
+     * Host writes are delivered to `hostStreams.connect(key).readable` inside the worker.
+     * Worker writes to `hostStreams.connect(key).writable` are delivered to this duplex readable side.
+     */
+    connect(key: string): Promise<Duplex>;
+    /** Low-level writer-only stream endpoint. */
     create(key?: string): DenoWorkerStreamWriter;
+    /** Low-level reader-only stream endpoint. */
     accept(key: string): Promise<DenoWorkerStreamReader>;
 };
 
@@ -771,6 +781,8 @@ export type DenoWorkerModuleEvalOptions = Omit<EvalOptions, "type"> & {
 };
 
 export type DenoWorkerModuleApi = {
+    /** Import a module specifier through the runtime import pipeline. */
+    import<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T>;
     /** Evaluate module source and return callable namespace exports. */
     eval<T extends Record<string, any> = Record<string, any>>(
         source: string,

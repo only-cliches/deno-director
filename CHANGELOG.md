@@ -3,6 +3,35 @@
 All notable changes to this project will be documented in this file.
 
 
+## [0.9.2] Future
+
+### Added
+- Added `worker.stream.connect(key): Promise<Duplex>` as the primary host-side stream API.
+- Added `hostStreams.connect(key, options?)` in worker bootstrap to expose Web Stream pairs for stream sessions.
+
+### Changed
+- Switched stream usage toward standard stream objects:
+  - Node side uses `Duplex` via `worker.stream.connect(...)`.
+  - Worker examples/docs use directional stream lanes (`<key>::h2w` and `<key>::w2h`) where explicit lane control is required.
+- Updated benchmark stream scenario labels to `worker.stream.connect`.
+- Updated `ipc-bench` stream scenario implementation to use `worker.stream.connect(...)` on Node side.
+- Updated stream docs and examples in `README.md` and `examples/11-streams.ts` to the new stream-connect flow.
+- Updated examples index docs in `examples/README.md` accordingly.
+
+### Fixed
+- Fixed `stream.connect` one-way/deferred-read behavior by making reverse-lane reader startup lazy (prevents deadlock in write-only flows).
+- Improved duplex teardown/cancellation behavior for stream-connect sessions under close/restart/error paths.
+
+### Tests
+- Migrated stream-focused tests to use Node stream objects (`worker.stream.connect`) on the host side.
+- Updated contention and bridge-isolation stream paths to align with stream-connect semantics.
+- Revalidated stream-related suites after migration:
+  - `test-ts/streams.spec.ts`
+  - `test-ts/streams.edge.spec.ts`
+  - `test-ts/bridge.isolation.spec.ts`
+  - `test-ts/contention.spec.ts`
+
+
 ## [0.9.1] Mar 5, 2026
 
 ### Added

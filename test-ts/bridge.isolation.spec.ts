@@ -152,7 +152,7 @@ describe("deno_worker: bridge isolation", () => {
       await dw.eval(`
         globalThis.__isoStreamOut = "";
         globalThis.__isoStreamTask = (async () => {
-          const s = await hostStreams.accept("iso-stream");
+          const s = await hostStreams.accept("iso-stream::h2w");
           const chunks = [];
           for await (const c of s) chunks.push(c);
           const total = chunks.reduce((n, c) => n + c.byteLength, 0);
@@ -167,14 +167,24 @@ describe("deno_worker: bridge isolation", () => {
         0;
       `);
 
-      const writer = dw.stream.create("iso-stream");
+      const duplex = await dw.stream.connect("iso-stream");
       const parts = ["a", "b", "c", "d", "e", "f"];
       for (let i = 0; i < parts.length; i += 1) {
-        await writer.write(new TextEncoder().encode(parts[i]));
+        await new Promise<void>((resolve, reject) => {
+          duplex.write(Buffer.from(parts[i]), (err?: Error | null) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
         dw.postMessage({ noise: i });
         await dw.eval("0");
       }
-      await writer.close();
+      await new Promise<void>((resolve, reject) => {
+        duplex.end((err?: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
 
       await withHardTimeout(dw.eval("__isoStreamTask"), 5_000, "stream-task");
       const out = await withHardTimeout(dw.eval("__isoStreamOut"), 3_000, "stream-out");

@@ -66,7 +66,7 @@ const scenarioCatalog: ScenarioMeta[] = [
     { key: "node+deno-postmessage", label: "Node | postMessage | Deno", main: "Node", ipc: "postMessage", worker: "Deno" },
     { key: "node+deno-eval", label: "Node | worker.eval | Deno", main: "Node", ipc: "worker.eval", worker: "Deno" },
     { key: "node+deno-handle", label: "Node | worker.handle | Deno", main: "Node", ipc: "worker.handle", worker: "Deno" },
-    { key: "node+deno-stream", label: "Node | worker.stream | Deno", main: "Node", ipc: "worker.stream", worker: "Deno" },
+    { key: "node+deno-stream", label: "Node | worker.stream.connect | Deno", main: "Node", ipc: "worker.stream.connect", worker: "Deno" },
     { key: "bun+bun-postmessage", label: "Bun | postMessage | Bun", main: "Bun", ipc: "postMessage", worker: "Bun" },
     { key: "bun+bun-http", label: "Bun | HTTP | Bun", main: "Bun", ipc: "HTTP", worker: "Bun" },
     { key: "deno+deno-postmessage", label: "Deno | postMessage | Deno", main: "Deno", ipc: "postMessage", worker: "Deno" },
@@ -577,7 +577,7 @@ const denoStreamScript = `
   (async () => {
   const readU32 = (buf, off) =>
     ((buf[off] >>> 0) | ((buf[off + 1] << 8) >>> 0) | ((buf[off + 2] << 16) >>> 0) | ((buf[off + 3] << 24) >>> 0)) >>> 0;
-  const reader = await hostStreams.accept(key);
+  const reader = await hostStreams.accept(String(key) + "::h2w");
   let buf = new Uint8Array(0);
   for await (const chunk of reader) {
     const next = new Uint8Array(buf.length + chunk.length);
@@ -629,6 +629,24 @@ const denoStreamScript = `
 }
 `;
 
+function writeDuplexChunk(duplex: any, chunk: Uint8Array): Promise<void> {
+    return new Promise((resolve, reject) => {
+        duplex.write(chunk, (err?: Error | null) => {
+            if (err) reject(err);
+            else resolve();
+        });
+    });
+}
+
+function endDuplex(duplex: any): Promise<void> {
+    return new Promise((resolve, reject) => {
+        duplex.end((err?: Error | null) => {
+            if (err) reject(err);
+            else resolve();
+        });
+    });
+}
+
 async function setupDenoStream(workerCount: number): Promise<any> {
     const workers = Array.from({ length: workerCount }, () => new DenoWorker());
     const pending = new Map<number, { resolve: (ack: Ack) => void; reject: (err: unknown) => void }>();
@@ -638,7 +656,7 @@ async function setupDenoStream(workerCount: number): Promise<any> {
     for (let i = 0; i < workers.length; i += 1) {
         const key = `bench-stream-persistent-${i}-${Math.random().toString(36).slice(2)}`;
         keys.push(key);
-        writers.push(workers[i].stream.create(key));
+        writers.push(await workers[i].stream.connect(key));
     }
     await Promise.all(workers.map((w, i) => w.eval(denoStreamScript, { args: [keys[i]] })));
     workers.forEach((w) => {
@@ -683,7 +701,7 @@ async function runDenoStream(payload: TransferPayload, messages: number, workerC
         frame[14] = 0;
         frame[15] = 0;
         frame.set(bytes, 16);
-        await writer.write(frame);
+        await writeDuplexChunk(writer, frame);
         return await ackPromise;
     });
 
@@ -693,7 +711,7 @@ async function runDenoStream(payload: TransferPayload, messages: number, workerC
 
 async function teardownDenoStream(ctx: any): Promise<void> {
     ctx.pending.clear();
-    await Promise.all(ctx.writers.map((w: any) => w.close()));
+    await Promise.all(ctx.writers.map((w: any) => endDuplex(w)));
     await Promise.all(ctx.workers.map((w: DenoWorker) => w.close({ force: true })));
 }
 
@@ -756,9 +774,9 @@ const localScenarios: LocalScenarioDef[] = [
     },
     {
         key: "node+deno-stream",
-        label: "Node | worker.stream | Deno",
+        label: "Node | worker.stream.connect | Deno",
         main: "Node",
-        ipc: "worker.stream",
+        ipc: "worker.stream.connect",
         worker: "Deno",
         setup: setupDenoStream,
         run: runDenoStream,
