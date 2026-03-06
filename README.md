@@ -616,8 +616,9 @@ Returns telemetry for the most recent `eval` operation.
 
 * `postMessage(msg: any): void`
 Fires an event into Deno's `globalThis.onmessage`.
-* `on(event: "message" | "close" | "lifecycle", cb: Function)`
+* `on(event: "message" | "close" | "lifecycle" | "runtime", cb: Function)`
 Listen for messages from Deno (`hostPostMessage`), close events, or lifecycle transitions (`beforeStart`, `onCrash`, etc.).
+`"runtime"` events emit operation telemetry such as `eval.begin/end`, `evalSync.begin/end`, `import.requested/resolved`, `handle.*`, and `error.thrown`.
 * `close(options?: { force?: boolean }): Promise<void>`
 Gracefully shuts down the V8 isolate. Use `force: true` to instantly terminate execution.
 * `restart(options?: { force?: boolean }): Promise<void>`
@@ -638,13 +639,13 @@ type DenoWorkerOptions = {
     maxEvalMs?: number;         // Default timeout for eval + handle runtime operations
     maxCpuMs?: number;          // Default CPU-budget timeout for eval + handle runtime operations
     maxMemoryBytes?: number;    // V8 Heap limit
-    wasm?: boolean;             // Enable/disable .wasm module loading (default true)
   };
   bridge?: {                    // Transport tuning
     channelSize?: number;       // Per-queue capacity (control/data/node callback queues)
     streamWindowBytes?: number; // Per-stream flow-control window
     streamCreditFlushBytes?: number; // Credit flush threshold
     streamBacklogLimit?: number; // Max unaccepted worker->Node stream opens to backlog (default 256)
+    streamHighWaterMarkBytes?: number; // Reader-side high water mark (defaults to streamWindowBytes)
   };
   cwd?: string;                 // Virtual root for the filesystem sandbox
   startup?: string;             // Script evaluated before user code runs
@@ -656,6 +657,9 @@ type DenoWorkerOptions = {
     run?: boolean | string[];   // Allow subprocess execution (high risk)
     ffi?: boolean;              // Allow Foreign Function Interface
     sys?: boolean;              // OS Info access
+    import?: boolean | string[]; // Deno import capability permission allow-list
+    hrtime?: boolean;           // High-resolution timing access
+    wasm?: boolean;             // Enable/disable .wasm module loading (default true)
   };
   env?: Record<string, string>; // Custom environment variables
   envFile?: string | boolean;   // Load from a .env file
@@ -677,7 +681,7 @@ type DenoWorkerOptions = {
     reload?: boolean;           // Bypass cache
     maxPayloadBytes?: number;   // Remote module payload size cap in bytes (-1 disables limit, default 10 MiB)
   };
-  console?: false | Console | Record<string, Function | false>; // Route console logs
+  console?: DenoWorkerConsoleOption; // Route/disable console methods
   inspect?: boolean | { host?: string; port?: number; break?: boolean; }; // V8 Debugging
 };
 
