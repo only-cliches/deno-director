@@ -1488,6 +1488,17 @@ export class DenoWorker {
         referrer?: string,
         isDynamicImport?: boolean,
     ): Promise<ImportsCallbackResult> {
+        if (typeof decision === "string") {
+            const { src: nextSrc, srcLoader } = await this.applyLoadersAsync({
+                kind: "import",
+                src: decision,
+                srcLoader: "js",
+                specifier,
+                referrer,
+                isDynamicImport,
+            });
+            return { src: nextSrc, srcLoader };
+        }
         if (!decision || typeof decision !== "object" || Array.isArray(decision)) return decision;
         const src = (decision as any).src;
         if (typeof src !== "string") return decision;

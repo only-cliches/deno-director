@@ -796,6 +796,7 @@ type EvalOptions = {
 ```ts
 type ImportsCallbackResult =
   | boolean
+  | string // shorthand for: { src: "...", srcLoader: "js" }
   | { resolve: string }
   | { src: string; srcLoader?: string }; // default srcLoader is "js"
 ```

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.9.12] Future
+## [0.9.12] Mar 6, 2026
 
 ### Fixed
 - Hardened `permissions.net` / `permissions.import` host allow-list matching for IPv6 entries:
@@ -10,13 +10,19 @@ All notable changes to this project will be documented in this file.
   - malformed bracketed IPv6 entries are rejected instead of falling back to host-only matching
 - Hardened `envFile: true` loading to stay within the worker `cwd` sandbox:
   - automatic `.env` discovery no longer traverses parent directories outside the configured worker cwd
+- Fixed package install flow for consumers by compiling the platform-specific native addon during install:
+  - added package lifecycle `install` hook that runs the native build step and emits local `index.node`.
 
 ### Changed
 - Updated docs to reflect sandbox-bounded `envFile: true` behavior (cwd-local discovery).
+- Expanded `imports` callback return contract:
+  - string return values are now supported as shorthand for `{ src: "...", srcLoader: "js" }`.
+  - string shorthand now passes through `sourceLoaders` transforms the same way object `{ src, srcLoader }` returns do.
 
 ### Tests
 - Added IPv6 permission matching regression coverage in Rust module-loader tests.
 - Added `envFile: true` sandbox-boundary regression coverage in Jest inspect/env tests.
+- Added Jest coverage for `imports` callback string-shorthand returns with loader-transform parity.
 
 ## [0.9.6] Mar 6, 2026
 

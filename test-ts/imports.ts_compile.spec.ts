@@ -72,6 +72,37 @@ describe("imports callback ts/tsx/jsx + dynamic flag", () => {
     }
   });
 
+  test("imports callback string return is shorthand for { src, srcLoader: 'js' } and runs sourceLoaders", async () => {
+    const dw = createTestWorker({
+      permissions: { import: true },
+      sourceLoaders: [
+        ({ src, srcLoader, kind }) => {
+          if (kind !== "import") return;
+          if (srcLoader !== "js") return;
+          return { src, srcLoader: "ts" };
+        },
+      ],
+      imports: (specifier: string) => {
+        if (specifier !== "virtual:string-shorthand-ts") return false;
+        return `
+          const n: number = 41;
+          export default n + 1;
+        `;
+      },
+    });
+
+    try {
+      await expect(
+        dw.module.eval(`
+          import v from "virtual:string-shorthand-ts";
+          export const out = v;
+        `),
+      ).resolves.toMatchObject({ out: 42 });
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("imports callback rejects unresolved custom loader names", async () => {
     const dw = createTestWorker({
       permissions: { import: true },

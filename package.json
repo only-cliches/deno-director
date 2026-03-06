@@ -6,6 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "cargo-cp-artifact -nc index.node -- cargo build --message-format=json-render-diagnostics",
+    "install": "npm run build",
     "build-debug": "npm run build -- && tsc --project tsconfig.idx.json",
     "build-release": "npm run build -- --release && tsc --project tsconfig.idx.json",
     "size:ts-js": "node scripts/ts-compiled-js-size.mjs",

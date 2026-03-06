@@ -64,6 +64,7 @@ export type ImportsCallbackSource = {
 
 export type ImportsCallbackResult =
     | boolean
+    | string
     | ImportsCallbackSource
     | {
             /** Replacement specifier to resolve instead of the original. */
