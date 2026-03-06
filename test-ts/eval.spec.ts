@@ -144,7 +144,7 @@ describe("deno_worker: eval", () => {
     });
 
     await expect(
-      dw.eval("const n: number = 20; n + 22;", { srcLoader: "custom-ts" as any }),
+      dw.eval("const n: number = 20; n + 22;", { srcLoader: "custom-ts" }),
     ).resolves.toBe(42);
   });
 
