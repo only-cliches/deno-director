@@ -43,6 +43,7 @@ npm run bench
 - `--workers-list <a,b,c>` compare multiple worker counts (default `1,2,4`)
 - `--warmup <n>` warmup passes before timing (default `1`)
 - `--iterations <n>` measured passes per worker count (default `3`)
+- `--repeats <n>` repeat each scenario/worker benchmark and use median run (`1` disables repeat aggregation; default `1`)
 - `--scenarios <csv>` subset of scenario keys to run (default: all)
 
 ## Examples

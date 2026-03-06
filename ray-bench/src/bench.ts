@@ -4,6 +4,7 @@ import { Agent as HttpAgent, createServer, IncomingMessage, request as httpReque
 import { Worker as NodeWorker } from "node:worker_threads";
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
+import chalk from "chalk";
 import { DenoWorker } from "../../src/index";
 import { randomUUID } from "node:crypto";
 import { Duplex } from "node:stream";
@@ -29,6 +30,7 @@ type BenchConfig = {
   tileSize: number;
   warmup: number;
   iterations: number;
+  repeats: number;
   workersList: number[];
   scenarios: ScenarioKey[];
 };
@@ -70,6 +72,7 @@ type Row = {
   scenario: ScenarioMeta;
   workers: number;
   medianMs?: number;
+  reqPerSec?: number;
   mpixPerSec?: number;
   checksum?: number;
   status: "ok" | "skip" | "fail";
@@ -346,6 +349,7 @@ function parseArgs(): BenchConfig {
     tileSize: 0,
     warmup: 1,
     iterations: 3,
+    repeats: 1,
     workersList: [1, 2, 4],
     scenarios: [...scenarioOrder],
   };
@@ -359,6 +363,7 @@ function parseArgs(): BenchConfig {
     else if (a === "--tile-size") out.tileSize = Number(args[++i]);
     else if (a === "--warmup") out.warmup = Number(args[++i]);
     else if (a === "--iterations") out.iterations = Number(args[++i]);
+    else if (a === "--repeats") out.repeats = Number(args[++i]);
     else if (a === "--workers") out.workersList = [Number(args[++i])];
     else if (a === "--workers-list") {
       out.workersList = args[++i].split(",").map((v) => Number(v.trim())).filter((v) => Number.isFinite(v) && v > 0).map((v) => Math.trunc(v));
@@ -376,6 +381,8 @@ function parseArgs(): BenchConfig {
   out.tileSize = Math.trunc(out.tileSize);
   if (!Number.isFinite(out.warmup) || out.warmup < 0) throw new Error("Invalid --warmup");
   if (!Number.isFinite(out.iterations) || out.iterations <= 0) throw new Error("Invalid --iterations");
+  if (!Number.isFinite(out.repeats) || out.repeats <= 0) throw new Error("Invalid --repeats");
+  out.repeats = Math.trunc(out.repeats);
   out.workersList = Array.from(new Set(out.workersList.filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.trunc(n))));
   if (out.workersList.length === 0) throw new Error("No valid workers configured");
   if (out.scenarios.length === 0) throw new Error("No scenarios selected");
@@ -445,6 +452,22 @@ function aggregate(parts: TileResult[]): { checksum: number; pixels: number } {
   return { checksum, pixels };
 }
 
+function hashString32(input: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function shuffledScenariosForWorkers(selected: ScenarioMeta[], workers: number): ScenarioMeta[] {
+  return [...selected]
+    .map((scenario) => ({ scenario, score: (hashString32(scenario.key) ^ Math.imul(workers, 0x9e3779b1)) >>> 0 }))
+    .sort((a, b) => (a.score - b.score) || a.scenario.key.localeCompare(b.scenario.key))
+    .map((x) => x.scenario);
+}
+
 async function runMeasured(fn: () => Promise<{ checksum: number; pixels: number }>, warmup: number, iterations: number): Promise<IterationStats> {
   for (let i = 0; i < warmup; i += 1) await fn();
   const times: number[] = [];
@@ -464,7 +487,7 @@ async function runMeasured(fn: () => Promise<{ checksum: number; pixels: number 
 
 async function runNodeNodePostMessage(cfg: BenchConfig, workers: number): Promise<IterationStats> {
   const nodeWorkers = Array.from({ length: workers }, () => new NodeWorker(NODE_PM_WORKER_SCRIPT, { eval: true }));
-  const pending = new Map<number, { resolve: (x: TileResult) => void; reject: (e: unknown) => void }>();
+  const pending = new Map<number, { resolve: (x: TileResult) => void }>();
   let nextId = 1;
   for (const w of nodeWorkers) {
     w.on("message", (msg: any) => {
@@ -480,13 +503,10 @@ async function runNodeNodePostMessage(cfg: BenchConfig, workers: number): Promis
       const jobs = jobsFor(cfg, workers);
       const results = await Promise.all(
         jobs.map((job, i) =>
-          new Promise<TileResult>((resolve, reject) => {
+          new Promise<TileResult>((resolve) => {
             const id = nextId++;
-            pending.set(id, { resolve, reject });
+            pending.set(id, { resolve });
             nodeWorkers[i % workers].postMessage({ type: "render", id, payload: job });
-            setTimeout(() => {
-              if (pending.delete(id)) reject(new Error(`Node postMessage timeout (${id})`));
-            }, 30_000).unref();
           }),
         ),
       );
@@ -572,7 +592,7 @@ async function runNodeNodeHttp(cfg: BenchConfig, workers: number): Promise<Itera
 async function runNodeDenoPostMessage(cfg: BenchConfig, workers: number): Promise<IterationStats> {
   const denoWorkers = Array.from({ length: workers }, () => new DenoWorker({ console: false }));
   await Promise.all(denoWorkers.map((w) => w.eval(DENO_POSTMESSAGE_SCRIPT)));
-  const pending = new Map<number, { resolve: (x: TileResult) => void; reject: (e: unknown) => void }>();
+  const pending = new Map<number, { resolve: (x: TileResult) => void }>();
   let nextId = 1;
   for (const w of denoWorkers) {
     w.on("message", (msg: any) => {
@@ -588,13 +608,10 @@ async function runNodeDenoPostMessage(cfg: BenchConfig, workers: number): Promis
       const jobs = jobsFor(cfg, workers);
       const parts = await Promise.all(
         jobs.map((job, i) =>
-          new Promise<TileResult>((resolve, reject) => {
+          new Promise<TileResult>((resolve) => {
             const id = nextId++;
-            pending.set(id, { resolve, reject });
+            pending.set(id, { resolve });
             denoWorkers[i % workers].postMessage({ type: "render", id, payload: job });
-            setTimeout(() => {
-              if (pending.delete(id)) reject(new Error(`Deno postMessage timeout (${id})`));
-            }, 30_000).unref();
           }),
         ),
       );
@@ -740,9 +757,8 @@ function createLocalRaytraceTile(): (job: TileJob) => TileResult {
   return fn as (job: TileJob) => TileResult;
 }
 
-const localRaytraceTile = createLocalRaytraceTile();
-
 async function runNodeNodeFn(cfg: BenchConfig, workers: number): Promise<IterationStats> {
+  const localRaytraceTile = createLocalRaytraceTile();
   const runOne = async (): Promise<{ checksum: number; pixels: number }> => {
     const jobs = jobsFor(cfg, workers);
     const parts = jobs.map((job) => localRaytraceTile(job));
@@ -856,8 +872,27 @@ async function runExternalDenoScenario(cfg: BenchConfig, workers: number, scenar
   };
 }
 
+async function runWithRepeats(cfg: BenchConfig, runner: () => Promise<IterationStats>): Promise<IterationStats> {
+  if (cfg.repeats === 1) return await runner();
+  const all: IterationStats[] = [];
+  for (let i = 0; i < cfg.repeats; i += 1) {
+    all.push(await runner());
+  }
+  const base = all[0];
+  for (let i = 1; i < all.length; i += 1) {
+    if ((all[i].checksum >>> 0) !== (base.checksum >>> 0) || (all[i].pixels | 0) !== (base.pixels | 0)) {
+      throw new Error("Non-deterministic output across repeats");
+    }
+  }
+  const medianMs = median(all.map((x) => x.medianMs));
+  return { medianMs, pixels: base.pixels, checksum: base.checksum };
+}
+
 function printRows(title: string, rows: Row[], workersList: number[], scenarioOrderForTable: ScenarioMeta[]): void {
-  const headers = ["Scenario", ...workersList.map((w) => `Throughput (${w}w)`)];
+  const headers = [
+    "Scenario",
+    ...workersList.flatMap((w) => [`Req/s (${w}w)`, `Throughput (${w}w)`]),
+  ];
   const rowsByScenario = new Map<ScenarioKey, Map<number, Row>>();
   for (const row of rows) {
     let perWorker = rowsByScenario.get(row.scenario.key);
@@ -888,20 +923,57 @@ function printRows(title: string, rows: Row[], workersList: number[], scenarioOr
     return a.key.localeCompare(b.key);
   });
 
-  const body = sortedScenarios.map((scenario) => {
+  const bodyRaw = sortedScenarios.map((scenario) => {
     const perWorker = rowsByScenario.get(scenario.key);
-    const cells = workersList.map((workers) => {
+    const cells = workersList.flatMap((workers) => {
       const row = perWorker?.get(workers);
-      if (!row) return "-";
-      if (row.status === "skip") return "skip";
-      if (row.status === "fail") return "fail";
-      return row.mpixPerSec == null ? "-" : `${row.mpixPerSec.toFixed(2)} MPix/s`;
+      if (!row) return ["-", "-"];
+      if (row.status === "skip") return ["skip", "skip"];
+      if (row.status === "fail") return ["fail", "fail"];
+      return [
+        row.reqPerSec == null ? "-" : `${row.reqPerSec.toFixed(2)} req/s`,
+        row.mpixPerSec == null ? "-" : `${row.mpixPerSec.toFixed(2)} MPix/s`,
+      ];
     });
     return [scenario.key, ...cells];
   });
 
-  const widths = headers.map((h, i) => Math.max(h.length, ...body.map((r) => r[i].length)));
-  const join = (cells: string[]) => `| ${cells.map((c, i) => c.padEnd(widths[i])).join(" | ")} |`;
+  const parseLeadingNumber = (cell: string): number | null => {
+    const m = cell.match(/^([0-9]+(?:\.[0-9]+)?)/);
+    return m ? Number(m[1]) : null;
+  };
+  const stripAnsi = (s: string): string => s.replace(/\x1B\[[0-9;]*m/g, "");
+  const visibleLen = (s: string): number => stripAnsi(s).length;
+  const padVisible = (s: string, width: number): string => s + " ".repeat(Math.max(0, width - visibleLen(s)));
+
+  const mins: Array<number | null> = headers.map(() => null);
+  const maxs: Array<number | null> = headers.map(() => null);
+  const highlightExcludedScenarios = new Set<ScenarioKey>(["node-node-fn"]);
+  for (let col = 1; col < headers.length; col += 1) {
+    const nums = bodyRaw
+      .filter((row) => !highlightExcludedScenarios.has(row[0] as ScenarioKey))
+      .map((row) => parseLeadingNumber(row[col]))
+      .filter((n): n is number => n != null);
+    if (nums.length > 0) {
+      mins[col] = Math.min(...nums);
+      maxs[col] = Math.max(...nums);
+    }
+  }
+
+  const body = bodyRaw.map((row) => {
+    if (highlightExcludedScenarios.has(row[0] as ScenarioKey)) return [...row];
+    const out = [...row];
+    for (let col = 1; col < out.length; col += 1) {
+      const val = parseLeadingNumber(out[col]);
+      if (val == null || mins[col] == null || maxs[col] == null) continue;
+      if (val === maxs[col]) out[col] = chalk.bgGreen.black(out[col]);
+      else if (val === mins[col]) out[col] = chalk.bgRed.white(out[col]);
+    }
+    return out;
+  });
+
+  const widths = headers.map((h, i) => Math.max(visibleLen(h), ...body.map((r) => visibleLen(r[i]))));
+  const join = (cells: string[]) => `| ${cells.map((c, i) => padVisible(c, widths[i])).join(" | ")} |`;
   const sep = `+-${widths.map((w) => "-".repeat(w)).join("-+-")}-+`;
 
   console.log(`\n${title}`);
@@ -927,40 +999,52 @@ async function main(): Promise<void> {
 
   console.log("# Ray Bench");
   console.log(
-    `config: width=${cfg.width} height=${cfg.height} samples=${cfg.samples} maxDepth=${cfg.maxDepth} tileSize=${cfg.tileSize === 0 ? "auto" : cfg.tileSize} warmup=${cfg.warmup} iterations=${cfg.iterations} workers=${cfg.workersList.join(",")} scenarios=${cfg.scenarios.join(",")}`,
+    `config: width=${cfg.width} height=${cfg.height} samples=${cfg.samples} maxDepth=${cfg.maxDepth} tileSize=${cfg.tileSize === 0 ? "auto" : cfg.tileSize} warmup=${cfg.warmup} iterations=${cfg.iterations} repeats=${cfg.repeats} workers=${cfg.workersList.join(",")} scenarios=${cfg.scenarios.join(",")}`,
   );
   if (!hasBun) console.log("runtime: bun not found in PATH (bun+bun-* scenarios skipped)");
   if (!hasDeno) console.log("runtime: deno not found in PATH (deno+deno-* scenarios skipped)");
 
   const selected = scenarioCatalog.filter((s) => cfg.scenarios.includes(s.key));
   const rows: Row[] = [];
+  let nodeFnBaseline: IterationStats | null = null;
 
   for (const workers of cfg.workersList) {
-    for (const scenario of selected) {
+    const executionOrder = shuffledScenariosForWorkers(selected, workers);
+    for (const scenario of executionOrder) {
       try {
         console.log(`running: ${scenario.key} workers=${workers}`);
         let out: IterationStats;
 
         if (scenario.main === "Node") {
           const runner = nodeScenarioRunners[scenario.key];
-          out = await runner(cfg, workers);
+          if (scenario.key === "node-node-fn") {
+            if (nodeFnBaseline == null) {
+              nodeFnBaseline = await runWithRepeats(cfg, () => runner(cfg, 1));
+            }
+            out = nodeFnBaseline;
+          } else {
+            out = await runWithRepeats(cfg, () => runner(cfg, workers));
+          }
         } else if (scenario.main === "Bun") {
           if (!hasBun) {
             rows.push({ scenario, workers, status: "skip", detail: "bun missing" });
             continue;
           }
-          out = await runExternalBunScenario(cfg, workers, scenario.key);
+          out = await runWithRepeats(cfg, () => runExternalBunScenario(cfg, workers, scenario.key));
         } else {
           if (!hasDeno) {
             rows.push({ scenario, workers, status: "skip", detail: "deno missing" });
             continue;
           }
-          out = await runExternalDenoScenario(cfg, workers, scenario.key);
+          out = await runWithRepeats(cfg, () => runExternalDenoScenario(cfg, workers, scenario.key));
         }
 
+        const reqPerSec = 1000 / out.medianMs;
         const mpixPerSec = (out.pixels / 1_000_000) / (out.medianMs / 1000);
-        console.log(`done: ${scenario.key} workers=${workers} throughput=${mpixPerSec.toFixed(2)} MPix/s`);
-        rows.push({ scenario, workers, medianMs: out.medianMs, mpixPerSec, checksum: out.checksum, status: "ok" });
+        console.log(
+          `done: ${scenario.key} workers=${workers} req/s=${reqPerSec.toFixed(2)} throughput=${mpixPerSec.toFixed(2)} MPix/s`,
+        );
+        rows.push({ scenario, workers, medianMs: out.medianMs, reqPerSec, mpixPerSec, checksum: out.checksum, status: "ok" });
       } catch (e: any) {
         rows.push({ scenario, workers, status: "fail", detail: String(e?.message || e) });
       }
