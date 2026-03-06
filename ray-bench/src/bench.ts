@@ -26,6 +26,7 @@ type BenchConfig = {
   height: number;
   samples: number;
   maxDepth: number;
+  tileSize: number;
   warmup: number;
   iterations: number;
   workersList: number[];
@@ -342,6 +343,7 @@ function parseArgs(): BenchConfig {
     height: 360,
     samples: 8,
     maxDepth: 6,
+    tileSize: 0,
     warmup: 1,
     iterations: 3,
     workersList: [1, 2, 4],
@@ -354,6 +356,7 @@ function parseArgs(): BenchConfig {
     else if (a === "--height") out.height = Number(args[++i]);
     else if (a === "--samples") out.samples = Number(args[++i]);
     else if (a === "--max-depth") out.maxDepth = Number(args[++i]);
+    else if (a === "--tile-size") out.tileSize = Number(args[++i]);
     else if (a === "--warmup") out.warmup = Number(args[++i]);
     else if (a === "--iterations") out.iterations = Number(args[++i]);
     else if (a === "--workers") out.workersList = [Number(args[++i])];
@@ -369,6 +372,8 @@ function parseArgs(): BenchConfig {
   if (!Number.isFinite(out.height) || out.height <= 0) throw new Error("Invalid --height");
   if (!Number.isFinite(out.samples) || out.samples <= 0) throw new Error("Invalid --samples");
   if (!Number.isFinite(out.maxDepth) || out.maxDepth <= 0) throw new Error("Invalid --max-depth");
+  if (!Number.isFinite(out.tileSize) || out.tileSize < 0) throw new Error("Invalid --tile-size");
+  out.tileSize = Math.trunc(out.tileSize);
   if (!Number.isFinite(out.warmup) || out.warmup < 0) throw new Error("Invalid --warmup");
   if (!Number.isFinite(out.iterations) || out.iterations <= 0) throw new Error("Invalid --iterations");
   out.workersList = Array.from(new Set(out.workersList.filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.trunc(n))));
@@ -401,8 +406,16 @@ function splitRows(height: number, workers: number): Array<{ yStart: number; yEn
   return out;
 }
 
+function splitRowsByTile(height: number, tileSize: number): Array<{ yStart: number; yEnd: number }> {
+  const out: Array<{ yStart: number; yEnd: number }> = [];
+  for (let yStart = 0; yStart < height; yStart += tileSize) {
+    out.push({ yStart, yEnd: Math.min(height, yStart + tileSize) });
+  }
+  return out;
+}
+
 function jobsFor(cfg: BenchConfig, workers: number): TileJob[] {
-  const slices = splitRows(cfg.height, workers);
+  const slices = cfg.tileSize > 0 ? splitRowsByTile(cfg.height, cfg.tileSize) : splitRows(cfg.height, workers);
   const globalSeed = (0x9e3779b1 ^ (cfg.width * 17) ^ (cfg.height * 131) ^ (cfg.samples * 8191) ^ (cfg.maxDepth * 65537)) >>> 0;
   return slices.map((s, i) => ({
     id: i + 1,
@@ -793,6 +806,8 @@ async function runExternalBunScenario(cfg: BenchConfig, workers: number, scenari
     String(cfg.samples),
     "--max-depth",
     String(cfg.maxDepth),
+    "--tile-size",
+    String(cfg.tileSize),
     "--workers",
     String(workers),
     "--warmup",
@@ -824,6 +839,8 @@ async function runExternalDenoScenario(cfg: BenchConfig, workers: number, scenar
     String(cfg.samples),
     "--max-depth",
     String(cfg.maxDepth),
+    "--tile-size",
+    String(cfg.tileSize),
     "--workers",
     String(workers),
     "--warmup",
@@ -851,7 +868,27 @@ function printRows(title: string, rows: Row[], workersList: number[], scenarioOr
     perWorker.set(row.workers, row);
   }
 
-  const body = scenarioOrderForTable.map((scenario) => {
+  const bestMedianMs = (scenario: ScenarioMeta): number => {
+    const perWorker = rowsByScenario.get(scenario.key);
+    if (!perWorker) return Number.POSITIVE_INFINITY;
+    let best = Number.POSITIVE_INFINITY;
+    for (const workers of workersList) {
+      const row = perWorker.get(workers);
+      if (row?.status === "ok" && row.medianMs != null && Number.isFinite(row.medianMs)) {
+        best = Math.min(best, row.medianMs);
+      }
+    }
+    return best;
+  };
+
+  const sortedScenarios = [...scenarioOrderForTable].sort((a, b) => {
+    const aBest = bestMedianMs(a);
+    const bBest = bestMedianMs(b);
+    if (aBest !== bBest) return aBest - bBest;
+    return a.key.localeCompare(b.key);
+  });
+
+  const body = sortedScenarios.map((scenario) => {
     const perWorker = rowsByScenario.get(scenario.key);
     const cells = workersList.map((workers) => {
       const row = perWorker?.get(workers);
@@ -890,7 +927,7 @@ async function main(): Promise<void> {
 
   console.log("# Ray Bench");
   console.log(
-    `config: width=${cfg.width} height=${cfg.height} samples=${cfg.samples} maxDepth=${cfg.maxDepth} warmup=${cfg.warmup} iterations=${cfg.iterations} workers=${cfg.workersList.join(",")} scenarios=${cfg.scenarios.join(",")}`,
+    `config: width=${cfg.width} height=${cfg.height} samples=${cfg.samples} maxDepth=${cfg.maxDepth} tileSize=${cfg.tileSize === 0 ? "auto" : cfg.tileSize} warmup=${cfg.warmup} iterations=${cfg.iterations} workers=${cfg.workersList.join(",")} scenarios=${cfg.scenarios.join(",")}`,
   );
   if (!hasBun) console.log("runtime: bun not found in PATH (bun+bun-* scenarios skipped)");
   if (!hasDeno) console.log("runtime: deno not found in PATH (deno+deno-* scenarios skipped)");
@@ -922,7 +959,7 @@ async function main(): Promise<void> {
         }
 
         const mpixPerSec = (out.pixels / 1_000_000) / (out.medianMs / 1000);
-        console.log(`done: ${scenario.key} workers=${workers} \nThroughput=${mpixPerSec.toFixed(2)} MPix/s`);
+        console.log(`done: ${scenario.key} workers=${workers} throughput=${mpixPerSec.toFixed(2)} MPix/s`);
         rows.push({ scenario, workers, medianMs: out.medianMs, mpixPerSec, checksum: out.checksum, status: "ok" });
       } catch (e: any) {
         rows.push({ scenario, workers, status: "fail", detail: String(e?.message || e) });

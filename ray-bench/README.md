@@ -38,6 +38,7 @@ npm run bench
 - `--height <n>` image height (default `360`)
 - `--samples <n>` samples per pixel (default `8`)
 - `--max-depth <n>` ray bounce depth (default `6`)
+- `--tile-size <n>` tile height in rows per render job (`0` keeps auto split by worker count; default `0`)
 - `--workers <n>` run one worker-count value
 - `--workers-list <a,b,c>` compare multiple worker counts (default `1,2,4`)
 - `--warmup <n>` warmup passes before timing (default `1`)

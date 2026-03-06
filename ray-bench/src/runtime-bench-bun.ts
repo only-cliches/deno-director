@@ -6,6 +6,7 @@ type Config = {
   height: number;
   samples: number;
   maxDepth: number;
+  tileSize: number;
   warmup: number;
   iterations: number;
   workers: number;
@@ -100,6 +101,7 @@ function parseArgs(): Config {
     height: 360,
     samples: 8,
     maxDepth: 6,
+    tileSize: 0,
     warmup: 1,
     iterations: 3,
     workers: 1,
@@ -112,11 +114,14 @@ function parseArgs(): Config {
     else if (a === "--height") out.height = Number(args[++i]);
     else if (a === "--samples") out.samples = Number(args[++i]);
     else if (a === "--max-depth") out.maxDepth = Number(args[++i]);
+    else if (a === "--tile-size") out.tileSize = Number(args[++i]);
     else if (a === "--workers") out.workers = Number(args[++i]);
     else if (a === "--warmup") out.warmup = Number(args[++i]);
     else if (a === "--iterations") out.iterations = Number(args[++i]);
     else if (a === "--json") out.json = true;
   }
+  if (!Number.isFinite(out.tileSize) || out.tileSize < 0) throw new Error("Invalid --tile-size");
+  out.tileSize = Math.trunc(out.tileSize);
   return out;
 }
 
@@ -135,8 +140,16 @@ function splitRows(height: number, workers: number): Array<{ yStart: number; yEn
   return out;
 }
 
+function splitRowsByTile(height: number, tileSize: number): Array<{ yStart: number; yEnd: number }> {
+  const out: Array<{ yStart: number; yEnd: number }> = [];
+  for (let yStart = 0; yStart < height; yStart += tileSize) {
+    out.push({ yStart, yEnd: Math.min(height, yStart + tileSize) });
+  }
+  return out;
+}
+
 function jobsFor(cfg: Config): TileJob[] {
-  const rows = splitRows(cfg.height, cfg.workers);
+  const rows = cfg.tileSize > 0 ? splitRowsByTile(cfg.height, cfg.tileSize) : splitRows(cfg.height, cfg.workers);
   const seed = (0x9e3779b1 ^ (cfg.width * 17) ^ (cfg.height * 131) ^ (cfg.samples * 8191) ^ (cfg.maxDepth * 65537)) >>> 0;
   return rows.map((r, i) => ({
     id: i + 1,
