@@ -19,6 +19,8 @@ export type DenoWorkerRuntimeEventKind =
     | "import.resolved"
     | "eval.begin"
     | "eval.end"
+    | "module.eval.begin"
+    | "module.eval.end"
     | "evalSync.begin"
     | "evalSync.end"
     | "error.thrown"

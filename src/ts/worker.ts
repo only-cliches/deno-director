@@ -3652,15 +3652,30 @@ export class DenoWorker {
         options?: DenoWorkerModuleEvalOptions,
     ): Promise<T> {
         await this.startupPromise;
+        const opId = `module.eval:${randomUUID()}`;
         const transformed = await this.applyLoadersAsync({
             kind: "module-eval",
             src: String(source),
             srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
         });
         const moduleName = typeof options?.moduleName === "string" ? options.moduleName.trim() : "";
+        this.emitRuntimeEvent({
+            kind: "module.eval.begin",
+            opId,
+            moduleName: moduleName || undefined,
+        });
         if (moduleName) {
             await this.registerModuleInternal(moduleName, transformed.src, { srcLoader: transformed.srcLoader });
-            return this.moduleApiImport<T>(moduleName);
+            try {
+                const imported = await this.moduleApiImport<T>(moduleName);
+                this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
+                return imported;
+            } catch (e) {
+                const hydrated = hydrateFromWire(e);
+                this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: false });
+                this.emitThrownError(opId, "module.eval", hydrated);
+                throw hydrated;
+            }
         }
 
         let raw: any;
@@ -3702,9 +3717,14 @@ export class DenoWorker {
                 this.recordLastExecutionSample();
                 this.recordOpSample("eval", Date.now() - nativeStartedAt, false);
             }
-            throw hydrateFromWire(e);
+            const hydrated = hydrateFromWire(e);
+            this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: false });
+            this.emitThrownError(opId, "module.eval", hydrated);
+            throw hydrated;
         }
-        return wrapModuleNamespace<T>(this, hydrateFromWire(raw));
+        const wrapped = wrapModuleNamespace<T>(this, hydrateFromWire(raw));
+        this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
+        return wrapped;
     }
 
     /** Module API entrypoint: register module source under a stable module name. */

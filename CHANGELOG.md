@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
   - automatic `.env` discovery no longer traverses parent directories outside the configured worker cwd
 - Fixed package install flow for consumers by compiling the platform-specific native addon during install:
   - added package lifecycle `install` hook that runs the native build step and emits local `index.node`.
+- Fixed runtime observability gap for module evaluation failures:
+  - `worker.module.eval(...)` now emits `error.thrown` runtime events with `surface: "module.eval"`.
 
 ### Changed
 - Updated docs to reflect sandbox-bounded `envFile: true` behavior (cwd-local discovery).
@@ -21,12 +23,15 @@ All notable changes to this project will be documented in this file.
 - Improved internal virtual module URL readability for named registry entries:
   - canonical specifiers now include a sanitized module-name label and stable fingerprint suffix
   - runtime `import.*` events and stack traces now surface user-relevant module context more clearly.
+- Added runtime event lifecycle for module evaluation:
+  - emits `module.eval.begin` and `module.eval.end` on `on("runtime")` subscribers.
 
 ### Tests
 - Added IPv6 permission matching regression coverage in Rust module-loader tests.
 - Added `envFile: true` sandbox-boundary regression coverage in Jest inspect/env tests.
 - Added Jest coverage for `imports` callback string-shorthand returns with loader-transform parity.
 - Added Rust unit coverage for readable named virtual specifier formatting.
+- Added Jest coverage for `module.eval` runtime event/error telemetry.
 
 ## [0.9.6] Mar 6, 2026
 
