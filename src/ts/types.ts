@@ -272,7 +272,7 @@ export type DenoWorkerModuleLoaderOption =
             httpResolve?: boolean;
             /** Enable Node-style disk/module resolution behavior. */
             nodeResolve?: boolean;
-            /** Enable CommonJS interop (`true` for built-in rewrite, `"esbuild"` for esbuild mode). */
+            /** Enable CommonJS interop (`true` uses cjs2esm-first interop; `"esbuild"` is a legacy alias). */
             cjsInterop?: boolean | "esbuild";
             /** Enable `jsr:` / `@std/*` resolution through jsr.io HTTPS URLs. */
             jsrResolve?: boolean;

@@ -88,7 +88,6 @@ pub enum CjsInteropMode {
     #[default]
     Disabled,
     Builtin,
-    Esbuild,
 }
 
 #[derive(Debug, Clone)]
@@ -805,8 +804,9 @@ impl WorkerCreateOptions {
                             CjsInteropMode::Disabled
                         };
                     } else if let Ok(cs) = cv.downcast::<JsString, _>(cx) {
+                        // Backward-compat alias: route legacy "esbuild" to builtin cjs2esm path.
                         if cs.value(cx).trim().eq_ignore_ascii_case("esbuild") {
-                            cfg.cjs_interop = CjsInteropMode::Esbuild;
+                            cfg.cjs_interop = CjsInteropMode::Builtin;
                         }
                     }
                 }

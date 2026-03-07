@@ -1839,9 +1839,6 @@ const c = require("cjs2esm");
                     _ => Self::transpile_cjs_to_esm(source).unwrap_or_else(|| source.to_string()),
                 }
             }
-            crate::worker::state::CjsInteropMode::Esbuild => {
-                Self::transpile_cjs_to_esm(source).unwrap_or_else(|| source.to_string())
-            }
         }
     }
 
@@ -2951,8 +2948,8 @@ mod tests {
     }
 
     #[test]
-    // CJS interop wrapper avoids redeclaring local identifiers when exporting names.
-    fn cjs_interop_wrapper_uses_alias_exports_for_ts_emitted_cjs() {
+    // CJS interop emits alias exports for TS-emitted CJS reassignment patterns.
+    fn cjs_interop_emits_alias_exports_for_ts_emitted_cjs() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         let source = r#""use strict";
 Object.defineProperty(exports, "__esModule", { value: true });

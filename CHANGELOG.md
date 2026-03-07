@@ -13,7 +13,6 @@ All notable changes to this project will be documented in this file.
   - `moduleLoader.nodeResolve` now resolves directory imports via nested `package.json` (`module`/`main`) and `index.*` fallback.
 - Fixed CommonJS package interop gap for ESM named imports under Node-style resolution:
   - added opt-in `moduleLoader.cjsInterop` to rewrite common transpiled CJS patterns into ESM exports at load time.
-  - `cjsInterop` now accepts `true` or `"esbuild"` mode values.
 
 ### Changed
 - Expanded `imports` callback return contract:
