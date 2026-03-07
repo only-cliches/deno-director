@@ -1435,6 +1435,47 @@ impl DynamicModuleLoader {
         Some((binding.to_string(), spec))
     }
 
+    // Parses `var|const|let X = helper(require("spec"));` into `(X, helper, spec)`.
+    fn parse_wrapped_require_binding(line: &str) -> Option<(String, String, String)> {
+        let trimmed = line.trim().trim_end_matches(';').trim();
+        let rest = trimmed
+            .strip_prefix("var ")
+            .or_else(|| trimmed.strip_prefix("const "))
+            .or_else(|| trimmed.strip_prefix("let "))?;
+        let (lhs, rhs) = rest.split_once('=')?;
+        let binding = lhs.trim();
+        if !Self::is_js_identifier(binding) {
+            return None;
+        }
+
+        let rhs = rhs.trim();
+        let open = rhs.find('(')?;
+        let close = rhs.rfind(')')?;
+        if close <= open {
+            return None;
+        }
+        let helper = rhs[..open].trim();
+        if !Self::is_js_identifier(helper) {
+            return None;
+        }
+        let inner = rhs[open + 1..close].trim();
+        if !inner.starts_with("require(") || !inner.ends_with(')') {
+            return None;
+        }
+        let req_inner = &inner["require(".len()..inner.len() - 1].trim();
+        let quote = if req_inner.starts_with('"') {
+            '"'
+        } else if req_inner.starts_with('\'') {
+            '\''
+        } else {
+            return None;
+        };
+        let tail = req_inner.get(1..)?;
+        let end = tail.find(quote)?;
+        let spec = tail[..end].to_string();
+        Some((binding.to_string(), helper.to_string(), spec))
+    }
+
     // Parses `__exportStar(require("spec"), exports);` into `spec`.
     fn parse_export_star(line: &str) -> Option<String> {
         let trimmed = line.trim().trim_end_matches(';').trim();
@@ -1453,6 +1494,26 @@ impl DynamicModuleLoader {
             return None;
         }
         Some(spec)
+    }
+
+    // Maps Node core module names to `node:` specifiers for ESM import compatibility.
+    fn normalize_cjs_require_specifier(spec: &str) -> String {
+        if spec.starts_with("node:") {
+            return spec.to_string();
+        }
+        // Keep list explicit to avoid rewriting arbitrary bare package names.
+        const CORE: &[&str] = &[
+            "assert", "buffer", "child_process", "cluster", "console", "constants", "crypto",
+            "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http", "http2",
+            "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process",
+            "punycode", "querystring", "readline", "repl", "stream", "string_decoder",
+            "sys", "timers", "tls", "tty", "url", "util", "v8", "vm", "worker_threads",
+            "zlib",
+        ];
+        if CORE.iter().any(|m| *m == spec) {
+            return format!("node:{spec}");
+        }
+        spec.to_string()
     }
 
     // Parses `Object.defineProperty(exports, "Name", { ..., get: function () { return ref; } });`.
@@ -1547,8 +1608,17 @@ impl DynamicModuleLoader {
                 continue;
             }
 
+            if let Some((binding, helper, spec)) = Self::parse_wrapped_require_binding(line) {
+                let spec_json = serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
+                let tmp = format!("__dd_req_{binding}");
+                imports.push(format!("import * as {tmp} from {spec_json};"));
+                body.push(format!("const {binding} = {helper}({tmp});"));
+                changed = true;
+                continue;
+            }
+
             if let Some((binding, spec)) = Self::parse_require_binding(line) {
-                let spec_json = serde_json::to_string(&spec).ok()?;
+                let spec_json = serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
                 imports.push(format!("import * as {binding} from {spec_json};"));
                 changed = true;
                 continue;

@@ -470,4 +470,41 @@ function getAvailableAdapters() {
       if (!dw.isClosed()) await dw.close();
     }
   });
+
+  test("nodeResolve: cjsInterop handles __importDefault(require(...)) top-level bindings", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeCompat: true,
+      moduleLoader: { nodeResolve: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjswrap", "package.json"),
+        JSON.stringify({ name: "cjswrap", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjswrap", "index.js"),
+        `"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+  return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.base = void 0;
+const path_1 = __importDefault(require("path"));
+exports.base = path_1.default.basename("/tmp/hello.txt");
+`
+      );
+
+      const code = `
+        import { base } from "cjswrap";
+        export const out = base;
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "hello.txt" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
 });
