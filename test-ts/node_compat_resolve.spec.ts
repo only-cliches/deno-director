@@ -423,4 +423,51 @@ exports.Provider = Provider;
       if (!dw.isClosed()) await dw.close();
     }
   });
+
+  test("nodeResolve: cjsInterop handles multiline object-literal exports", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeCompat: true,
+      moduleLoader: { nodeResolve: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsobj", "package.json"),
+        JSON.stringify({ name: "cjsobj", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsobj", "index.js"),
+        `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.adapterFunctions = exports.adapterClasses = void 0;
+exports.getAvailableAdapters = getAvailableAdapters;
+exports.adapterClasses = {
+  s3: ["AdapterS3", "mod-s3"],
+  aws: ["AdapterAws", "mod-aws"],
+};
+exports.adapterFunctions = {
+  b2f: ["AdapterB2F", "mod-b2f"],
+};
+function getAvailableAdapters() {
+  return Object.keys(exports.adapterClasses);
+}
+`
+      );
+
+      const code = `
+        import { adapterClasses, adapterFunctions, getAvailableAdapters } from "cjsobj";
+        export const out = [
+          adapterClasses.s3[0],
+          adapterFunctions.b2f[0],
+          getAvailableAdapters().includes("s3")
+        ];
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: ["AdapterS3", "AdapterB2F", true] });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
 });

@@ -1499,6 +1499,21 @@ impl DynamicModuleLoader {
         Some((name.to_string(), expr.to_string()))
     }
 
+    // Parses `exports.Name = {` header for multi-line object-literal exports.
+    fn parse_exports_object_assignment_start(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("exports.")?;
+        let (name, rhs) = rest.split_once('=')?;
+        let name = name.trim();
+        if !Self::is_js_identifier(name) {
+            return None;
+        }
+        if rhs.trim() != "{" {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
     // Best-effort CJS -> ESM rewrite for common transpiled CJS patterns.
     fn transpile_cjs_to_esm(source: &str) -> Option<String> {
         let mut changed = false;
@@ -1539,11 +1554,20 @@ impl DynamicModuleLoader {
                 continue;
             }
 
+            if let Some(name) = Self::parse_exports_object_assignment_start(line) {
+                body.push(format!("export const {name} = exports.{name} = {{"));
+                seen_exports.insert(name);
+                changed = true;
+                continue;
+            }
+
             if let Some((name, expr)) = Self::parse_define_property_export(line) {
                 if seen_exports.insert(name.clone()) {
                     let alias = format!("__dd_export_{export_counter}");
                     export_counter += 1;
-                    exports.push(format!("const {alias} = {expr}; export {{ {alias} as {name} }};"));
+                    exports.push(format!(
+                        "const {alias} = exports.{name} = {expr}; export {{ {alias} as {name} }};"
+                    ));
                 }
                 changed = true;
                 continue;
@@ -1553,7 +1577,9 @@ impl DynamicModuleLoader {
                 if seen_exports.insert(name.clone()) {
                     let alias = format!("__dd_export_{export_counter}");
                     export_counter += 1;
-                    exports.push(format!("const {alias} = {expr}; export {{ {alias} as {name} }};"));
+                    exports.push(format!(
+                        "const {alias} = exports.{name} = {expr}; export {{ {alias} as {name} }};"
+                    ));
                 }
                 changed = true;
                 continue;
@@ -1567,6 +1593,7 @@ impl DynamicModuleLoader {
         }
 
         let mut out = String::new();
+        out.push_str("const exports = Object.create(null);\n");
         for line in imports {
             out.push_str(&line);
             out.push('\n');
