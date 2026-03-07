@@ -94,4 +94,15 @@ describe("DenoWorker runtime events", () => {
       await dw.close();
     }
   });
+
+  test("module.import surfaces code context for registry module syntax errors", async () => {
+    const dw = createTestWorker();
+
+    try {
+      await dw.module.register("named:broken", "export const bad = ;");
+      await expect(dw.module.import("named:broken")).rejects.toThrow(/Code context \(/);
+    } finally {
+      await dw.close();
+    }
+  });
 });

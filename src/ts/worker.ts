@@ -1399,16 +1399,16 @@ export class DenoWorker {
 
     /** Resolves source text for an error specifier from hints, registry maps, or file:// disk reads. */
     private sourceForErrorSpecifier(specifier: string, sourceHint?: string): string | null {
-        if (typeof sourceHint === "string" && sourceHint.length > 0) return sourceHint;
         const fromVirtual = this.moduleSourceByVirtualSpecifier.get(specifier);
         if (typeof fromVirtual === "string" && fromVirtual.length > 0) return fromVirtual;
         if (specifier.startsWith("file://")) {
             try {
                 return readFileSync(fileURLToPath(specifier), "utf8");
             } catch {
-                return null;
+                // fall through to source hint
             }
         }
+        if (typeof sourceHint === "string" && sourceHint.length > 0) return sourceHint;
         return null;
     }
 
@@ -3869,9 +3869,12 @@ export class DenoWorker {
         }
 
         const source = buildImportModuleSource(spec);
-
-        const raw = await this.eval(source);
-        return wrapModuleNamespace<T>(this, raw);
+        try {
+            const raw = await this.eval(source);
+            return wrapModuleNamespace<T>(this, raw);
+        } catch (e) {
+            throw this.enrichErrorWithCodeContext(e, source);
+        }
     }
 
     private isWasmSpecifier(specifier: string): boolean {
