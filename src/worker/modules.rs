@@ -1635,9 +1635,17 @@ impl DynamicModuleLoader {
         let mut seen_exports: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         let mut export_counter = 0usize;
+        let mut skipping_es_module_define = false;
 
         for raw_line in source.lines() {
             let line = raw_line.trim();
+            if skipping_es_module_define {
+                changed = true;
+                if line.contains(");") {
+                    skipping_es_module_define = false;
+                }
+                continue;
+            }
             if line == "\"use strict\";" || line == "'use strict';" {
                 changed = true;
                 continue;
@@ -1646,6 +1654,9 @@ impl DynamicModuleLoader {
                 || line.starts_with("Object.defineProperty(exports, '__esModule'")
             {
                 changed = true;
+                if !line.contains(");") {
+                    skipping_es_module_define = true;
+                }
                 continue;
             }
             if line.contains("exports.") && line.contains("void 0") {
@@ -2960,5 +2971,23 @@ exports.Provider = Provider;
         let out = loader.convert_cjs_to_esm(source, crate::worker::state::CjsInteropMode::Builtin);
         assert!(out.contains("export { __dd_export_0 as Provider };"));
         assert!(!out.contains("export const Provider ="));
+    }
+
+    #[test]
+    // CJS interop drops multiline __esModule defineProperty blocks to avoid dangling parse tokens.
+    fn cjs_interop_drops_multiline_esmodule_marker_block() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        let source = r#""use strict";
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+exports.generate = generate;
+function generate() { return 1; }
+"#;
+        let out = loader.convert_cjs_to_esm(source, crate::worker::state::CjsInteropMode::Builtin);
+        assert!(!out.contains("value: true"));
+        assert!(!out.contains("Object.defineProperty(exports, \"__esModule\""));
+        assert!(out.contains("export { __dd_export_0 as generate };"));
     }
 }
