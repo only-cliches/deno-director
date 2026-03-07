@@ -742,6 +742,7 @@ export class DenoWorker {
     private readonly lifecycleHandlers = new Set<DenoWorkerLifecycleHandler>();
     private readonly runtimeHandlers = new Set<DenoWorkerRuntimeHandler>();
     private readonly moduleSourceByName = new Map<string, string>();
+    private readonly moduleSourceByLabel = new Map<string, string>();
     private readonly moduleSourceByVirtualSpecifier = new Map<string, string>();
     private readonly inFlightRejectors = new Set<(reason: unknown) => void>();
     private nativeEpoch = 0;
@@ -1225,6 +1226,7 @@ export class DenoWorker {
         }
         const normalizedSource = String(source ?? "");
         this.moduleSourceByName.set(name, normalizedSource);
+        this.moduleSourceByLabel.set(this.moduleNameLabel(name), normalizedSource);
         await this.trackInFlight(this.native.registerModule(name, normalizedSource, options));
     }
 
@@ -1237,6 +1239,9 @@ export class DenoWorker {
         }
         const priorSource = this.moduleSourceByName.get(name);
         this.moduleSourceByName.delete(name);
+        const label = this.moduleNameLabel(name);
+        const labelSource = this.moduleSourceByLabel.get(label);
+        if (labelSource && labelSource === priorSource) this.moduleSourceByLabel.delete(label);
         if (typeof priorSource === "string") {
             for (const [specifier, source] of [...this.moduleSourceByVirtualSpecifier.entries()]) {
                 if (source === priorSource) this.moduleSourceByVirtualSpecifier.delete(specifier);
@@ -1364,7 +1369,44 @@ export class DenoWorker {
         const specifier = typeof (event as any).specifier === "string" ? String((event as any).specifier) : "";
         if (!resolvedSpecifier) return;
         const fromName = this.moduleSourceByName.get(specifier);
-        if (typeof fromName === "string") this.moduleSourceByVirtualSpecifier.set(resolvedSpecifier, fromName);
+        if (typeof fromName === "string") {
+            this.moduleSourceByVirtualSpecifier.set(resolvedSpecifier, fromName);
+            return;
+        }
+        const label = this.namedVirtualLabel(resolvedSpecifier);
+        if (!label) return;
+        const fromLabel = this.moduleSourceByLabel.get(label);
+        if (typeof fromLabel === "string") this.moduleSourceByVirtualSpecifier.set(resolvedSpecifier, fromLabel);
+    }
+
+    /** Canonical label format used by Rust named virtual specifiers. */
+    private moduleNameLabel(moduleName: string): string {
+        let out = "";
+        let lastWasDash = false;
+        for (const ch of String(moduleName ?? "")) {
+            if (/[A-Za-z0-9]/.test(ch)) {
+                out += ch.toLowerCase();
+                lastWasDash = false;
+                continue;
+            }
+            if (ch === "-" || ch === "_" || ch === ".") {
+                out += ch;
+                lastWasDash = false;
+                continue;
+            }
+            if (!lastWasDash) {
+                out += "-";
+                lastWasDash = true;
+            }
+        }
+        out = out.replace(/^-+|-+$/g, "").slice(0, 64);
+        return out || "unnamed";
+    }
+
+    /** Extracts `<label>` from `denojs-worker://virtual/__named_<label>_<fingerprint>.js`. */
+    private namedVirtualLabel(specifier: string): string | null {
+        const m = String(specifier).match(/^denojs-worker:\/\/virtual\/__named_(.+)_[0-9a-f]{16}\.js$/i);
+        return m?.[1] || null;
     }
 
     /** Parses first `url:line:column` frame from an Error-like value. */
