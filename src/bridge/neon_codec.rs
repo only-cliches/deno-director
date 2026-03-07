@@ -1,9 +1,9 @@
 // src/bridge/neon_codec.rs
+use bytes::Bytes;
 use neon::prelude::*;
 use neon::result::Throw;
 use neon::types::JsDate;
 use std::cell::RefCell;
-use bytes::Bytes;
 
 use super::types::JsValueBridge;
 use crate::bridge::tags::{
@@ -857,7 +857,11 @@ fn make_arraybuffer_from_bytes<'a, C: Context<'a>>(
         cx.throw_error::<_, Throw>("Uint8Array.set is not a function")
             .unwrap_err()
     })?;
-    let _ = set_fn.call_with(cx).this(u8).arg(src).apply::<JsValue, _>(cx);
+    let _ = set_fn
+        .call_with(cx)
+        .this(u8)
+        .arg(src)
+        .apply::<JsValue, _>(cx);
 
     Ok(ab_obj.upcast())
 }
@@ -895,7 +899,11 @@ fn make_shared_arraybuffer_from_bytes<'a, C: Context<'a>>(
         cx.throw_error::<_, Throw>("Uint8Array.set is not a function")
             .unwrap_err()
     })?;
-    let _ = set_fn.call_with(cx).this(u8).arg(src).apply::<JsValue, _>(cx);
+    let _ = set_fn
+        .call_with(cx)
+        .this(u8)
+        .arg(src)
+        .apply::<JsValue, _>(cx);
 
     Ok(sab_obj.upcast())
 }

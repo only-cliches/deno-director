@@ -1,5 +1,5 @@
-use deno_runtime::deno_core::{JsBuffer, OpState, op2};
 use bytes::Bytes;
+use deno_runtime::deno_core::{JsBuffer, OpState, op2};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -50,7 +50,10 @@ fn bytes_to_u8_bridge(bytes: &[u8]) -> JsValueBridge {
 
 // Returns a wire error reply when host callbacks are attempted during `evalSync`.
 fn host_call_blocked_during_evalsync(ctx: &WorkerOpContext) -> Option<serde_json::Value> {
-    if ctx.eval_sync_active.load(std::sync::atomic::Ordering::SeqCst) {
+    if ctx
+        .eval_sync_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         return Some(serde_json::json!({
             "ok": false,
             "error": err_wire(
@@ -115,10 +118,7 @@ pub fn op_denojs_worker_post_message_bin(state: &mut OpState, #[buffer] msg: JsB
 
 // Worker-native stream accept (incoming stream data plane).
 #[op2(fast)]
-pub fn op_denojs_worker_stream_accept(
-    state: &mut OpState,
-    #[string] key: String,
-) -> i32 {
+pub fn op_denojs_worker_stream_accept(state: &mut OpState, #[string] key: String) -> i32 {
     if key.trim().is_empty() {
         return -1;
     }
@@ -164,7 +164,10 @@ pub async fn op_denojs_worker_stream_accept_async(
 // Worker-native stream read (incoming stream data plane).
 #[op2]
 #[serde]
-pub fn op_denojs_worker_stream_read(state: &mut OpState, #[smi] stream_id: i32) -> serde_json::Value {
+pub fn op_denojs_worker_stream_read(
+    state: &mut OpState,
+    #[smi] stream_id: i32,
+) -> serde_json::Value {
     if stream_id <= 0 {
         return serde_json::json!({ "kind": "error", "message": "Invalid native stream id" });
     }
@@ -184,7 +187,9 @@ pub fn op_denojs_worker_stream_read(state: &mut OpState, #[smi] stream_id: i32) 
             serde_json::json!({ "kind": "chunk" })
         }
         Some(NativeReadEvent::Close) => serde_json::json!({ "kind": "close" }),
-        Some(NativeReadEvent::Error(message)) => serde_json::json!({ "kind": "error", "message": message }),
+        Some(NativeReadEvent::Error(message)) => {
+            serde_json::json!({ "kind": "error", "message": message })
+        }
         None => serde_json::json!({ "kind": "none" }),
     }
 }
@@ -274,7 +279,9 @@ pub async fn op_denojs_worker_stream_read_async(
             serde_json::json!({ "kind": "chunk" })
         }
         NativeReadEvent::Close => serde_json::json!({ "kind": "close" }),
-        NativeReadEvent::Error(message) => serde_json::json!({ "kind": "error", "message": message }),
+        NativeReadEvent::Error(message) => {
+            serde_json::json!({ "kind": "error", "message": message })
+        }
     };
     v
 }

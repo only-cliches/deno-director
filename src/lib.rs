@@ -36,7 +36,9 @@ pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
 ) {
     let send_result = match tx.try_send(msg) {
         Ok(()) => Ok(()),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => tx.blocking_send(msg).map_err(|e| e.0),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+            tx.blocking_send(msg).map_err(|e| e.0)
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(msg)) => Err(msg),
     };
     if let Err(err) = send_result {
@@ -49,7 +51,9 @@ pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
             | DenoMsg::Memory { deferred }
             | DenoMsg::SetGlobal { deferred, .. }
             | DenoMsg::RegisterModule { deferred, .. }
-            | DenoMsg::ClearModule { deferred, .. } => deferred.reject_with_error("Runtime is closed"),
+            | DenoMsg::ClearModule { deferred, .. } => {
+                deferred.reject_with_error("Runtime is closed")
+            }
             DenoMsg::Eval { deferred: None, .. }
             | DenoMsg::PostMessage { .. }
             | DenoMsg::PostMessageTyped { .. }
@@ -74,7 +78,9 @@ pub(crate) fn deno_control_tx_for_worker(
 }
 
 /// Deno data tx for worker.
-pub(crate) fn deno_data_tx_for_worker(worker_id: usize) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
+pub(crate) fn deno_data_tx_for_worker(
+    worker_id: usize,
+) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
     WORKERS
         .read()
         .ok()
@@ -82,7 +88,9 @@ pub(crate) fn deno_data_tx_for_worker(worker_id: usize) -> Option<tokio::sync::m
 }
 
 /// Native stream plane for worker.
-pub(crate) fn native_stream_plane_for_worker(worker_id: usize) -> Option<std::sync::Arc<NativeIncomingPlane>> {
+pub(crate) fn native_stream_plane_for_worker(
+    worker_id: usize,
+) -> Option<std::sync::Arc<NativeIncomingPlane>> {
     let map = WORKERS.read().ok()?;
     let handle = map.get(&worker_id)?;
     let guard = handle.native_stream_plane.lock().ok()?;

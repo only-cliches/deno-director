@@ -17,29 +17,27 @@ use crate::worker::filesystem::{
 };
 use crate::worker::messages::{DenoMsg, NodeMsg};
 use crate::worker::ops::{
-    NativeReadScratch,
-    op_denojs_worker_env_delete, op_denojs_worker_env_get, op_denojs_worker_env_set,
-    op_denojs_worker_env_to_object, op_denojs_worker_host_call_async,
-    op_denojs_worker_host_call_async_bin_mixed,
-    op_denojs_worker_host_call_async_bin, op_denojs_worker_host_call_sync,
-    op_denojs_worker_host_call_sync_bin_mixed,
-    op_denojs_worker_host_call_sync_bin, op_denojs_worker_post_message,
+    NativeReadScratch, op_denojs_worker_env_delete, op_denojs_worker_env_get,
+    op_denojs_worker_env_set, op_denojs_worker_env_to_object, op_denojs_worker_host_call_async,
+    op_denojs_worker_host_call_async_bin, op_denojs_worker_host_call_async_bin_mixed,
+    op_denojs_worker_host_call_sync, op_denojs_worker_host_call_sync_bin,
+    op_denojs_worker_host_call_sync_bin_mixed, op_denojs_worker_post_message,
     op_denojs_worker_post_message_bin, op_denojs_worker_stream_accept,
     op_denojs_worker_stream_accept_async, op_denojs_worker_stream_discard,
     op_denojs_worker_stream_read, op_denojs_worker_stream_read_async,
     op_denojs_worker_stream_read_async_raw, op_denojs_worker_stream_read_raw,
     op_denojs_worker_stream_take_chunk,
 };
-use crate::worker::stream_plane::NativeIncomingPlane;
 use crate::worker::state::RuntimeLimits;
+use crate::worker::stream_plane::NativeIncomingPlane;
 
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use tokio::sync::mpsc;
@@ -89,10 +87,7 @@ extension!(
         op_denojs_worker_env_to_object
     ],
     esm_entry_point = "ext:deno_worker_extension/src/worker/bootstrap.js",
-    esm = [
-        "src/worker/bootstrap.js",
-        "src/shared/stream-envelope.ts",
-    ],
+    esm = ["src/worker/bootstrap.js", "src/shared/stream-envelope.ts",],
 );
 
 // Cfg items.
@@ -616,9 +611,9 @@ pub fn spawn_worker_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_perm_field, cfg_items, create_params_from_limits, env_access_from_permissions, inspector_addr,
-        inspector_http_response, mark_worker_closed, parse_http_method_path,
-        merge_env_snapshot,
+        apply_perm_field, cfg_items, create_params_from_limits, env_access_from_permissions,
+        inspector_addr, inspector_http_response, mark_worker_closed, merge_env_snapshot,
+        parse_http_method_path,
     };
     use crate::worker::env::EnvAccess;
     use crate::worker::state::{EnvConfig, RuntimeLimits};

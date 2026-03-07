@@ -1,6 +1,6 @@
+use bytes::Bytes;
 use neon::prelude::*;
 use neon::types::buffer::TypedArray;
-use bytes::Bytes;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -511,16 +511,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             let msg = DenoMsg::PostMessage { value: msg };
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postMessage)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postMessage)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postMessage)")
@@ -582,15 +584,17 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                     };
                     match tx.try_send(msg) {
                         Ok(()) => sent += 1,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                            Ok(()) => sent += 1,
-                            Err(_) => {
-                                if strict_channel() {
-                                    return cx.throw_error("Runtime is closed (postMessages)");
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                            match tx.blocking_send(msg) {
+                                Ok(()) => sent += 1,
+                                Err(_) => {
+                                    if strict_channel() {
+                                        return cx.throw_error("Runtime is closed (postMessages)");
+                                    }
+                                    break;
                                 }
-                                break;
                             }
-                        },
+                        }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             if strict_channel() {
                                 return cx.throw_error("Runtime is closed (postMessages)");
@@ -608,15 +612,17 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 let msg = DenoMsg::PostMessage { value: msg };
                 match tx.try_send(msg) {
                     Ok(()) => sent += 1,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                        Ok(()) => sent += 1,
-                        Err(_) => {
-                            if strict_channel() {
-                                return cx.throw_error("Runtime is closed (postMessages)");
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                        match tx.blocking_send(msg) {
+                            Ok(()) => sent += 1,
+                            Err(_) => {
+                                if strict_channel() {
+                                    return cx.throw_error("Runtime is closed (postMessages)");
+                                }
+                                break;
                             }
-                            break;
                         }
-                    },
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         if strict_channel() {
                             return cx.throw_error("Runtime is closed (postMessages)");
@@ -659,16 +665,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postMessageTyped)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postMessageTyped)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postMessageTyped)")
@@ -704,16 +712,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postStreamChunk)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postStreamChunk)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunk)")
@@ -731,7 +741,10 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let id2 = id;
         let f = JsFunction::new(&mut cx, move |mut cx| {
             let stream_id_num = cx.argument::<JsNumber>(0)?.value(&mut cx);
-            if !stream_id_num.is_finite() || stream_id_num < 1.0 || stream_id_num > (u32::MAX as f64) {
+            if !stream_id_num.is_finite()
+                || stream_id_num < 1.0
+                || stream_id_num > (u32::MAX as f64)
+            {
                 return cx.throw_error("postStreamChunkRaw streamId must be a finite uint32");
             }
             let payload_js = cx.argument::<JsValue>(1)?;
@@ -770,16 +783,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postStreamChunkRaw)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postStreamChunkRaw)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunkRaw)")
@@ -797,7 +812,10 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let id2 = id;
         let f = JsFunction::new(&mut cx, move |mut cx| {
             let stream_id_num = cx.argument::<JsNumber>(0)?.value(&mut cx);
-            if !stream_id_num.is_finite() || stream_id_num < 1.0 || stream_id_num > (u32::MAX as f64) {
+            if !stream_id_num.is_finite()
+                || stream_id_num < 1.0
+                || stream_id_num > (u32::MAX as f64)
+            {
                 return cx.throw_error("postStreamChunkRawBin streamId must be a finite uint32");
             }
             let payload_js = cx.argument::<JsValue>(1)?;
@@ -808,7 +826,9 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             } else if let Ok(ab) = payload_js.downcast::<JsArrayBuffer, _>(&mut cx) {
                 ab.as_slice(&cx).to_vec()
             } else {
-                return cx.throw_error("postStreamChunkRawBin payload must be Buffer/Uint8Array/ArrayBuffer");
+                return cx.throw_error(
+                    "postStreamChunkRawBin payload must be Buffer/Uint8Array/ArrayBuffer",
+                );
             };
             let credit = if cx.len() >= 3 {
                 let c = cx.argument::<JsValue>(2)?;
@@ -844,16 +864,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postStreamChunkRawBin)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postStreamChunkRawBin)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunkRawBin)")
@@ -897,19 +919,24 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             }
             let count = payloads.len();
 
-            let msg = DenoMsg::PostStreamChunks { stream_id, payloads };
+            let msg = DenoMsg::PostStreamChunks {
+                stream_id,
+                payloads,
+            };
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.number(count as f64)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.number(count as f64)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postStreamChunks)")
-                        } else {
-                            Ok(cx.number(0.0))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.number(count as f64)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postStreamChunks)")
+                            } else {
+                                Ok(cx.number(0.0))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunks)")
@@ -927,7 +954,10 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         let id2 = id;
         let f = JsFunction::new(&mut cx, move |mut cx| {
             let stream_id_num = cx.argument::<JsNumber>(0)?.value(&mut cx);
-            if !stream_id_num.is_finite() || stream_id_num < 1.0 || stream_id_num > (u32::MAX as f64) {
+            if !stream_id_num.is_finite()
+                || stream_id_num < 1.0
+                || stream_id_num > (u32::MAX as f64)
+            {
                 return cx.throw_error("postStreamChunksRaw streamId must be a finite uint32");
             }
             let payload_js = cx.argument::<JsValue>(1)?;
@@ -947,16 +977,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             };
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postStreamChunksRaw)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postStreamChunksRaw)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunksRaw)")
@@ -1008,16 +1040,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             match tx.try_send(msg) {
                 Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
-                    Ok(()) => Ok(cx.boolean(true)),
-                    Err(_) => {
-                        if strict_channel() {
-                            cx.throw_error("Runtime is closed (postStreamControl)")
-                        } else {
-                            Ok(cx.boolean(false))
+                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                    match tx.blocking_send(msg) {
+                        Ok(()) => Ok(cx.boolean(true)),
+                        Err(_) => {
+                            if strict_channel() {
+                                cx.throw_error("Runtime is closed (postStreamControl)")
+                            } else {
+                                Ok(cx.boolean(false))
+                            }
                         }
                     }
-                },
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamControl)")

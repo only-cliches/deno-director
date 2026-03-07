@@ -266,7 +266,8 @@ fn resolve_env_path(base_cwd: &Path, raw: &str) -> PathBuf {
 
 // Canonicalize or lexical.
 fn canonicalize_or_lexical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(path))
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(path))
 }
 
 // Checks whether base dir and returns the boolean result for worker configuration/state parsing and runtime limits.
@@ -684,7 +685,8 @@ impl WorkerCreateOptions {
                     if !trimmed.is_empty() {
                         let p = resolve_env_path(&base_cwd, trimmed);
                         if !within_base_dir(&base_cwd, &p) {
-                            return cx.throw_error("envFile path must stay within worker cwd sandbox");
+                            return cx
+                                .throw_error("envFile path must stay within worker cwd sandbox");
                         }
                         let map = load_dotenv_file_strict(cx, &p)?;
                         out.runtime_options.env = Some(EnvConfig::Map(map));
@@ -854,7 +856,10 @@ impl WorkerCreateOptions {
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "tsCompiler") {
             if let Ok(tco) = v.downcast::<JsObject, _>(cx) {
                 if let Some(tc) = parse_ts_compiler_config(cx, tco) {
-                    let cfg = out.runtime_options.module_loader.get_or_insert_with(Default::default);
+                    let cfg = out
+                        .runtime_options
+                        .module_loader
+                        .get_or_insert_with(Default::default);
                     cfg.transpile_ts = true;
                     cfg.ts_compiler = Some(tc);
                 }
@@ -864,10 +869,8 @@ impl WorkerCreateOptions {
         let env_keys = out.runtime_options.env.as_ref().and_then(|cfg| match cfg {
             EnvConfig::Map(map) => Some(map),
         });
-        let (permissions, env_warnings) = ensure_env_permission_enabled(
-            out.runtime_options.permissions.take(),
-            env_keys,
-        );
+        let (permissions, env_warnings) =
+            ensure_env_permission_enabled(out.runtime_options.permissions.take(), env_keys);
         out.runtime_options.permissions = permissions;
         out.runtime_options.startup_warnings.extend(env_warnings);
         if run_permission_enabled(out.runtime_options.permissions.as_ref()) {
@@ -964,7 +967,8 @@ mod tests {
     // Ensure shorthand permissions=true expands to allow-all semantics.
     fn ensure_env_permission_enabled_expands_permissions_true_shorthand() {
         let env = env_map(&["A"]);
-        let (out, warnings) = ensure_env_permission_enabled(Some(serde_json::Value::Bool(true)), Some(&env));
+        let (out, warnings) =
+            ensure_env_permission_enabled(Some(serde_json::Value::Bool(true)), Some(&env));
         let env_allow = out
             .and_then(|v| v.as_object().cloned())
             .and_then(|o| o.get("env").cloned())
@@ -977,11 +981,21 @@ mod tests {
     // Checks whether permissions run enables subprocess execution.
     fn run_permission_enabled_detects_supported_forms() {
         assert!(run_permission_enabled(Some(&serde_json::Value::Bool(true))));
-        assert!(run_permission_enabled(Some(&serde_json::json!({ "run": true }))));
-        assert!(run_permission_enabled(Some(&serde_json::json!({ "run": ["deno"] }))));
-        assert!(!run_permission_enabled(Some(&serde_json::json!({ "run": false }))));
-        assert!(!run_permission_enabled(Some(&serde_json::json!({ "run": [] }))));
-        assert!(!run_permission_enabled(Some(&serde_json::json!({ "read": true }))));
+        assert!(run_permission_enabled(Some(
+            &serde_json::json!({ "run": true })
+        )));
+        assert!(run_permission_enabled(Some(
+            &serde_json::json!({ "run": ["deno"] })
+        )));
+        assert!(!run_permission_enabled(Some(
+            &serde_json::json!({ "run": false })
+        )));
+        assert!(!run_permission_enabled(Some(
+            &serde_json::json!({ "run": [] })
+        )));
+        assert!(!run_permission_enabled(Some(
+            &serde_json::json!({ "read": true })
+        )));
         assert!(!run_permission_enabled(None));
     }
 

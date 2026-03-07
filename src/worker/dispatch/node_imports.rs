@@ -71,7 +71,9 @@ fn interpret_value(cx: &mut TaskContext, v: Handle<JsValue>) -> Option<ImportDec
                     } else {
                         return Some(ImportDecision::Block);
                     }
-                } else if !(loader_val.is_a::<JsUndefined, _>(cx) || loader_val.is_a::<JsNull, _>(cx)) {
+                } else if !(loader_val.is_a::<JsUndefined, _>(cx)
+                    || loader_val.is_a::<JsNull, _>(cx))
+                {
                     return Some(ImportDecision::Block);
                 }
             }

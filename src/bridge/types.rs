@@ -1,6 +1,6 @@
+use bytes::Bytes;
 use neon::{prelude::*, result::Throw};
 use serde::{Deserialize, Serialize};
-use bytes::Bytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]

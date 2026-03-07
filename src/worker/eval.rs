@@ -14,12 +14,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::sync::{OnceLock, mpsc};
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
     path::PathBuf,
 };
-use std::time::{Duration, Instant};
 use std::{sync::atomic::AtomicU64, thread};
 
 enum EvalTimerCmd {
@@ -59,7 +59,11 @@ impl EvalTimerService {
                     let now = Instant::now();
                     let due_ids: Vec<u64> = timers
                         .iter()
-                        .filter_map(|(id, (deadline, _, _))| if *deadline <= now { Some(*id) } else { None })
+                        .filter_map(
+                            |(id, (deadline, _, _))| {
+                                if *deadline <= now { Some(*id) } else { None }
+                            },
+                        )
                         .collect();
 
                     for id in due_ids {
@@ -105,7 +109,12 @@ impl EvalTimerService {
     }
 
     // Arm.
-    fn arm(&self, timeout_ms: u64, cancel: Arc<AtomicBool>, isolate_handle: v8::IsolateHandle) -> u64 {
+    fn arm(
+        &self,
+        timeout_ms: u64,
+        cancel: Arc<AtomicBool>,
+        isolate_handle: v8::IsolateHandle,
+    ) -> u64 {
         let timer_id = self.next_timer_id.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let _ = self.tx.send(EvalTimerCmd::Arm {
@@ -479,16 +488,17 @@ pub async fn eval_in_runtime(
         options.filename.clone()
     };
 
-    let transpiled_source = match maybe_transpile_eval_source(limits, &filename, &options.loader, source) {
-        Ok(s) => s,
-        Err(error) => {
-            let stats = ExecStats {
-                cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
-                eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
-            };
-            return EvalReply::Err { error, stats };
-        }
-    };
+    let transpiled_source =
+        match maybe_transpile_eval_source(limits, &filename, &options.loader, source) {
+            Ok(s) => s,
+            Err(error) => {
+                let stats = ExecStats {
+                    cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
+                    eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
+                };
+                return EvalReply::Err { error, stats };
+            }
+        };
 
     let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -501,9 +511,8 @@ pub async fn eval_in_runtime(
         (None, None) => None,
     };
 
-    let timeout_id = effective_termination_ms.map(|ms| {
-        EvalTimerService::global().arm(ms, cancel.clone(), isolate_handle.clone())
-    });
+    let timeout_id = effective_termination_ms
+        .map(|ms| EvalTimerService::global().arm(ms, cancel.clone(), isolate_handle.clone()));
 
     let result = if options.is_module {
         eval_module(worker, &transpiled_source).await
@@ -593,21 +602,15 @@ async fn eval_module(
     let url =
         deno_core::url::Url::parse(&spec).map_err(|e| mk_err("ModuleError", e.to_string()))?;
 
-    worker
-        .execute_side_module(&url)
-        .await
-        .map_err(|e| {
-            reg.remove(&spec);
-            JsValueBridge::any_error_to_bridge(e.into())
-        })?;
+    worker.execute_side_module(&url).await.map_err(|e| {
+        reg.remove(&spec);
+        JsValueBridge::any_error_to_bridge(e.into())
+    })?;
 
-    worker
-        .run_event_loop(false)
-        .await
-        .map_err(|e| {
-            reg.remove(&spec);
-            JsValueBridge::any_error_to_bridge(e.into())
-        })?;
+    worker.run_event_loop(false).await.map_err(|e| {
+        reg.remove(&spec);
+        JsValueBridge::any_error_to_bridge(e.into())
+    })?;
 
     let decide_script = format!(
         r#"(async () => {{
@@ -790,12 +793,10 @@ mod tests {
         let limits = limits_with_cache(Some("/tmp/cache"), Some("react-jsx"), Some("h"));
         let media = media_type_for_eval_loader("tsx");
 
-        let a =
-            transpile_cache_path_from_limits(&limits, "x.tsx", "const a: number = 1;", media)
-                .expect("cache path");
-        let b =
-            transpile_cache_path_from_limits(&limits, "x.tsx", "const a: number = 1;", media)
-                .expect("cache path");
+        let a = transpile_cache_path_from_limits(&limits, "x.tsx", "const a: number = 1;", media)
+            .expect("cache path");
+        let b = transpile_cache_path_from_limits(&limits, "x.tsx", "const a: number = 1;", media)
+            .expect("cache path");
         assert_eq!(a, b);
     }
 

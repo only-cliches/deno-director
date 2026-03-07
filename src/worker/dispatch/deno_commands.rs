@@ -1,9 +1,9 @@
+use bytes::Bytes;
 use deno_runtime::deno_core::{self, v8};
 use deno_runtime::worker::MainWorker;
 use neon::prelude::*;
-use tokio::sync::mpsc;
-use bytes::Bytes;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::bridge::types::{EvalOptions, JsValueBridge};
 use crate::worker::env_flags::{native_stream_debug_enabled, native_stream_plane_enabled};
@@ -31,14 +31,19 @@ pub async fn handle_deno_msg(
             DenoMsg::PostStreamChunkRaw { stream_id, .. } => {
                 eprintln!("[native-stream] msg:PostStreamChunkRaw id={}", stream_id)
             }
-            DenoMsg::PostStreamChunkRawBin { stream_id, payload, .. } => {
+            DenoMsg::PostStreamChunkRawBin {
+                stream_id, payload, ..
+            } => {
                 eprintln!(
                     "[native-stream] msg:PostStreamChunkRawBin id={} bytes={}",
                     stream_id,
                     payload.len()
                 )
             }
-            DenoMsg::PostStreamChunks { stream_id, payloads } => {
+            DenoMsg::PostStreamChunks {
+                stream_id,
+                payloads,
+            } => {
                 eprintln!(
                     "[native-stream] msg:PostStreamChunks id={} count={}",
                     stream_id,
@@ -48,8 +53,13 @@ pub async fn handle_deno_msg(
             DenoMsg::PostStreamChunksRaw { stream_id, .. } => {
                 eprintln!("[native-stream] msg:PostStreamChunksRaw id={}", stream_id)
             }
-            DenoMsg::PostStreamControl { kind, stream_id, .. } => {
-                eprintln!("[native-stream] msg:PostStreamControl kind={} id={}", kind, stream_id)
+            DenoMsg::PostStreamControl {
+                kind, stream_id, ..
+            } => {
+                eprintln!(
+                    "[native-stream] msg:PostStreamControl kind={} id={}",
+                    kind, stream_id
+                )
             }
             _ => {}
         }
@@ -77,9 +87,10 @@ pub async fn handle_deno_msg(
             payload,
             credit,
         } => handle_post_stream_chunk_raw_bin_msg(worker, stream_id, payload, credit),
-        DenoMsg::PostStreamChunks { stream_id, payloads } => {
-            handle_post_stream_chunks_msg(worker, stream_id, payloads)
-        }
+        DenoMsg::PostStreamChunks {
+            stream_id,
+            payloads,
+        } => handle_post_stream_chunks_msg(worker, stream_id, payloads),
         DenoMsg::PostStreamChunksRaw { stream_id, payload } => {
             handle_post_stream_chunks_raw_msg(worker, stream_id, payload)
         }
@@ -98,7 +109,18 @@ pub async fn handle_deno_msg(
             source,
             loader,
             deferred,
-        } => handle_register_module_msg(worker, worker_id, limits, module_name, source, loader, deferred).await,
+        } => {
+            handle_register_module_msg(
+                worker,
+                worker_id,
+                limits,
+                module_name,
+                source,
+                loader,
+                deferred,
+            )
+            .await
+        }
         DenoMsg::ClearModule {
             module_name,
             deferred,
@@ -203,9 +225,9 @@ fn handle_close_msg(worker_id: usize, deferred: crate::bridge::promise::PromiseS
                     let _ = cb.call(&mut cx, this, &[]);
                 }
 
-            if let Ok(mut map) = crate::WORKERS.write() {
-                let _ = map.remove(&wid);
-            }
+                if let Ok(mut map) = crate::WORKERS.write() {
+                    let _ = map.remove(&wid);
+                }
 
                 Ok(())
             })
@@ -310,11 +332,7 @@ fn handle_post_message_typed_msg(
                                     &[type_val.into(), id_val.into(), payload_val],
                                 )
                                 .is_some();
-                            if ok {
-                                true
-                            } else {
-                                false
-                            }
+                            if ok { true } else { false }
                         } else {
                             false
                         }
@@ -371,7 +389,9 @@ fn handle_post_message_typed_msg(
         let _ = msg_obj.set(scope, type_key.into(), type_val.into());
         let _ = msg_obj.set(scope, id_key.into(), id_val.into());
         let _ = msg_obj.set(scope, payload_key.into(), payload_val);
-        dispatch_fn.call(scope, global.into(), &[msg_obj.into()]).is_some()
+        dispatch_fn
+            .call(scope, global.into(), &[msg_obj.into()])
+            .is_some()
     };
 
     if !dispatched {
@@ -447,7 +467,11 @@ fn handle_post_stream_chunks_msg(
     payloads: Vec<JsValueBridge>,
 ) -> bool {
     if native_stream_plane_enabled() && native_stream_debug_enabled() {
-        eprintln!("[native-stream] handle chunks id={} count={}", stream_id, payloads.len());
+        eprintln!(
+            "[native-stream] handle chunks id={} count={}",
+            stream_id,
+            payloads.len()
+        );
     }
     // Vectorize into one binary payload when all chunks are binary payloads.
     let mut all_binary = !payloads.is_empty();
@@ -570,7 +594,11 @@ fn handle_post_stream_chunk_raw_msg(
             None => v8::undefined(scope).into(),
         };
         dispatch_fn
-            .call(scope, global.into(), &[id_val.into(), payload_val, credit_val])
+            .call(
+                scope,
+                global.into(),
+                &[id_val.into(), payload_val, credit_val],
+            )
             .is_some()
     };
 
@@ -587,7 +615,11 @@ fn handle_post_stream_chunk_raw_bin_msg(
     credit: Option<u32>,
 ) -> bool {
     if native_stream_plane_enabled() && native_stream_debug_enabled() {
-        eprintln!("[native-stream] handle raw-bin id={} bytes={}", stream_id, payload.len());
+        eprintln!(
+            "[native-stream] handle raw-bin id={} bytes={}",
+            stream_id,
+            payload.len()
+        );
     }
     if native_stream_plane_enabled()
         && let Some(plane) = native_stream_plane(worker)
@@ -619,7 +651,9 @@ fn handle_post_stream_chunk_raw_bin_msg(
             let bs = v8::ArrayBuffer::new_backing_store_from_vec(payload).make_shared();
             v8::ArrayBuffer::with_backing_store(scope, &bs)
         };
-        let Some(payload_val) = v8::Uint8Array::new(scope, ab, 0, ab.byte_length()).map(|v| v.into()) else {
+        let Some(payload_val) =
+            v8::Uint8Array::new(scope, ab, 0, ab.byte_length()).map(|v| v.into())
+        else {
             return false;
         };
         let credit_val: v8::Local<v8::Value> = match credit {
@@ -627,7 +661,11 @@ fn handle_post_stream_chunk_raw_bin_msg(
             None => v8::undefined(scope).into(),
         };
         dispatch_fn
-            .call(scope, global.into(), &[id_val.into(), payload_val, credit_val])
+            .call(
+                scope,
+                global.into(),
+                &[id_val.into(), payload_val, credit_val],
+            )
             .is_some()
     };
 
@@ -690,7 +728,9 @@ fn handle_post_stream_control_msg(
     stream_id: String,
     aux: Option<String>,
 ) -> bool {
-    if native_stream_plane_enabled() && let Some(plane) = native_stream_plane(worker) {
+    if native_stream_plane_enabled()
+        && let Some(plane) = native_stream_plane(worker)
+    {
         let (handled, wake) = match kind.as_str() {
             "open" => {
                 let key = aux.as_deref().unwrap_or_default();
@@ -705,7 +745,9 @@ fn handle_post_stream_control_msg(
             }
             "error" => {
                 if let Ok(id) = stream_id.parse::<u32>() {
-                    let msg = aux.clone().unwrap_or_else(|| "Remote stream error".to_string());
+                    let msg = aux
+                        .clone()
+                        .unwrap_or_else(|| "Remote stream error".to_string());
                     plane.error_with_wake(id, msg)
                 } else {
                     (false, false)
@@ -713,7 +755,9 @@ fn handle_post_stream_control_msg(
             }
             "cancel" => {
                 if let Ok(id) = stream_id.parse::<u32>() {
-                    let msg = aux.clone().unwrap_or_else(|| "Remote stream cancelled".to_string());
+                    let msg = aux
+                        .clone()
+                        .unwrap_or_else(|| "Remote stream cancelled".to_string());
                     plane.error_with_wake(id, msg)
                 } else {
                     (false, false)
@@ -763,7 +807,11 @@ fn handle_post_stream_control_msg(
             v8::undefined(scope).into()
         };
         dispatch_fn
-            .call(scope, global.into(), &[kind_val.into(), id_val.into(), aux_val])
+            .call(
+                scope,
+                global.into(),
+                &[kind_val.into(), id_val.into(), aux_val],
+            )
             .is_some()
     };
 
@@ -850,7 +898,8 @@ async fn handle_register_module_msg(
     let module_name = module_name.trim().to_string();
     if module_name.is_empty() {
         if let Some(tx) = get_node_tx(worker_id) {
-            let err = crate::bridge::errors::error("Error", "moduleName must be a non-empty string");
+            let err =
+                crate::bridge::errors::error("Error", "moduleName must be a non-empty string");
             send_node_msg_or_reject(
                 &tx,
                 NodeMsg::Resolve {
@@ -901,7 +950,11 @@ async fn handle_register_module_msg(
             .borrow()
             .borrow::<crate::worker::modules::ModuleRegistry>()
             .clone();
-        reg.put_named_persistent(&module_name, &final_source, deno_core::ModuleType::JavaScript);
+        reg.put_named_persistent(
+            &module_name,
+            &final_source,
+            deno_core::ModuleType::JavaScript,
+        );
     }
 
     if let Some(tx) = get_node_tx(worker_id) {
@@ -930,7 +983,8 @@ async fn handle_clear_module_msg(
     let module_name = module_name.trim().to_string();
     if module_name.is_empty() {
         if let Some(tx) = get_node_tx(worker_id) {
-            let err = crate::bridge::errors::error("Error", "moduleName must be a non-empty string");
+            let err =
+                crate::bridge::errors::error("Error", "moduleName must be a non-empty string");
             send_node_msg_or_reject(
                 &tx,
                 NodeMsg::Resolve {

@@ -1,7 +1,7 @@
 // src/bridge/v8_codec.rs
+use bytes::Bytes;
 use deno_runtime::deno_core::v8::{ValueDeserializerHelper, ValueSerializerHelper};
 use deno_runtime::deno_core::{serde_v8, v8};
-use bytes::Bytes;
 
 use crate::bridge::tags::{TYPE_FUNCTION, TYPE_KEY};
 use crate::bridge::types::JsValueBridge;

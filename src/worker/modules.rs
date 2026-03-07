@@ -4,14 +4,15 @@ use deno_runtime::transpile::{JsParseDiagnostic, JsTranspileError};
 
 use crate::worker::messages::NodeMsg;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -159,11 +160,7 @@ impl ModuleRegistry {
             }
         }
 
-        let label = label
-            .trim_matches('-')
-            .chars()
-            .take(64)
-            .collect::<String>();
+        let label = label.trim_matches('-').chars().take(64).collect::<String>();
         let label = if label.is_empty() {
             "unnamed".to_string()
         } else {
@@ -277,7 +274,9 @@ impl ModuleRegistry {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        state.aliases.insert(module_name.to_string(), canonical.clone());
+        state
+            .aliases
+            .insert(module_name.to_string(), canonical.clone());
         state.modules.insert(
             canonical.clone(),
             ModuleEntry {
@@ -776,8 +775,7 @@ impl DynamicModuleLoader {
             .map(|r| r.specifier.as_str().to_string())
             .unwrap_or_default();
 
-        Self::decode_resolve_url(module_specifier)
-            .unwrap_or_else(|| (spec, referrer_from_runtime))
+        Self::decode_resolve_url(module_specifier).unwrap_or_else(|| (spec, referrer_from_runtime))
     }
 
     // Internal helper for module loading and import policy flow; it handles imports policy error.
@@ -843,12 +841,10 @@ impl DynamicModuleLoader {
         new_spec: &str,
         orig_referrer: &str,
     ) -> Result<Url, JsErrorBox> {
-        self.resolve_rewritten_target(new_spec, orig_referrer).ok_or_else(|| {
-            JsErrorBox::generic(format!(
-                "Unable to resolve rewritten import: {}",
-                new_spec
-            ))
-        })
+        self.resolve_rewritten_target(new_spec, orig_referrer)
+            .ok_or_else(|| {
+                JsErrorBox::generic(format!("Unable to resolve rewritten import: {}", new_spec))
+            })
     }
 
     // Checks whether load remote non callback and returns the boolean result for module resolution, policy, and remote loading.
@@ -919,7 +915,10 @@ impl DynamicModuleLoader {
     }
 
     // Reads or fetch remote source for module resolution, policy, and remote loading.
-    async fn read_or_fetch_remote_source(&self, module_specifier: &Url) -> Result<String, JsErrorBox> {
+    async fn read_or_fetch_remote_source(
+        &self,
+        module_specifier: &Url,
+    ) -> Result<String, JsErrorBox> {
         let cfg = self.module_loader_cfg();
         let cache_path = self.remote_cache_path(module_specifier);
 
@@ -929,7 +928,8 @@ impl DynamicModuleLoader {
             }
         }
 
-        let s = DynamicModuleLoader::fetch_remote_text(module_specifier, self.max_payload_bytes()).await?;
+        let s = DynamicModuleLoader::fetch_remote_text(module_specifier, self.max_payload_bytes())
+            .await?;
         if let Some(parent) = cache_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -974,7 +974,9 @@ impl DynamicModuleLoader {
     ) -> Result<crate::worker::messages::ImportDecision, JsErrorBox> {
         match wait {
             CallbackDecisionWait::Decision(decision) => Ok(decision),
-            CallbackDecisionWait::ChannelClosed => Ok(crate::worker::messages::ImportDecision::Block),
+            CallbackDecisionWait::ChannelClosed => {
+                Ok(crate::worker::messages::ImportDecision::Block)
+            }
             CallbackDecisionWait::TimedOut => Err(JsErrorBox::generic(format!(
                 "Import callback timed out: {}",
                 orig_spec
@@ -1252,10 +1254,15 @@ impl DynamicModuleLoader {
         self.module_loader_cfg().max_payload_bytes
     }
 
+    // Returns configured CJS interop mode.
+    fn cjs_interop_mode(&self) -> crate::worker::state::CjsInteropMode {
+        self.module_loader_cfg().cjs_interop
+    }
+
     // Checks whether CJS interop wrapping is enabled.
     fn cjs_interop_enabled(&self) -> bool {
         !matches!(
-            self.module_loader_cfg().cjs_interop,
+            self.cjs_interop_mode(),
             crate::worker::state::CjsInteropMode::Disabled
         )
     }
@@ -1396,6 +1403,18 @@ impl DynamicModuleLoader {
         }
     }
 
+    // Checks whether a loaded source appears to be CommonJS.
+    fn is_probable_cjs_source(source: &str, ext: &str) -> bool {
+        if ext == "cjs" {
+            return true;
+        }
+        source.contains("module.exports")
+            || source.contains("exports.")
+            || source.contains("exports[")
+            || source.contains("require(")
+            || source.contains("Object.defineProperty(exports")
+    }
+
     // Checks whether a string is a JS identifier supported by ESM named exports.
     fn is_js_identifier(name: &str) -> bool {
         let mut chars = name.chars();
@@ -1501,13 +1520,45 @@ impl DynamicModuleLoader {
         if spec.starts_with("node:") {
             return spec.to_string();
         }
-        // Keep list explicit to avoid rewriting arbitrary bare package names.
         const CORE: &[&str] = &[
-            "assert", "buffer", "child_process", "cluster", "console", "constants", "crypto",
-            "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http", "http2",
-            "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process",
-            "punycode", "querystring", "readline", "repl", "stream", "string_decoder",
-            "sys", "timers", "tls", "tty", "url", "util", "v8", "vm", "worker_threads",
+            "assert",
+            "buffer",
+            "child_process",
+            "cluster",
+            "console",
+            "constants",
+            "crypto",
+            "dgram",
+            "diagnostics_channel",
+            "dns",
+            "domain",
+            "events",
+            "fs",
+            "http",
+            "http2",
+            "https",
+            "inspector",
+            "module",
+            "net",
+            "os",
+            "path",
+            "perf_hooks",
+            "process",
+            "punycode",
+            "querystring",
+            "readline",
+            "repl",
+            "stream",
+            "string_decoder",
+            "sys",
+            "timers",
+            "tls",
+            "tty",
+            "url",
+            "util",
+            "v8",
+            "vm",
+            "worker_threads",
             "zlib",
         ];
         if CORE.iter().any(|m| *m == spec) {
@@ -1581,7 +1632,8 @@ impl DynamicModuleLoader {
         let mut imports: Vec<String> = Vec::new();
         let mut body: Vec<String> = Vec::new();
         let mut exports: Vec<String> = Vec::new();
-        let mut seen_exports: BTreeSet<String> = BTreeSet::new();
+        let mut seen_exports: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         let mut export_counter = 0usize;
 
         for raw_line in source.lines() {
@@ -1609,7 +1661,8 @@ impl DynamicModuleLoader {
             }
 
             if let Some((binding, helper, spec)) = Self::parse_wrapped_require_binding(line) {
-                let spec_json = serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
+                let spec_json =
+                    serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
                 let tmp = format!("__dd_req_{binding}");
                 imports.push(format!("import * as {tmp} from {spec_json};"));
                 body.push(format!("const {binding} = {helper}({tmp});"));
@@ -1618,7 +1671,8 @@ impl DynamicModuleLoader {
             }
 
             if let Some((binding, spec)) = Self::parse_require_binding(line) {
-                let spec_json = serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
+                let spec_json =
+                    serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
                 imports.push(format!("import * as {binding} from {spec_json};"));
                 changed = true;
                 continue;
@@ -1679,19 +1733,119 @@ impl DynamicModuleLoader {
         Some(out)
     }
 
-    // Checks whether a loaded source appears to be CommonJS.
-    fn is_probable_cjs_source(source: &str, ext: &str) -> bool {
-        if ext == "cjs" {
-            return true;
+    // Executes cjs2esm conversion in a temp workspace and returns converted source on success.
+    fn cjs2esm_convert_source(source: &str) -> Result<String, String> {
+        let mut base = std::env::temp_dir();
+        let nonce = format!(
+            "deno-director-cjs2esm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        base.push(nonce);
+        let src_dir = base.join("src");
+        let in_file = src_dir.join("in.js");
+
+        std::fs::create_dir_all(&src_dir)
+            .map_err(|e| format!("cjs2esm temp dir create failed: {e}"))?;
+        std::fs::write(&in_file, source.as_bytes())
+            .map_err(|e| format!("cjs2esm temp write failed: {e}"))?;
+
+        let script = r#"
+const path = require("path");
+const fs = require("fs");
+const c = require("cjs2esm");
+(async () => {
+  const root = process.argv[1];
+  process.chdir(root);
+  const cfg = {
+    input: [path.join(root, "src")],
+    output: path.join(root, "out"),
+    forceDirectory: true,
+    modules: [],
+    extension: { use: "js", ignore: [] },
+    addModuleEntry: false,
+    addPackageJson: false,
+    filesWithShebang: [],
+    codemod: { files: ["cjs", "exports", "named-export-generation"] }
+  };
+  const prevLog = console.log;
+  console.log = () => {};
+  try {
+    await c.prepare();
+    await c.ensureOutput(cfg.output);
+    const files = await c.copyFiles(cfg.input, cfg.output, cfg.extension.use, cfg.forceDirectory, []);
+    await c.transformOutput(files, cfg);
+  } finally {
+    console.log = prevLog;
+  }
+  process.stdout.write(fs.readFileSync(path.join(root, "out", "src", "in.js"), "utf8"));
+})().catch((e) => {
+  const msg = e && e.stack ? e.stack : String(e);
+  process.stderr.write(msg);
+  process.exit(1);
+});
+"#;
+
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .arg(base.to_string_lossy().to_string())
+            .env("BABEL_DISABLE_CACHE", "1")
+            .output()
+            .map_err(|e| format!("cjs2esm node exec failed: {e}"))?;
+
+        let _ = std::fs::remove_dir_all(&base);
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(if err.trim().is_empty() {
+                format!("cjs2esm failed with status {}", output.status)
+            } else {
+                err
+            });
         }
-        source.contains("module.exports")
-            || source.contains("exports.")
-            || source.contains("exports[")
-            || source.contains("require(")
-            || source.contains("Object.defineProperty(exports")
+
+        String::from_utf8(output.stdout).map_err(|e| format!("cjs2esm output decode failed: {e}"))
     }
 
-    // Builds an ESM module from detected CommonJS source using a best-effort rewrite.
+    // Converts CJS source using configured interop mode.
+    fn convert_cjs_to_esm(
+        &self,
+        source: &str,
+        mode: crate::worker::state::CjsInteropMode,
+    ) -> String {
+        match mode {
+            crate::worker::state::CjsInteropMode::Disabled => source.to_string(),
+            crate::worker::state::CjsInteropMode::Builtin => {
+                if source.contains("Object.defineProperty(exports, \"__esModule\"")
+                    || source.contains("Object.defineProperty(exports, '__esModule'")
+                    || source.contains(" = void 0;")
+                {
+                    return Self::transpile_cjs_to_esm(source)
+                        .unwrap_or_else(|| source.to_string());
+                }
+                match Self::cjs2esm_convert_source(source) {
+                    Ok(esm)
+                        if (esm.contains("export ") || esm.contains("import "))
+                            && !esm.contains("module.exports")
+                            && !esm.contains("exports.")
+                            && !esm.contains("require(") =>
+                    {
+                        esm
+                    }
+                    _ => Self::transpile_cjs_to_esm(source).unwrap_or_else(|| source.to_string()),
+                }
+            }
+            crate::worker::state::CjsInteropMode::Esbuild => {
+                Self::transpile_cjs_to_esm(source).unwrap_or_else(|| source.to_string())
+            }
+        }
+    }
+
+    // Builds an ESM module from detected CommonJS source.
     fn build_cjs_interop_module(
         &self,
         requested_specifier: &Url,
@@ -1712,7 +1866,7 @@ impl DynamicModuleLoader {
             return None;
         }
 
-        let esm = Self::transpile_cjs_to_esm(source)?;
+        let esm = self.convert_cjs_to_esm(source, self.cjs_interop_mode());
 
         let out = if Self::should_wrap_with_redirect(requested_specifier) {
             ModuleSource::new_with_redirect(
@@ -1821,9 +1975,8 @@ Specifier: {}",
 
         let media_type = Self::media_type_for_ext(ext);
         let cfg = self.module_loader_cfg();
-        let maybe_cache_path =
-            Self::compiler_cache_dir_from_cfg(&cfg)
-                .map(|dir| Self::transpile_cache_path(&dir, module_specifier, ext, &code, &cfg));
+        let maybe_cache_path = Self::compiler_cache_dir_from_cfg(&cfg)
+            .map(|dir| Self::transpile_cache_path(&dir, module_specifier, ext, &code, &cfg));
         if !cfg.reload {
             if let Some(cache_path) = maybe_cache_path.as_ref() {
                 if let Ok(hit) = std::fs::read_to_string(cache_path) {
@@ -2039,12 +2192,15 @@ impl ModuleLoader for DynamicModuleLoader {
                             "callback.block",
                             true,
                         );
-                        Err(JsErrorBox::generic(format!("Import blocked: {}", orig_spec)))
+                        Err(JsErrorBox::generic(format!(
+                            "Import blocked: {}",
+                            orig_spec
+                        )))
                     }
 
                     ImportDecision::AllowDisk => {
-                        let resolved = this_loader
-                            .resolve_allow_disk_or_error(&orig_spec, &orig_referrer)?;
+                        let resolved =
+                            this_loader.resolve_allow_disk_or_error(&orig_spec, &orig_referrer)?;
 
                         this_loader.emit_import_resolved(
                             &orig_spec,
@@ -2067,8 +2223,8 @@ impl ModuleLoader for DynamicModuleLoader {
                     }
 
                     ImportDecision::Resolve(new_spec) => {
-                        let resolved = this_loader
-                            .resolve_rewritten_or_error(&new_spec, &orig_referrer)?;
+                        let resolved =
+                            this_loader.resolve_rewritten_or_error(&new_spec, &orig_referrer)?;
 
                         this_loader.emit_import_resolved(
                             &orig_spec,
@@ -2173,8 +2329,8 @@ mod tests {
     use deno_runtime::deno_core;
     use deno_runtime::deno_core::ModuleType;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -2318,12 +2474,36 @@ mod tests {
     #[test]
     // Internal helper for module loading and import policy flow; it handles ipv6 host-port matching correctly.
     fn match_host_port_ipv6_respects_port_constraints() {
-        assert!(DynamicModuleLoader::match_host_port("[::1]:443", "::1", Some(443)));
-        assert!(!DynamicModuleLoader::match_host_port("[::1]:443", "::1", Some(8443)));
-        assert!(DynamicModuleLoader::match_host_port("[::1]", "::1", Some(8443)));
-        assert!(DynamicModuleLoader::match_host_port("::1", "::1", Some(8443)));
-        assert!(!DynamicModuleLoader::match_host_port("[::1]x", "::1", Some(443)));
-        assert!(!DynamicModuleLoader::match_host_port("[::1]:notaport", "::1", Some(443)));
+        assert!(DynamicModuleLoader::match_host_port(
+            "[::1]:443",
+            "::1",
+            Some(443)
+        ));
+        assert!(!DynamicModuleLoader::match_host_port(
+            "[::1]:443",
+            "::1",
+            Some(8443)
+        ));
+        assert!(DynamicModuleLoader::match_host_port(
+            "[::1]",
+            "::1",
+            Some(8443)
+        ));
+        assert!(DynamicModuleLoader::match_host_port(
+            "::1",
+            "::1",
+            Some(8443)
+        ));
+        assert!(!DynamicModuleLoader::match_host_port(
+            "[::1]x",
+            "::1",
+            Some(443)
+        ));
+        assert!(!DynamicModuleLoader::match_host_port(
+            "[::1]:notaport",
+            "::1",
+            Some(443)
+        ));
     }
 
     #[test]
@@ -2382,15 +2562,20 @@ mod tests {
             ..test_loader(true, serde_json::json!({ "import": true, "net": true }))
         };
 
-        assert!(deny
-            .imports_policy_error("https://example.com/mod.ts")
-            .is_some());
-        assert!(allow_disk
-            .imports_policy_error("https://example.com/mod.ts")
-            .is_none());
-        assert!(callback
-            .imports_policy_error("https://example.com/mod.ts")
-            .is_none());
+        assert!(
+            deny.imports_policy_error("https://example.com/mod.ts")
+                .is_some()
+        );
+        assert!(
+            allow_disk
+                .imports_policy_error("https://example.com/mod.ts")
+                .is_none()
+        );
+        assert!(
+            callback
+                .imports_policy_error("https://example.com/mod.ts")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2564,9 +2749,10 @@ mod tests {
             "https://example.com/slow.ts",
         )
         .expect_err("timeout error");
-        assert!(err
-            .to_string()
-            .contains("Import callback timed out: https://example.com/slow.ts"));
+        assert!(
+            err.to_string()
+                .contains("Import callback timed out: https://example.com/slow.ts")
+        );
     }
 
     #[test]
@@ -2575,9 +2761,9 @@ mod tests {
         let virt = "denojs-worker://virtual/__vm_42.js";
         let wrapper = DynamicModuleLoader::source_typed_wrapper(virt);
         assert!(wrapper.contains("export * from \"denojs-worker://virtual/__vm_42.js\";"));
-        assert!(wrapper.contains(
-            "export { default } from \"denojs-worker://virtual/__vm_42.js\";"
-        ));
+        assert!(
+            wrapper.contains("export { default } from \"denojs-worker://virtual/__vm_42.js\";")
+        );
     }
 
     #[test]
@@ -2589,7 +2775,10 @@ mod tests {
 
         assert!(a.starts_with("denojs-worker://virtual/__named_intent_bootstrap_"));
         assert!(a.ends_with(".js"));
-        assert_eq!(ModuleRegistry::module_name_label("intent/bootstrap"), "intent-bootstrap");
+        assert_eq!(
+            ModuleRegistry::module_name_label("intent/bootstrap"),
+            "intent-bootstrap"
+        );
         assert_eq!(ModuleRegistry::module_name_label(""), "unnamed");
         assert_ne!(a, b);
         assert_ne!(b, c);
@@ -2608,7 +2797,10 @@ mod tests {
         let err = loader
             .resolve_allow_disk_or_error("@bad/bare", "file:///tmp/main.ts")
             .expect_err("unresolved");
-        assert!(err.to_string().contains("Unable to resolve import: @bad/bare"));
+        assert!(
+            err.to_string()
+                .contains("Unable to resolve import: @bad/bare")
+        );
     }
 
     #[test]
@@ -2624,9 +2816,10 @@ mod tests {
         let err = loader
             .resolve_rewritten_or_error("@bad/rewrite", "file:///tmp/main.ts")
             .expect_err("unresolved");
-        assert!(err
-            .to_string()
-            .contains("Unable to resolve rewritten import: @bad/rewrite"));
+        assert!(
+            err.to_string()
+                .contains("Unable to resolve rewritten import: @bad/rewrite")
+        );
     }
 
     #[test]
@@ -2656,7 +2849,10 @@ mod tests {
         let err = loader
             .build_source_typed_module(&requested, "ts", "export const x: number = 1;".to_string())
             .expect_err("expected transpile-disabled error");
-        assert!(err.to_string().contains("TypeScript transpilation is disabled"));
+        assert!(
+            err.to_string()
+                .contains("TypeScript transpilation is disabled")
+        );
     }
 
     #[test]
@@ -2727,9 +2923,10 @@ mod tests {
             )
             .await
             .expect_err("timeout");
-            assert!(err
-                .to_string()
-                .contains("Import callback timed out: https://example.com/slow.ts"));
+            assert!(
+                err.to_string()
+                    .contains("Import callback timed out: https://example.com/slow.ts")
+            );
         });
     }
 
@@ -2751,5 +2948,20 @@ mod tests {
             .expect_err("closed");
             assert!(err.to_string().contains("Imports callback unavailable"));
         });
+    }
+
+    #[test]
+    // CJS interop wrapper avoids redeclaring local identifiers when exporting names.
+    fn cjs_interop_wrapper_uses_alias_exports_for_ts_emitted_cjs() {
+        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        let source = r#""use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Provider = void 0;
+const Provider = "provider";
+exports.Provider = Provider;
+"#;
+        let out = loader.convert_cjs_to_esm(source, crate::worker::state::CjsInteropMode::Builtin);
+        assert!(out.contains("export { __dd_export_0 as Provider };"));
+        assert!(!out.contains("export const Provider ="));
     }
 }

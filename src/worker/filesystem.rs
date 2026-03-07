@@ -710,10 +710,16 @@ mod tests {
         std::fs::write(&outside, "console.log('outside');").expect("write outside");
 
         let in_url = normalize_startup_url(&root, Some("main.js"));
-        assert!(in_url.is_some(), "expected startup inside sandbox to be allowed");
+        assert!(
+            in_url.is_some(),
+            "expected startup inside sandbox to be allowed"
+        );
 
         let out_url = normalize_startup_url(&root, outside.to_str());
-        assert!(out_url.is_none(), "expected startup outside sandbox to be blocked");
+        assert!(
+            out_url.is_none(),
+            "expected startup outside sandbox to be blocked"
+        );
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside_root);
@@ -732,7 +738,10 @@ mod tests {
         let outside_file = outside_root.join("b.txt");
         std::fs::write(&outside_file, "y").expect("write outside file");
 
-        let inside_rel = Path::new("nested").join("a.txt").to_string_lossy().to_string();
+        let inside_rel = Path::new("nested")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
         let outside_abs = outside_file.to_string_lossy().to_string();
         let items = vec![" ".to_string(), inside_rel, outside_abs];
 
@@ -762,13 +771,19 @@ mod tests {
         std::fs::write(&file, "export {};").expect("write file");
 
         let dir_attempt = normalize_startup_url(&root, Some("."));
-        assert!(dir_attempt.is_none(), "directory should not be accepted as startup");
+        assert!(
+            dir_attempt.is_none(),
+            "directory should not be accepted as startup"
+        );
 
         let file_url = deno_core::url::Url::from_file_path(&file)
             .expect("file url")
             .to_string();
         let ok = normalize_startup_url(&root, Some(&file_url));
-        assert!(ok.is_some(), "file:// URL inside sandbox should be accepted");
+        assert!(
+            ok.is_some(),
+            "file:// URL inside sandbox should be accepted"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -27,9 +27,7 @@ fn parse_u8_array(items: &[serde_json::Value]) -> Option<Bytes> {
 }
 
 // Decodes error object from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
-fn decode_error_object(
-    map: &serde_json::Map<String, serde_json::Value>,
-) -> Option<JsValueBridge> {
+fn decode_error_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<JsValueBridge> {
     if map.get(TYPE_KEY).and_then(|v| v.as_str()) != Some(TYPE_ERROR) {
         return None;
     }
@@ -134,7 +132,10 @@ fn decode_map_entries(items: &[serde_json::Value]) -> JsValueBridge {
         if pair.len() != 2 {
             continue;
         }
-        out.push((from_wire_json(pair[0].clone()), from_wire_json(pair[1].clone())));
+        out.push((
+            from_wire_json(pair[0].clone()),
+            from_wire_json(pair[1].clone()),
+        ));
     }
     JsValueBridge::Map(out)
 }
@@ -351,8 +352,8 @@ mod tests {
         decode_v8_serialized_object, from_wire_json, parse_u8_array, to_wire_json,
     };
     use crate::bridge::tags::{
-        BUFFER_KEY, MAP_KEY, NUMBER_KEY, REGEXP_KEY, SET_KEY, TYPE_ERROR, TYPE_FUNCTION,
-        TYPE_KEY, V8_KEY,
+        BUFFER_KEY, MAP_KEY, NUMBER_KEY, REGEXP_KEY, SET_KEY, TYPE_ERROR, TYPE_FUNCTION, TYPE_KEY,
+        V8_KEY,
     };
     use crate::bridge::types::JsValueBridge;
 
@@ -729,7 +730,10 @@ mod tests {
     fn decode_special_number_tag_handles_supported_and_unknown_tags() {
         assert!(decode_special_number_tag("NaN").expect("NaN").is_nan());
         assert_eq!(decode_special_number_tag("Infinity"), Some(f64::INFINITY));
-        assert_eq!(decode_special_number_tag("-Infinity"), Some(f64::NEG_INFINITY));
+        assert_eq!(
+            decode_special_number_tag("-Infinity"),
+            Some(f64::NEG_INFINITY)
+        );
         assert_eq!(decode_special_number_tag("nope"), None);
     }
 
@@ -751,7 +755,11 @@ mod tests {
     #[test]
     // Parses u8 array rejects non numeric entries from input data and validates it for bridge encoding/decoding between Rust, V8, and Neon.
     fn parse_u8_array_rejects_non_numeric_entries() {
-        let arr = vec![serde_json::json!(1), serde_json::json!("bad"), serde_json::json!(3)];
+        let arr = vec![
+            serde_json::json!(1),
+            serde_json::json!("bad"),
+            serde_json::json!(3),
+        ];
         assert_eq!(parse_u8_array(&arr), None);
     }
 
@@ -904,10 +912,7 @@ mod tests {
         .as_object()
         .cloned()
         .expect("object");
-        assert!(matches!(
-            decode_buffer_view_object(&bad_buf),
-            Some(Err(()))
-        ));
+        assert!(matches!(decode_buffer_view_object(&bad_buf), Some(Err(()))));
 
         let bad_v8 = serde_json::json!({
             V8_KEY: [1, "bad", 3]
