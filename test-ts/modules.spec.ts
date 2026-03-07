@@ -137,6 +137,15 @@ describe("deno_worker: modules", () => {
     await expect(dw.module.import("named:startup")).resolves.toMatchObject({ boot: 1 });
   });
 
+  it("constructor modules accept Map entries", async () => {
+    dw = createTestWorker({
+      modules: new Map([
+        ["intent_bootstrap", `export const boot = "ok";`],
+      ]),
+    });
+    await expect(dw.module.import("intent_bootstrap")).resolves.toMatchObject({ boot: "ok" });
+  });
+
   it("constructor modules are re-applied on restart", async () => {
     dw = createTestWorker({
       modules: {

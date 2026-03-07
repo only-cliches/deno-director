@@ -1254,10 +1254,14 @@ export class DenoWorker {
     /** Initializes constructor-time globals/modules and tracks startup readiness/error state. */
     private initializeStartup(
         globals?: Record<string, any>,
-        modules?: Record<string, DenoWorkerStartupModuleSource>,
+        modules?: Record<string, DenoWorkerStartupModuleSource> | Map<string, DenoWorkerStartupModuleSource>,
     ): void {
         const globalEntries = globals && typeof globals === "object" ? Object.entries(globals) : [];
-        const moduleEntries = modules && typeof modules === "object" ? Object.entries(modules) : [];
+        const moduleEntries = modules instanceof Map
+            ? [...modules.entries()]
+            : modules && typeof modules === "object"
+                ? Object.entries(modules)
+                : [];
         if (globalEntries.length === 0 && moduleEntries.length === 0) {
             this.startupReady = true;
             this.startupError = null;

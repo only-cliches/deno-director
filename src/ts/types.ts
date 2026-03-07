@@ -607,7 +607,7 @@ export type DenoWorkerOptions = {
      * - string (shorthand for `{ src: string, srcLoader: "js" }`)
      * - object `{ src, srcLoader? }`
      */
-    modules?: Record<string, DenoWorkerStartupModuleSource>;
+    modules?: Record<string, DenoWorkerStartupModuleSource> | Map<string, DenoWorkerStartupModuleSource>;
     /** Lifecycle hooks invoked around start/stop/crash transitions. */
     lifecycle?: DenoWorkerLifecycleHooks;
 };
