@@ -1608,6 +1608,11 @@ impl DynamicModuleLoader {
         if expr.is_empty() || expr == "void 0" || expr.starts_with("exports.") {
             return None;
         }
+        // Avoid rewriting multiline/block-start assignments (e.g. class/function/object
+        // bodies) with a single-line alias export, which can produce invalid syntax.
+        if expr.ends_with('{') || expr.ends_with('(') || expr.ends_with('[') {
+            return None;
+        }
         Some((name.to_string(), expr.to_string()))
     }
 
@@ -2984,6 +2989,23 @@ function generate() { return 1; }
         let out = loader.convert_cjs_to_esm(source, crate::worker::state::CjsInteropMode::Builtin);
         assert!(!out.contains("value: true"));
         assert!(!out.contains("Object.defineProperty(exports, \"__esModule\""));
+        assert!(out.contains("export { __dd_export_0 as generate };"));
+    }
+
+    #[test]
+    // CJS interop leaves multiline class exports intact instead of emitting invalid one-line alias rewrites.
+    fn cjs_interop_skips_multiline_class_assignment_rewrite() {
+        let source = r#""use strict";
+exports.CodeGenerator = class CodeGenerator {
+  generate() { return 1; }
+};
+exports.generate = generate;
+function generate() { return 2; }
+"#;
+        let out = DynamicModuleLoader::transpile_cjs_to_esm(source).expect("converted");
+        assert!(out.contains("exports.CodeGenerator = class CodeGenerator {"));
+        assert!(!out.contains("class CodeGenerator {;"));
+        assert!(!out.contains("as CodeGenerator"));
         assert!(out.contains("export { __dd_export_0 as generate };"));
     }
 }
