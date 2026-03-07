@@ -110,7 +110,7 @@ describe("DenoWorker runtime events", () => {
     const dw = createTestWorker();
 
     try {
-      expect.assertions(2);
+      expect.assertions(4);
       await dw.module.register(
         "named:stacked-error",
         `
@@ -124,10 +124,13 @@ describe("DenoWorker runtime events", () => {
       try {
         await dw.module.import("named:stacked-error");
       } catch (e) {
-        const msg = String((e as any)?.message ?? "");
+        const err = e as any;
+        const msg = String(err?.message ?? "");
         expect(msg).toMatch(/Code context \(/);
         const count = (msg.match(/Code context \(/g) || []).length;
         expect(count).toBeGreaterThanOrEqual(2);
+        expect(String(err?.codeContext?.specifier?.friendlyName ?? "")).toBe("stacked-error.js");
+        expect(String(err?.codeContext?.specifier?.denoSysName ?? "")).toContain("denojs-worker://virtual/__named_");
       }
     } finally {
       await dw.close();

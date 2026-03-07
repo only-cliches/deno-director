@@ -2,6 +2,7 @@
 
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { nativeAddon } from "./native";
@@ -1409,6 +1410,33 @@ export class DenoWorker {
         return m?.[1] || null;
     }
 
+    /** Provides human-friendly and raw names for stack-frame specifiers. */
+    private describeErrorSpecifier(specifier: string): { friendlyName: string; denoSysName: string } {
+        const denoSysName = String(specifier ?? "");
+        const namedLabel = this.namedVirtualLabel(denoSysName);
+        if (namedLabel) {
+            const normalized = namedLabel.replace(/^named[-_]/, "");
+            return { friendlyName: `${normalized || namedLabel}.js`, denoSysName };
+        }
+        if (denoSysName.startsWith("file://")) {
+            try {
+                const fileName = basename(fileURLToPath(denoSysName));
+                if (fileName) return { friendlyName: fileName, denoSysName };
+            } catch {
+                // fall through
+            }
+        }
+        try {
+            const parsed = new URL(denoSysName);
+            const tail = parsed.pathname.split("/").filter(Boolean).pop();
+            if (tail) return { friendlyName: decodeURIComponent(tail), denoSysName };
+            if (parsed.hostname) return { friendlyName: parsed.hostname, denoSysName };
+        } catch {
+            // fall through
+        }
+        return { friendlyName: denoSysName, denoSysName };
+    }
+
     /** Parses all stack `url:line:column` frames from an Error-like value (deduped, in order). */
     private parseErrorLocations(error: unknown): Array<{ specifier: string; line: number; column: number }> {
         const text = error instanceof Error
@@ -1471,14 +1499,31 @@ export class DenoWorker {
     private enrichErrorWithCodeContext(error: unknown, sourceHint?: string): unknown {
         const locations = this.parseErrorLocations(error);
         if (locations.length === 0) return error;
-        const contexts: Array<{ specifier: string; line: number; column: number; frame: string; header: string; block: string }> = [];
+        const contexts: Array<{
+            specifier: string;
+            specifierInfo: { friendlyName: string; denoSysName: string };
+            line: number;
+            column: number;
+            frame: string;
+            header: string;
+            block: string;
+        }> = [];
         for (const loc of locations) {
             const source = this.sourceForErrorSpecifier(loc.specifier, sourceHint);
             if (!source) continue;
             const frame = this.buildCodeFrame(source, loc.line, loc.column);
             if (!frame) continue;
-            const header = `Code context (${loc.specifier}:${loc.line}:${loc.column})`;
-            contexts.push({ specifier: loc.specifier, line: loc.line, column: loc.column, frame, header, block: `${header}\n${frame}` });
+            const specifierInfo = this.describeErrorSpecifier(loc.specifier);
+            const header = `Code context (${specifierInfo.friendlyName} @ ${loc.specifier}:${loc.line}:${loc.column})`;
+            contexts.push({
+                specifier: loc.specifier,
+                specifierInfo,
+                line: loc.line,
+                column: loc.column,
+                frame,
+                header,
+                block: `${header}\n${frame}`,
+            });
         }
         if (contexts.length === 0) return error;
         const first = contexts[0];
@@ -1493,9 +1538,9 @@ export class DenoWorker {
             if (missingMessageBlocks.length > 0) {
                 error.message = `${messageText}\n${missingMessageBlocks.join("\n\n")}`;
             }
-            (error as any).codeContext = { specifier: first.specifier, line: first.line, column: first.column, frame: first.frame };
+            (error as any).codeContext = { specifier: first.specifierInfo, line: first.line, column: first.column, frame: first.frame };
             (error as any).codeContexts = contexts.map((c) => ({
-                specifier: c.specifier,
+                specifier: c.specifierInfo,
                 line: c.line,
                 column: c.column,
                 frame: c.frame,
@@ -1515,9 +1560,9 @@ export class DenoWorker {
             if (missingStackBlocks.length > 0) {
                 e.stack = `${stackText}\n${missingStackBlocks.join("\n\n")}`;
             }
-            (e as any).codeContext = { specifier: first.specifier, line: first.line, column: first.column, frame: first.frame };
+            (e as any).codeContext = { specifier: first.specifierInfo, line: first.line, column: first.column, frame: first.frame };
             (e as any).codeContexts = contexts.map((c) => ({
-                specifier: c.specifier,
+                specifier: c.specifierInfo,
                 line: c.line,
                 column: c.column,
                 frame: c.frame,
