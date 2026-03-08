@@ -769,6 +769,7 @@ export class DenoWorker {
     private readonly closeHandlers = new Set<DenoWorkerCloseHandler>();
     private readonly lifecycleHandlers = new Set<DenoWorkerLifecycleHandler>();
     private readonly runtimeHandlers = new Set<DenoWorkerRuntimeHandler>();
+    private readonly hostCallsiteByOpId = new Map<string, Partial<DenoWorkerRuntimeEvent>>();
     private readonly moduleSourceByName = new Map<string, string>();
     private readonly moduleSourceByLabel = new Map<string, string>();
     private readonly moduleSourceByVirtualSpecifier = new Map<string, string>();
@@ -1065,7 +1066,8 @@ export class DenoWorker {
                         throw new Error("handle.call(path, args?, options?) expects args as an array when path is provided");
                     }
                     const args = Array.isArray(argsOrOptions) ? argsOrOptions : [];
-                    self.emitRuntimeEvent({ kind: "handle.call.begin", opId, handleId: id, path: p, args });
+                    const hostMeta = self.rememberHostCallsiteForOp(opId);
+                    self.emitRuntimeEvent({ kind: "handle.call.begin", opId, handleId: id, path: p, args, ...hostMeta });
                     try {
                         const out = await self.runHandleCallOp(id, p, args, toExecOptions(optionsMaybe));
                         self.emitRuntimeEvent({ kind: "handle.call.end", opId, handleId: id, path: p, ok: true });
@@ -1074,6 +1076,8 @@ export class DenoWorker {
                         self.emitRuntimeEvent({ kind: "handle.call.end", opId, handleId: id, path: p, ok: false });
                         self.emitThrownError(opId, "handle.call", e);
                         throw e;
+                    } finally {
+                        self.clearHostCallsiteForOp(opId);
                     }
                 }
                 const args = pathOrArgs;
@@ -1082,7 +1086,8 @@ export class DenoWorker {
                 }
                 const execOptions = toExecOptions(optionsMaybe ?? (Array.isArray(argsOrOptions) ? undefined : argsOrOptions));
                 const callArgs = Array.isArray(args) ? args : [];
-                self.emitRuntimeEvent({ kind: "handle.call.begin", opId, handleId: id, path: "", args: callArgs });
+                const hostMeta = self.rememberHostCallsiteForOp(opId);
+                self.emitRuntimeEvent({ kind: "handle.call.begin", opId, handleId: id, path: "", args: callArgs, ...hostMeta });
                 try {
                     const out = await self.runHandleCallOp(id, "", callArgs, execOptions);
                     self.emitRuntimeEvent({ kind: "handle.call.end", opId, handleId: id, path: "", ok: true });
@@ -1091,6 +1096,8 @@ export class DenoWorker {
                     self.emitRuntimeEvent({ kind: "handle.call.end", opId, handleId: id, path: "", ok: false });
                     self.emitThrownError(opId, "handle.call", e);
                     throw e;
+                } finally {
+                    self.clearHostCallsiteForOp(opId);
                 }
             },
             construct: async <T = any>(args?: any[], options?: DenoWorkerHandleExecOptions): Promise<T> => {
@@ -1152,7 +1159,7 @@ export class DenoWorker {
                 self.activeHandleIds.delete(id);
                 if (generation !== self.handleGeneration || self.isClosed()) return;
                 const opId = `handle.dispose:${id}`;
-                self.emitRuntimeEvent({ kind: "handle.dispose", opId, handleId: id });
+                self.emitRuntimeEvent({ kind: "handle.dispose", opId, handleId: id, ...self.captureHostCallsiteMeta() });
                 try {
                     await self.runHandleOp({ op: "dispose", id }, toExecOptions(options));
                 } catch {
@@ -1384,7 +1391,10 @@ export class DenoWorker {
     /** Emits runtime events to `on("runtime")` listeners with auto timestamping. */
     private emitRuntimeEvent(event: Omit<DenoWorkerRuntimeEvent, "ts"> & { ts?: number }): void {
         if (this.runtimeHandlers.size === 0) return;
+        const opId = typeof (event as any)?.opId === "string" ? String((event as any).opId) : "";
+        const hostMeta = opId ? this.hostCallsiteByOpId.get(opId) : undefined;
         const payload = {
+            ...(hostMeta ?? {}),
             ...event,
             ts: typeof event.ts === "number" ? event.ts : Date.now(),
         } as DenoWorkerRuntimeEvent;
@@ -1395,6 +1405,84 @@ export class DenoWorker {
                 // ignore runtime subscriber errors
             }
         }
+    }
+
+    /** Captures best-effort host callsite metadata for runtime begin events. */
+    private captureHostCallsiteMeta(): Partial<DenoWorkerRuntimeEvent> {
+        if (this.runtimeHandlers.size === 0) return {};
+
+        const stack = String(new Error().stack ?? "");
+        if (!stack) return {};
+
+        const lines = stack
+            .split("\n")
+            .slice(1)
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+        for (const line of lines) {
+            let loc = "";
+            const paren = line.match(/\((.*)\)\s*$/);
+            if (paren?.[1]) loc = paren[1];
+            else {
+                const bare = line.match(/^at\s+(.+)$/);
+                if (bare?.[1]) loc = bare[1];
+            }
+            if (!loc) continue;
+
+            if (
+                loc.startsWith("node:") ||
+                loc.includes("node:internal") ||
+                loc.includes("/node_modules/") ||
+                loc.includes("\\node_modules\\")
+            ) {
+                continue;
+            }
+
+            const match = loc.match(/^(.*):(\d+):(\d+)$/);
+            if (!match) continue;
+
+            let filePart = match[1];
+            const hostLine = Number(match[2]);
+            const hostColumn = Number(match[3]);
+            if (!Number.isFinite(hostLine) || !Number.isFinite(hostColumn)) continue;
+
+            if (filePart.startsWith("file://")) {
+                try {
+                    filePart = fileURLToPath(filePart);
+                } catch {
+                    // keep as-is when URL parsing fails.
+                }
+            }
+
+            const normalized = filePart.replaceAll("\\", "/");
+            if (normalized.endsWith("/src/ts/worker.ts") || normalized.endsWith("/dist/worker.js")) {
+                continue;
+            }
+
+            return {
+                hostFile: filePart,
+                hostLine,
+                hostColumn,
+                hostCallSite: `${filePart}:${hostLine}:${hostColumn}`,
+            };
+        }
+
+        return {};
+    }
+
+    /** Stores host callsite metadata for an operation id and returns inline metadata for begin events. */
+    private rememberHostCallsiteForOp(opId: string): Partial<DenoWorkerRuntimeEvent> {
+        if (!opId) return {};
+        const meta = this.captureHostCallsiteMeta();
+        if (typeof meta.hostFile === "string") this.hostCallsiteByOpId.set(opId, meta);
+        return meta;
+    }
+
+    /** Clears host callsite metadata for an operation id after terminal event emission. */
+    private clearHostCallsiteForOp(opId: string): void {
+        if (!opId) return;
+        this.hostCallsiteByOpId.delete(opId);
     }
 
     /** Emits standardized user-visible thrown error events. */
@@ -3944,7 +4032,7 @@ export class DenoWorker {
         this.ensureHandleCapacity();
         const id = this.nextHandleId();
         const opId = `handle.create:${id}`;
-        this.emitRuntimeEvent({ kind: "handle.create", opId, handleId: id, source: "path", path: p });
+        this.emitRuntimeEvent({ kind: "handle.create", opId, handleId: id, source: "path", path: p, ...this.captureHostCallsiteMeta() });
         const defaultExecOptions: Omit<EvalOptions, "args" | "type" | "srcLoader"> | undefined =
             typeof options?.maxEvalMs === "number" || typeof options?.maxCpuMs === "number"
                 ? {
@@ -3981,7 +4069,7 @@ export class DenoWorker {
         this.ensureHandleCapacity();
         const id = this.nextHandleId();
         const opId = `handle.create:${id}`;
-        this.emitRuntimeEvent({ kind: "handle.create", opId, handleId: id, source: "eval" });
+        this.emitRuntimeEvent({ kind: "handle.create", opId, handleId: id, source: "eval", ...this.captureHostCallsiteMeta() });
         const defaultExecOptions: Omit<EvalOptions, "args" | "type" | "srcLoader"> | undefined =
             options &&
             (typeof options.maxEvalMs === "number" ||
@@ -4011,51 +4099,57 @@ export class DenoWorker {
      */
     eval<T = any>(src: string, options?: EvalOptions): Promise<T> {
         const opId = `eval:${randomUUID()}`;
+        const hostMeta = this.rememberHostCallsiteForOp(opId);
         this.emitRuntimeEvent({
             kind: "eval.begin",
             opId,
             args: Array.isArray(options?.args) ? options?.args : [],
+            ...hostMeta,
         });
         const op = (async () => {
-            if (!this.startupReady) {
-                await this.startupPromise;
-            } else if (this.startupError) {
-                this.emitRuntimeEvent({ kind: "eval.end", opId, ok: false });
-                throw this.startupError;
-            }
-            let opKind: StatsOpKind | null = "eval";
-            let startedAt = Date.now();
-            let sourceForErrorContext: string | undefined;
-            const liveCpuKey = `cpu:${opId}`;
             try {
-                const transformed = await this.applyLoadersAsync({
-                    kind: "eval",
-                    src: String(src),
-                    srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
-                });
-                sourceForErrorContext = transformed.src;
-                opKind = this.classifyEvalOp(transformed.src);
-                startedAt = Date.now();
-                if (opKind) this.beginLiveCpuTracking(liveCpuKey);
-                const raw = await this.trackInFlight(
-                    this.native.eval(
-                        transformed.src,
-                        this.buildResolvedEvalOptions(options, transformed.srcLoader),
-                    ),
-                );
-                if (opKind) this.endLiveCpuTracking(liveCpuKey);
-                this.recordLastExecutionSample();
-                if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, true);
-                this.emitRuntimeEvent({ kind: "eval.end", opId, ok: true });
-                return hydrateFromWire(raw) as T;
-            } catch (e) {
-                if (opKind) this.endLiveCpuTracking(liveCpuKey);
-                this.recordLastExecutionSample();
-                if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, false);
-                const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), sourceForErrorContext);
-                this.emitRuntimeEvent({ kind: "eval.end", opId, ok: false });
-                this.emitThrownError(opId, "eval", hydrated, sourceForErrorContext);
-                throw hydrated;
+                if (!this.startupReady) {
+                    await this.startupPromise;
+                } else if (this.startupError) {
+                    this.emitRuntimeEvent({ kind: "eval.end", opId, ok: false });
+                    throw this.startupError;
+                }
+                let opKind: StatsOpKind | null = "eval";
+                let startedAt = Date.now();
+                let sourceForErrorContext: string | undefined;
+                const liveCpuKey = `cpu:${opId}`;
+                try {
+                    const transformed = await this.applyLoadersAsync({
+                        kind: "eval",
+                        src: String(src),
+                        srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
+                    });
+                    sourceForErrorContext = transformed.src;
+                    opKind = this.classifyEvalOp(transformed.src);
+                    startedAt = Date.now();
+                    if (opKind) this.beginLiveCpuTracking(liveCpuKey);
+                    const raw = await this.trackInFlight(
+                        this.native.eval(
+                            transformed.src,
+                            this.buildResolvedEvalOptions(options, transformed.srcLoader),
+                        ),
+                    );
+                    if (opKind) this.endLiveCpuTracking(liveCpuKey);
+                    this.recordLastExecutionSample();
+                    if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, true);
+                    this.emitRuntimeEvent({ kind: "eval.end", opId, ok: true });
+                    return hydrateFromWire(raw) as T;
+                } catch (e) {
+                    if (opKind) this.endLiveCpuTracking(liveCpuKey);
+                    this.recordLastExecutionSample();
+                    if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, false);
+                    const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), sourceForErrorContext);
+                    this.emitRuntimeEvent({ kind: "eval.end", opId, ok: false });
+                    this.emitThrownError(opId, "eval", hydrated, sourceForErrorContext);
+                    throw hydrated;
+                }
+            } finally {
+                this.clearHostCallsiteForOp(opId);
             }
         })();
         // Keep rejection semantics unchanged for callers while preventing
@@ -4071,48 +4165,54 @@ export class DenoWorker {
      */
     evalSync<T = any>(src: string, options?: EvalOptions): T {
         const opId = `evalSync:${randomUUID()}`;
+        const hostMeta = this.rememberHostCallsiteForOp(opId);
         this.emitRuntimeEvent({
             kind: "evalSync.begin",
             opId,
             args: Array.isArray(options?.args) ? options?.args : [],
+            ...hostMeta,
         });
-        if (!this.startupReady) {
-            this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: false });
-            throw new Error(
-                "DenoWorker.evalSync cannot run while constructor globals are still initializing; use eval(...) or await startup completion",
-            );
-        }
-        if (this.startupError) {
-            this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: false });
-            throw this.startupError;
-        }
-        let opKind: StatsOpKind | null = "eval";
-        let startedAt = Date.now();
-        let sourceForErrorContext: string | undefined;
         try {
-            const transformed = this.applyLoadersSync({
-                kind: "eval",
-                src: String(src),
-                srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
-            });
-            sourceForErrorContext = transformed.src;
-            opKind = this.classifyEvalOp(transformed.src);
-            startedAt = Date.now();
-            const raw = this.native.evalSync(
-                transformed.src,
-                this.buildResolvedEvalOptions(options, transformed.srcLoader),
-            );
-            this.recordLastExecutionSample();
-            if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, true);
-            this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: true });
-            return hydrateFromWire(raw) as T;
-        } catch (e) {
-            this.recordLastExecutionSample();
-            if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, false);
-            const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), sourceForErrorContext);
-            this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: false });
-            this.emitThrownError(opId, "evalSync", hydrated, sourceForErrorContext);
-            throw hydrated;
+            if (!this.startupReady) {
+                this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: false });
+                throw new Error(
+                    "DenoWorker.evalSync cannot run while constructor globals are still initializing; use eval(...) or await startup completion",
+                );
+            }
+            if (this.startupError) {
+                this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: false });
+                throw this.startupError;
+            }
+            let opKind: StatsOpKind | null = "eval";
+            let startedAt = Date.now();
+            let sourceForErrorContext: string | undefined;
+            try {
+                const transformed = this.applyLoadersSync({
+                    kind: "eval",
+                    src: String(src),
+                    srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
+                });
+                sourceForErrorContext = transformed.src;
+                opKind = this.classifyEvalOp(transformed.src);
+                startedAt = Date.now();
+                const raw = this.native.evalSync(
+                    transformed.src,
+                    this.buildResolvedEvalOptions(options, transformed.srcLoader),
+                );
+                this.recordLastExecutionSample();
+                if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, true);
+                this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: true });
+                return hydrateFromWire(raw) as T;
+            } catch (e) {
+                this.recordLastExecutionSample();
+                if (opKind) this.recordOpSample(opKind, Date.now() - startedAt, false);
+                const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), sourceForErrorContext);
+                this.emitRuntimeEvent({ kind: "evalSync.end", opId, ok: false });
+                this.emitThrownError(opId, "evalSync", hydrated, sourceForErrorContext);
+                throw hydrated;
+            }
+        } finally {
+            this.clearHostCallsiteForOp(opId);
         }
     }
 
@@ -4120,85 +4220,91 @@ export class DenoWorker {
         source: string,
         options?: DenoWorkerModuleEvalOptions,
     ): Promise<T> {
-        await this.startupPromise;
         const opId = `module.eval:${randomUUID()}`;
-        const sourceText = String(source);
-        if (sourceText.includes("@babel/parser") || sourceText.includes("@babel/generator")) {
-            await this.ensureBabelShimGlobals();
-        }
-        const sourceForLoaders = options?.cjs === true ? this.buildCjsEvalEsmSource(sourceText) : sourceText;
-        const transformed = await this.applyLoadersAsync({
-            kind: "module-eval",
-            src: sourceForLoaders,
-            srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
-        });
-        const moduleName = typeof options?.moduleName === "string" ? options.moduleName.trim() : "";
-        this.emitRuntimeEvent({
-            kind: "module.eval.begin",
-            opId,
-            moduleName: moduleName || undefined,
-        });
-        if (moduleName) {
-            await this.registerModuleInternal(moduleName, transformed.src, { srcLoader: transformed.srcLoader });
+        const hostMeta = this.rememberHostCallsiteForOp(opId);
+        try {
+            await this.startupPromise;
+            const sourceText = String(source);
+            if (sourceText.includes("@babel/parser") || sourceText.includes("@babel/generator")) {
+                await this.ensureBabelShimGlobals();
+            }
+            const sourceForLoaders = options?.cjs === true ? this.buildCjsEvalEsmSource(sourceText) : sourceText;
+            const transformed = await this.applyLoadersAsync({
+                kind: "module-eval",
+                src: sourceForLoaders,
+                srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
+            });
+            const moduleName = typeof options?.moduleName === "string" ? options.moduleName.trim() : "";
+            this.emitRuntimeEvent({
+                kind: "module.eval.begin",
+                opId,
+                moduleName: moduleName || undefined,
+                ...hostMeta,
+            });
+            if (moduleName) {
+                await this.registerModuleInternal(moduleName, transformed.src, { srcLoader: transformed.srcLoader });
+                try {
+                    const imported = await this.moduleApiImport<T>(moduleName);
+                    this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
+                    return imported;
+                } catch (e) {
+                    const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), transformed.src);
+                    this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: false });
+                    this.emitThrownError(opId, "module.eval", hydrated, transformed.src);
+                    throw hydrated;
+                }
+            }
+
+            let raw: any;
+            let usedNativeEvalModule = false;
+            let nativeStartedAt = Date.now();
+            const nativeCpuKey = `cpu:module:${randomUUID()}`;
             try {
-                const imported = await this.moduleApiImport<T>(moduleName);
-                this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
-                return imported;
+                if (typeof this.native.evalModule === "function") {
+                    usedNativeEvalModule = true;
+                    nativeStartedAt = Date.now();
+                    this.beginLiveCpuTracking(nativeCpuKey);
+                    raw = await this.trackInFlight(
+                        this.native.evalModule(
+                            transformed.src,
+                            normalizeEvalOptions({
+                                ...(options ?? {}),
+                                type: "module",
+                                ...(transformed.srcLoader !== "js" || options?.srcLoader !== undefined
+                                    ? { srcLoader: transformed.srcLoader }
+                                    : {}),
+                            }),
+                        ),
+                    );
+                } else {
+                    raw = await this.eval(transformed.src, {
+                        ...(options ?? {}),
+                        type: "module",
+                        srcLoader: transformed.srcLoader,
+                    });
+                }
+                if (usedNativeEvalModule) {
+                    this.endLiveCpuTracking(nativeCpuKey);
+                    this.recordLastExecutionSample();
+                    this.recordOpSample("eval", Date.now() - nativeStartedAt, true);
+                }
             } catch (e) {
+                if (usedNativeEvalModule) {
+                    this.endLiveCpuTracking(nativeCpuKey);
+                    this.recordLastExecutionSample();
+                    this.recordOpSample("eval", Date.now() - nativeStartedAt, false);
+                }
                 const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), transformed.src);
                 this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: false });
                 this.emitThrownError(opId, "module.eval", hydrated, transformed.src);
                 throw hydrated;
             }
+            const wrapped = wrapModuleNamespace<T>(this, hydrateFromWire(raw));
+            this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
+            return wrapped;
+        } finally {
+            this.clearHostCallsiteForOp(opId);
         }
-
-        let raw: any;
-        let usedNativeEvalModule = false;
-        let nativeStartedAt = Date.now();
-        const nativeCpuKey = `cpu:module:${randomUUID()}`;
-        try {
-            if (typeof this.native.evalModule === "function") {
-                usedNativeEvalModule = true;
-                nativeStartedAt = Date.now();
-                this.beginLiveCpuTracking(nativeCpuKey);
-                raw = await this.trackInFlight(
-                    this.native.evalModule(
-                        transformed.src,
-                        normalizeEvalOptions({
-                            ...(options ?? {}),
-                            type: "module",
-                            ...(transformed.srcLoader !== "js" || options?.srcLoader !== undefined
-                                ? { srcLoader: transformed.srcLoader }
-                                : {}),
-                        }),
-                    ),
-                );
-            } else {
-                raw = await this.eval(transformed.src, {
-                    ...(options ?? {}),
-                    type: "module",
-                    srcLoader: transformed.srcLoader,
-                });
-            }
-            if (usedNativeEvalModule) {
-                this.endLiveCpuTracking(nativeCpuKey);
-                this.recordLastExecutionSample();
-                this.recordOpSample("eval", Date.now() - nativeStartedAt, true);
-            }
-        } catch (e) {
-            if (usedNativeEvalModule) {
-                this.endLiveCpuTracking(nativeCpuKey);
-                this.recordLastExecutionSample();
-                this.recordOpSample("eval", Date.now() - nativeStartedAt, false);
-            }
-            const hydrated = this.enrichErrorWithCodeContext(hydrateFromWire(e), transformed.src);
-            this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: false });
-            this.emitThrownError(opId, "module.eval", hydrated, transformed.src);
-            throw hydrated;
-        }
-        const wrapped = wrapModuleNamespace<T>(this, hydrateFromWire(raw));
-        this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
-        return wrapped;
     }
 
     private normalizeCjsRequireSpecifier(specifier: string): string {

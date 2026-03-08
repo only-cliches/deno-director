@@ -27,6 +27,10 @@ describe("DenoWorker runtime events", () => {
       expect(begin).toBeTruthy();
       expect(end).toBeTruthy();
       expect(begin.args).toEqual([2, 3]);
+      expect(typeof begin.hostFile).toBe("string");
+      expect(typeof begin.hostLine).toBe("number");
+      expect(typeof begin.hostColumn).toBe("number");
+      expect(String(begin.hostCallSite ?? "")).toContain(":");
       expect(JSON.stringify(begin)).not.toContain("a + b");
     } finally {
       await dw.close();
