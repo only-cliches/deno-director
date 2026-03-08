@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.9.20] Future
+## [0.9.20] Mar 7, 2026
 
 ### Fixed
 - Fixed runtime observability gap for module evaluation failures:
