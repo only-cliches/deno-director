@@ -75,6 +75,24 @@ describe("DenoWorker nodeJs modules/runtime interop", () => {
     }
   });
 
+  it("resolves bare Node builtin specifiers as node:* when nodeResolve enabled", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: { modules: true },
+    });
+
+    try {
+      const code = `
+        import os from "os";
+        export const out = typeof os.platform;
+      `;
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "function" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
   it("nodeJs:true shorthand enables Node module resolution", async () => {
     await writeFile(
       path.join(dir, "node_modules", "my_cjs_pkg", "package.json"),

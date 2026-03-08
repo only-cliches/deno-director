@@ -848,6 +848,9 @@ impl DynamicModuleLoader {
 
     // Resolves a specifier using the same logic as `imports: true` (non-callback policy).
     fn resolve_like_allow_disk(&self, specifier: &str, referrer: &str) -> Result<Url, JsErrorBox> {
+        let normalized = Self::normalize_cjs_require_specifier(specifier);
+        let specifier = normalized.as_str();
+
         // Allow internal virtual URLs to pass through unchanged.
         if let Ok(u) = Url::parse(specifier) {
             if Self::is_internal_virtual_url(&u) {
@@ -2329,6 +2332,9 @@ impl ModuleLoader for DynamicModuleLoader {
         referrer: &str,
         _kind: deno_core::ResolutionKind,
     ) -> Result<Url, JsErrorBox> {
+        let normalized = Self::normalize_cjs_require_specifier(specifier);
+        let specifier = normalized.as_str();
+
         if !self.wasm && Self::is_wasm_specifier(specifier) {
             return Err(JsErrorBox::generic(format!(
                 "WASM module loading is disabled by permissions.wasm: {}",
