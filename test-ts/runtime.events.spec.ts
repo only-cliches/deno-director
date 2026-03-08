@@ -164,6 +164,22 @@ describe("DenoWorker runtime events", () => {
     }
   });
 
+  test("on('error') receives runtime error.thrown events", async () => {
+    const dw = createTestWorker();
+    const errors: any[] = [];
+    dw.on("error", (e) => errors.push(e));
+
+    try {
+      await expect(dw.eval(`throw new Error("boom")`)).rejects.toBeTruthy();
+      expect(errors.length).toBe(1);
+      expect(errors[0]?.kind).toBe("error.thrown");
+      expect(errors[0]?.surface).toBe("eval");
+      expect(String(errors[0]?.error?.message ?? "")).toContain("boom");
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("emits module.eval begin/end and error.thrown for module eval errors", async () => {
     const dw = createTestWorker();
     const events: any[] = [];

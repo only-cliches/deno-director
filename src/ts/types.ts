@@ -10,8 +10,9 @@ import type { Duplex } from "node:stream";
  * - `close`: emitted when the runtime closes.
  * - `lifecycle`: control-plane lifecycle transitions (`beforeStart`, `afterStart`, etc).
  * - `runtime`: runtime execution/import/handle events.
+ * - `error`: convenience channel for runtime `error.thrown` events.
  */
-export type DenoWorkerEvent = "message" | "close" | "lifecycle" | "runtime";
+export type DenoWorkerEvent = "message" | "close" | "lifecycle" | "runtime" | "error";
 export type DenoWorkerMessageHandler = (msg: any) => void;
 export type DenoWorkerCloseHandler = () => void;
 export type DenoWorkerRuntimeEventKind =
@@ -37,6 +38,10 @@ export type DenoWorkerRuntimeEvent = {
     [k: string]: any;
 };
 export type DenoWorkerRuntimeHandler = (event: DenoWorkerRuntimeEvent) => void;
+export type DenoWorkerErrorEvent = DenoWorkerRuntimeEvent & {
+    kind: "error.thrown";
+};
+export type DenoWorkerErrorHandler = (event: DenoWorkerErrorEvent) => void;
 
 /** Source loader mode used for import callback virtual modules and eval/module.eval calls. */
 export type DenoSourceLoader = "js" | "ts" | "tsx" | "jsx";

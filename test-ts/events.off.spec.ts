@@ -87,4 +87,19 @@ describe("DenoWorker on/off event adapters", () => {
     expect(hits).toEqual([]);
     await dw.close();
   });
+
+  test("on('error') can be removed with off()", async () => {
+    const hits: any[] = [];
+    const dw = createTestWorker();
+    const cb = (event: any) => hits.push(event.kind);
+    dw.on("error", cb);
+    await expect(dw.eval(`throw new Error("boom-1")`)).rejects.toBeTruthy();
+    expect(hits).toEqual(["error.thrown"]);
+
+    dw.off("error", cb);
+    hits.length = 0;
+    await expect(dw.eval(`throw new Error("boom-2")`)).rejects.toBeTruthy();
+    expect(hits).toEqual([]);
+    await dw.close();
+  });
 });

@@ -15,6 +15,8 @@ All notable changes to this project will be documented in this file.
   - callback mode now preserves native `node:*` module handling instead of routing those specifiers through file-URL fallback paths.
 - Fixed callback-path remote module loading parity:
   - callback import allow-disk/rewrite flows now keep resolved `http(s)` modules on the remote fetch/transpile path (instead of file-loader-only paths).
+- Fixed Node builtin bare-specifier resolution in Node modules mode:
+  - bare core imports (for example `"os"`) are now normalized to `node:*` during module resolution, including callback allow-disk/rewrite import flows.
 - Fixed eval/module/handle argument-scope clobbering under overlap:
   - `$args` binding is now per-call and isolated across concurrent operations.
   - eval/module temporary `$args` backing keys are cleaned up after execution.
@@ -27,6 +29,10 @@ All notable changes to this project will be documented in this file.
 - Added `$args` support across runtime execution surfaces:
   - `worker.eval(...)` and `worker.module.eval(...)` now expose `$args` to source code when `options.args` is provided.
   - handle runtime call surfaces (`handle.call`, `handle.apply` call ops, `handle.construct`) now expose operation-local `$args`.
+- Expanded runtime event attribution metadata:
+  - runtime events emitted from host-attributed operations now include host callsite metadata (`hostFile`, `hostLine`, `hostColumn`, `hostCallSite`) when available.
+- Updated eval/module/handle args typing:
+  - `args` inputs for eval-style and handle-style call surfaces now accept `any` payloads.
 
 ### Tests
 - Added coverage for unsafe-stream-memory guardrails:
@@ -42,6 +48,10 @@ All notable changes to this project will be documented in this file.
 - Added contention and memory-leak regression coverage for `$args` isolation and cleanup:
   - overlapping eval + handle calls verify no `$args` clobbering across concurrent operations.
   - memory leak suite verifies eval/module temporary arg-key cleanup and bounded-growth churn across eval/module/handle/restart/register-clear paths.
+- Added node-compat regression coverage for bare core imports:
+  - verifies `import os from "os"` resolves under Node modules mode via `node:*` normalization.
+- Added runtime event coverage for host-source callsite attribution:
+  - validates host file/line metadata propagation on host-attributed runtime events.
 
 ### Docs & Examples
 - Updated README/API docs for:

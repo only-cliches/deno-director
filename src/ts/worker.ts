@@ -55,6 +55,8 @@ import type {
     DenoWorkerRatesStats,
     DenoWorkerRuntimeEvent,
     DenoWorkerRuntimeHandler,
+    DenoWorkerErrorEvent,
+    DenoWorkerErrorHandler,
     DenoWorkerStatsResetOptions,
     DenoWorkerStatsApi,
     DenoWorkerStartupModuleSource,
@@ -769,6 +771,7 @@ export class DenoWorker {
     private readonly closeHandlers = new Set<DenoWorkerCloseHandler>();
     private readonly lifecycleHandlers = new Set<DenoWorkerLifecycleHandler>();
     private readonly runtimeHandlers = new Set<DenoWorkerRuntimeHandler>();
+    private readonly errorHandlers = new Set<DenoWorkerErrorHandler>();
     private readonly hostCallsiteByOpId = new Map<string, Partial<DenoWorkerRuntimeEvent>>();
     private readonly moduleSourceByName = new Map<string, string>();
     private readonly moduleSourceByLabel = new Map<string, string>();
@@ -1390,7 +1393,6 @@ export class DenoWorker {
 
     /** Emits runtime events to `on("runtime")` listeners with auto timestamping. */
     private emitRuntimeEvent(event: Omit<DenoWorkerRuntimeEvent, "ts"> & { ts?: number }): void {
-        if (this.runtimeHandlers.size === 0) return;
         const opId = typeof (event as any)?.opId === "string" ? String((event as any).opId) : "";
         const hostMeta = opId ? this.hostCallsiteByOpId.get(opId) : undefined;
         const payload = {
@@ -1398,18 +1400,34 @@ export class DenoWorker {
             ...event,
             ts: typeof event.ts === "number" ? event.ts : Date.now(),
         } as DenoWorkerRuntimeEvent;
-        for (const cb of [...this.runtimeHandlers]) {
+        if (this.runtimeHandlers.size > 0) {
+            for (const cb of [...this.runtimeHandlers]) {
+                try {
+                    cb(payload);
+                } catch {
+                    // ignore runtime subscriber errors
+                }
+            }
+        }
+        this.emitErrorEvent(payload);
+    }
+
+    /** Emits dedicated runtime error channel events to `on("error")` listeners. */
+    private emitErrorEvent(event: DenoWorkerRuntimeEvent): void {
+        if (event.kind !== "error.thrown" || this.errorHandlers.size === 0) return;
+        const payload = event as DenoWorkerErrorEvent;
+        for (const cb of [...this.errorHandlers]) {
             try {
                 cb(payload);
             } catch {
-                // ignore runtime subscriber errors
+                // ignore error subscriber errors
             }
         }
     }
 
     /** Captures best-effort host callsite metadata for runtime begin events. */
     private captureHostCallsiteMeta(): Partial<DenoWorkerRuntimeEvent> {
-        if (this.runtimeHandlers.size === 0) return {};
+        if (this.runtimeHandlers.size === 0 && this.errorHandlers.size === 0) return {};
 
         const stack = String(new Error().stack ?? "");
         if (!stack) return {};
@@ -2928,6 +2946,7 @@ export class DenoWorker {
      * - `close`: emitted once runtime closes.
      * - `lifecycle`: emits lifecycle transitions and crash/requested flags.
      * - `runtime`: emits runtime execution/import/handle/stream events.
+     * - `error`: emits runtime `error.thrown` events only.
      *
      * @example
      * ```ts
@@ -2939,9 +2958,15 @@ export class DenoWorker {
     on(event: "close", cb: DenoWorkerCloseHandler): void;
     on(event: "lifecycle", cb: DenoWorkerLifecycleHandler): void;
     on(event: "runtime", cb: DenoWorkerRuntimeHandler): void;
+    on(event: "error", cb: DenoWorkerErrorHandler): void;
     on(
         event: DenoWorkerEvent,
-        cb: DenoWorkerMessageHandler | DenoWorkerCloseHandler | DenoWorkerLifecycleHandler | DenoWorkerRuntimeHandler,
+        cb:
+            | DenoWorkerMessageHandler
+            | DenoWorkerCloseHandler
+            | DenoWorkerLifecycleHandler
+            | DenoWorkerRuntimeHandler
+            | DenoWorkerErrorHandler,
     ): void {
         if (event === "message") {
             if (typeof cb === "function") this.messageHandlers.add(cb as DenoWorkerMessageHandler);
@@ -2957,6 +2982,10 @@ export class DenoWorker {
         }
         if (event === "runtime" && typeof cb === "function") {
             this.runtimeHandlers.add(cb as DenoWorkerRuntimeHandler);
+            return;
+        }
+        if (event === "error" && typeof cb === "function") {
+            this.errorHandlers.add(cb as DenoWorkerErrorHandler);
         }
     }
 
@@ -2977,9 +3006,15 @@ export class DenoWorker {
     off(event: "close", cb?: DenoWorkerCloseHandler): void;
     off(event: "lifecycle", cb?: DenoWorkerLifecycleHandler): void;
     off(event: "runtime", cb?: DenoWorkerRuntimeHandler): void;
+    off(event: "error", cb?: DenoWorkerErrorHandler): void;
     off(
         event: DenoWorkerEvent,
-        cb?: DenoWorkerMessageHandler | DenoWorkerCloseHandler | DenoWorkerLifecycleHandler | DenoWorkerRuntimeHandler,
+        cb?:
+            | DenoWorkerMessageHandler
+            | DenoWorkerCloseHandler
+            | DenoWorkerLifecycleHandler
+            | DenoWorkerRuntimeHandler
+            | DenoWorkerErrorHandler,
     ): void {
         if (event === "message") {
             if (cb) this.messageHandlers.delete(cb as DenoWorkerMessageHandler);
@@ -2994,6 +3029,11 @@ export class DenoWorker {
         if (event === "runtime") {
             if (cb) this.runtimeHandlers.delete(cb as DenoWorkerRuntimeHandler);
             else this.runtimeHandlers.clear();
+            return;
+        }
+        if (event === "error") {
+            if (cb) this.errorHandlers.delete(cb as DenoWorkerErrorHandler);
+            else this.errorHandlers.clear();
             return;
         }
         if (cb) this.lifecycleHandlers.delete(cb as DenoWorkerLifecycleHandler);
