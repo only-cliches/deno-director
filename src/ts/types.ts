@@ -17,6 +17,7 @@ export type DenoWorkerCloseHandler = () => void;
 export type DenoWorkerRuntimeEventKind =
     | "import.requested"
     | "import.resolved"
+    | "import.classified"
     | "eval.begin"
     | "eval.end"
     | "module.eval.begin"
@@ -300,16 +301,32 @@ export type DenoWorkerModuleLoaderOption =
  * - CJS sources execute with Node-style wrapper semantics and expose ESM facade exports.
  * - Default import reflects `module.exports` value.
  * - In practice you usually pair this with `modules: true`.
+ * - Compatibility is best effort (not byte-for-byte Node parity for every package shape).
+ * - For deterministic behavior on ambiguous files, use `cjsForcePaths`.
+ *
+ * `cjsForcePaths`:
+ * - Optional force-match list applied before parser-based CJS detection.
+ * - Supports:
+ *   - literal paths (`"node_modules/pkg/index.js"`)
+ *   - glob patterns (`"node_modules/pkg/*"`)
+ *   - regex patterns (`/node_modules\\/pkg\\/.+\\.js$/`)
+ * - Relative path/glob entries resolve from worker `cwd`.
+ *
+ * Shorthand:
+ * - `true`: enables `{ modules: true, runtime: true, cjsInterop: true }`.
  */
 export type DenoWorkerNodeJsOption =
     | undefined
+    | boolean
     | {
             /** Enable Node-style module resolution behavior. */
             modules?: boolean;
             /** Enable Node compatibility runtime behavior. */
             runtime?: boolean;
-            /** Enable CommonJS interop for package/module loading. */
+            /** Enable best-effort CommonJS interop for package/module loading. */
             cjsInterop?: boolean;
+            /** Force specific files/patterns to be treated as CommonJS. */
+            cjsForcePaths?: Array<string | RegExp>;
       };
 
 export type DenoWorkerTsCompilerOption =
@@ -550,7 +567,7 @@ export type DenoWorkerOptions = {
     /**
      * Runtime working directory used for relative path resolution.
      *
-     * - When omitted, worker uses an internal sandbox cwd (`<tmp>/deno-director/sandbox`).
+     * - When omitted, worker uses a unique internal sandbox cwd (`<tmp>/deno-director/sandbox/w-<id>`).
      * - When provided, path must exist and be a directory.
      * - Relative paths are resolved from host process cwd.
      */
@@ -574,6 +591,9 @@ export type DenoWorkerOptions = {
      * - package resolution only: `{ modules: true }`
      * - broader Node-like runtime + resolution: `{ runtime: true, modules: true }`
      * - CJS-heavy ecosystems: `{ runtime: true, modules: true, cjsInterop: true }`
+     *
+     * Note: `cjsInterop` is best effort. Some edge-case/transpiled package shapes may
+     * still require explicit `nodeJs.cjsForcePaths` overrides.
      *
      * Legacy keys are removed in this API version:
      * - top-level `nodeCompat`

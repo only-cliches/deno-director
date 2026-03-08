@@ -75,6 +75,34 @@ describe("DenoWorker nodeJs modules/runtime interop", () => {
     }
   });
 
+  it("nodeJs:true shorthand enables Node module resolution", async () => {
+    await writeFile(
+      path.join(dir, "node_modules", "my_cjs_pkg", "package.json"),
+      JSON.stringify({ name: "my_cjs_pkg", version: "1.0.0", main: "main.js" }, null, 2)
+    );
+    await writeFile(
+      path.join(dir, "node_modules", "my_cjs_pkg", "main.js"),
+      `module.exports = { y: 789 };\n`
+    );
+
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: true,
+    });
+
+    try {
+      const code = `
+        import pkg from "my_cjs_pkg";
+        const { y } = pkg;
+        export const out = y;
+      `;
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: 789 });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
   it("nodeJs.modules resolves bare packages without runtime mode", async () => {
     const dw = createTestWorker({
       cwd: dir,
@@ -164,6 +192,79 @@ describe("DenoWorker nodeJs modules/runtime interop", () => {
       `;
 
       await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "module" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeJs:true: package.json module ESM entry is not CJS-wrapped", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: true,
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "websocket_like", "package.json"),
+        JSON.stringify(
+          {
+            name: "websocket_like",
+            version: "1.0.0",
+            main: "dist/cjs/src/index.js",
+            module: "dist/esm/src/index.js",
+          },
+          null,
+          2
+        )
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "websocket_like", "dist", "esm", "src", "index.js"),
+        `export*from "./inner.js";\n`
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "websocket_like", "dist", "esm", "src", "inner.js"),
+        `export const marker = "esm-ok";\n`
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "websocket_like", "dist", "cjs", "src", "index.js"),
+        `module.exports = { marker: "cjs-fallback" };\n`
+      );
+
+      const code = `
+        import { marker } from "websocket_like";
+        export const out = marker;
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "esm-ok" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeJs:true: .ts package entry using CJS patterns is CJS-wrapped", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: true,
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "pkg_ts_cjs", "package.json"),
+        JSON.stringify({ name: "pkg_ts_cjs", version: "1.0.0", main: "index.ts" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "pkg_ts_cjs", "index.ts"),
+        `module.exports = { marker: "ts-cjs-ok" };\n`
+      );
+
+      const code = `
+        import pkg from "pkg_ts_cjs";
+        export const out = pkg.marker;
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "ts-cjs-ok" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -755,6 +856,70 @@ exports.base = path.basename("/tmp/a.txt");
       `;
 
       await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "a.txt" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeJs.cjsForcePaths supports glob patterns", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: {
+        modules: true,
+        runtime: true,
+        cjsInterop: true,
+        cjsForcePaths: ["node_modules/pkg_force_glob/*"],
+      },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "pkg_force_glob", "package.json"),
+        JSON.stringify({ name: "pkg_force_glob", version: "1.0.0", module: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "pkg_force_glob", "index.js"),
+        `module.exports = { forced: "glob-ok" };\n`
+      );
+
+      const code = `
+        import pkg from "pkg_force_glob";
+        export const out = pkg.forced;
+      `;
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "glob-ok" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeJs.cjsForcePaths supports regex patterns", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: {
+        modules: true,
+        runtime: true,
+        cjsInterop: true,
+        cjsForcePaths: [/pkg_force_regex\/index\.js$/],
+      },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "pkg_force_regex", "package.json"),
+        JSON.stringify({ name: "pkg_force_regex", version: "1.0.0", module: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "pkg_force_regex", "index.js"),
+        `module.exports = { forced: "regex-ok" };\n`
+      );
+
+      const code = `
+        import pkg from "pkg_force_regex";
+        export const out = pkg.forced;
+      `;
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "regex-ok" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }

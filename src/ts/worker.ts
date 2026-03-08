@@ -1,9 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join as joinPath } from "node:path";
+import { basename, isAbsolute, join as joinPath, resolve as resolvePath } from "node:path";
 import { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { nativeAddon } from "./native";
@@ -732,6 +732,8 @@ class StreamReaderImpl implements DenoWorkerStreamReader {
 }
 
 export class DenoWorker {
+    /** Stable host-side worker id used for correlation and default cwd derivation. */
+    readonly id: string;
     private native: NativeWorker;
     private closePromise: Promise<void> | null = null;
     private closed = false;
@@ -1794,6 +1796,49 @@ export class DenoWorker {
         return out;
     }
 
+    private static defaultInternalCwd(workerId: string): string {
+        return joinPath(tmpdir(), "deno-director", "sandbox", workerId);
+    }
+
+    private static resolveCwdOnce(pathLike: string): string {
+        const raw = String(pathLike ?? "").trim();
+        if (!raw) return raw;
+        if (raw.startsWith("file://")) {
+            try {
+                return fileURLToPath(raw);
+            } catch {
+                return raw;
+            }
+        }
+        return isAbsolute(raw) ? raw : resolvePath(raw);
+    }
+
+    private static prepareCreationOptions(options: DenoWorkerOptions | undefined, workerId: string): DenoWorkerOptions | undefined {
+        if (!options) return undefined;
+        const out: DenoWorkerOptions = { ...options };
+        const raw = typeof out.cwd === "string" ? out.cwd.trim() : "";
+        if (!raw) {
+            const generated = DenoWorker.defaultInternalCwd(workerId);
+            try {
+                mkdirSync(generated, { recursive: true });
+            } catch (e) {
+                throw new Error(`Failed to create internal default cwd: ${generated} (${String((e as any)?.message ?? e)})`);
+            }
+            out.cwd = generated;
+            return out;
+        }
+
+        const resolved = DenoWorker.resolveCwdOnce(raw);
+        if (!existsSync(resolved)) {
+            throw new Error(`configured cwd does not exist: ${resolved}`);
+        }
+        if (!lstatSync(resolved).isDirectory()) {
+            throw new Error(`configured cwd is not a directory: ${resolved}`);
+        }
+        out.cwd = resolved;
+        return out;
+    }
+
     private configuredCwdFallback(): string {
         const raw = this.creationOptions?.cwd;
         const cwd = typeof raw === "string" ? raw.trim() : "";
@@ -1817,7 +1862,14 @@ export class DenoWorker {
     }
 
     private async cwdSet(pathLike: string): Promise<string> {
-        const cwd = this.normalizeCwdInput(pathLike);
+        const raw = this.normalizeCwdInput(pathLike);
+        const cwd = DenoWorker.resolveCwdOnce(raw);
+        if (!existsSync(cwd)) {
+            throw new Error(`configured cwd does not exist: ${cwd}`);
+        }
+        if (!lstatSync(cwd).isDirectory()) {
+            throw new Error(`configured cwd is not a directory: ${cwd}`);
+        }
         const nextOptions: DenoWorkerOptions = { ...(this.creationOptions ?? {}), cwd };
         this.creationOptions = nextOptions;
         this.nativeOptions = this.createNativeOptions(nextOptions);
@@ -2654,8 +2706,10 @@ export class DenoWorker {
      * Async APIs wait for that startup phase; `evalSync` throws until startup globals finish.
      */
     constructor(options?: DenoWorkerOptions) {
-        this.lifecycleHooks = options?.lifecycle;
-        this.creationOptions = options;
+        this.id = `w-${randomUUID()}`;
+        const preparedOptions = DenoWorker.prepareCreationOptions(options, this.id);
+        this.lifecycleHooks = preparedOptions?.lifecycle;
+        this.creationOptions = preparedOptions;
         const self = this;
         const statsApi = {} as DenoWorkerStatsApi;
         Object.defineProperty(statsApi, "activeOps", {
@@ -2711,18 +2765,19 @@ export class DenoWorker {
             return coerceMemoryPayload(raw);
         };
         this.statsApi = statsApi;
-        const sourceLoadersOpt = options?.sourceLoaders;
+        const sourceLoadersOpt = preparedOptions?.sourceLoaders;
         this.loadersStrictJsOnly = sourceLoadersOpt === false;
         this.loaderTransforms = Array.isArray(sourceLoadersOpt)
             ? sourceLoadersOpt.filter((x): x is DenoLoaderTransform => typeof x === "function")
             : [];
-        this.nativeOptions = this.createNativeOptions(options);
-        const parsedMaxHandle = Number((options as any)?.limits?.maxHandle);
+        this.nativeOptions = this.createNativeOptions(preparedOptions);
+        const parsedMaxHandle = Number((preparedOptions as any)?.limits?.maxHandle);
         this.maxHandle =
             Number.isFinite(parsedMaxHandle) && parsedMaxHandle >= 1
                 ? Math.trunc(parsedMaxHandle)
                 : HANDLE_DEFAULT_MAX;
-        const rawBridge: any = options && typeof options === "object" ? (options as any).bridge : undefined;
+        const rawBridge: any =
+            preparedOptions && typeof preparedOptions === "object" ? (preparedOptions as any).bridge : undefined;
         const parsedWindow = Number(rawBridge?.streamWindowBytes);
         const parsedFlush = Number(rawBridge?.streamCreditFlushBytes);
         const parsedBacklogLimit = Number(rawBridge?.streamBacklogLimit);
@@ -2745,11 +2800,11 @@ export class DenoWorker {
                 : this.streamWindowBytes;
         this.streamSlotPoolTarget = STREAM_SLOT_POOL_MIN;
         this.resizeStreamSlotPool(this.streamSlotPoolTarget);
-        this.invokeHook("beforeStart", { options });
+        this.invokeHook("beforeStart", { options: preparedOptions });
         this.native = this.createNative(false);
         this.nativeEpoch += 1;
         this.bindNativeEvents(this.native, this.nativeEpoch);
-        this.initializeStartup(options?.globals, options?.modules);
+        this.initializeStartup(preparedOptions?.globals, preparedOptions?.modules);
         this.invokeHook("afterStart");
     }
 

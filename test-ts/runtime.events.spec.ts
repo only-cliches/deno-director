@@ -40,6 +40,42 @@ describe("DenoWorker runtime events", () => {
     }
   });
 
+  test("emits import.classified with parser-backed CJS decision", async () => {
+    const dw = createTestWorker({
+      imports: true,
+      cwd: process.cwd(),
+      nodeJs: true,
+    });
+    const events: any[] = [];
+    dw.on("runtime", (e) => events.push(e));
+
+    try {
+      await expect(
+        dw.module.eval(`
+          import { WebsocketBuilder } from "websocket-ts";
+          export const out = typeof WebsocketBuilder;
+        `),
+      ).resolves.toMatchObject({ out: "function" });
+
+      const classified = events.find(
+        (e) =>
+          e.kind === "import.classified" &&
+          (
+            /websocket-ts/.test(String(e.specifier ?? "")) ||
+            /websocket-ts/.test(String(e.resolvedSpecifier ?? ""))
+          ),
+      );
+      expect(classified).toBeTruthy();
+      expect(typeof classified.cjs).toBe("boolean");
+      expect(typeof classified.esm).toBe("boolean");
+      expect(classified.parser).toBe("deno_ast");
+      expect(typeof classified.cacheHit).toBe("boolean");
+      expect(classified.wrappedAsCjs).toBe(false);
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("emits handle create/call/dispose runtime events", async () => {
     const dw = createTestWorker();
     const events: any[] = [];

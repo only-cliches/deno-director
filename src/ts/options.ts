@@ -174,12 +174,28 @@ function normalizeModuleLoaderOption(x: unknown): unknown {
 
 /** Normalizes the top-level `nodeJs` compatibility bundle. */
 function normalizeNodeJsOption(x: unknown): unknown {
+    if (x === true) return { modules: true, runtime: true, cjsInterop: true };
+    if (x === false || x == null) return undefined;
     if (!x || typeof x !== "object") return undefined;
     const o: any = x as any;
     const out: any = {};
     if (typeof o.modules === "boolean") out.modules = o.modules;
     if (typeof o.runtime === "boolean") out.runtime = o.runtime;
     if (typeof o.cjsInterop === "boolean") out.cjsInterop = o.cjsInterop;
+    const cjsForceRaw = (o as any).cjsForcePaths;
+    if (Array.isArray(cjsForceRaw)) {
+        const items: any[] = [];
+        for (const it of cjsForceRaw) {
+            if (typeof it === "string" && it.trim().length > 0) {
+                items.push(it.trim());
+                continue;
+            }
+            if (it instanceof RegExp) {
+                items.push({ regex: it.source, flags: it.flags });
+            }
+        }
+        if (items.length > 0) out.cjsForcePaths = items;
+    }
     return Object.keys(out).length ? out : undefined;
 }
 

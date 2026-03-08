@@ -21,7 +21,7 @@ You get one process, two ecosystems, and clean runtime seperation.
 * **Host function bridging:** inject Node functions into Deno and call them from sandboxed code, sync or async.
 * **Real sandbox controls:** enforce `read`, `write`, `net`, `env`, `run`, `ffi`, `sys`, `import`, `hrtime`, and `wasm` permissions per worker.
 * **TS/JSX first-class:** run TypeScript and TSX through `eval`, `evalSync`, and module APIs with built-in transpilation.
-* **Node-style module compatibility:** use centralized `nodeJs` config (`modules`, `runtime`, `cjsInterop`) for near-full Node package/runtime interop.
+* **NodeJS compatibility:** enjoy NodeJ support across module resolution, runtime behavior, and CommonJS interop.
 * **Fast stream transport:** push bytes through `worker.stream.connect(...)` when message-style APIs are not enough.
 * **Handles and global ops:** mutate and inspect runtime object graphs through `worker.handle.*` and `worker.global.*` APIs.
 * **Fleet controls:** orchestrate large runtime pools with `DenoDirector`.
@@ -486,6 +486,13 @@ const runtimeOut = await runtimeWorker.module.eval(`
 console.log(runtimeOut.out); // "a/b" (platform separators may vary)
 
 await runtimeWorker.close();
+
+// Example 3: shorthand (enable all Node modes)
+const allNodeWorker = new DenoWorker({
+  imports: true,
+  nodeJs: true, // same as { modules: true, runtime: true, cjsInterop: true }
+});
+await allNodeWorker.close();
 ```
 
 ### 📦 CommonJS Interop (`cjsInterop`)
@@ -518,12 +525,36 @@ await worker.close();
 
 Interop semantics:
 - `nodeJs.cjsInterop` is boolean-only (`true` = enabled, `false`/omitted = disabled).
+- `nodeJs: true` is shorthand for enabling `modules`, `runtime`, and `cjsInterop`.
+- CJS detection is parser-backed and best effort, not guaranteed full Node parity for every package shape.
 - Default import follows Node CJS interop semantics (`default` is the full `module.exports` value).
 - `exports.default` (when present in transpiled CJS) remains nested at `default.default`.
-- CJS heavy Babel paths are shimmed for runtime stability (`@babel/parser`, `@babel/generator`).
+
+Force overrides (`nodeJs.cjsForcePaths`):
+- Use this when detection is ambiguous and you need deterministic CJS treatment.
+- Supports literal paths, glob patterns, and regex.
+- Relative path/glob entries resolve from worker `cwd`.
+
+```ts
+const worker = new DenoWorker({
+  cwd: process.cwd(),
+  imports: true,
+  nodeJs: {
+    modules: true,
+    runtime: true,
+    cjsInterop: true,
+    cjsForcePaths: [
+      "node_modules/some_package/index.js", // literal
+      "node_modules/some_package/*",        // glob
+      /node_modules\/legacy-.*\/dist\/.+\.js$/, // regex
+    ],
+  },
+});
+```
 
 Compatibility scope:
-- For module loading and package usage, this is near-full Node-style behavior (`nodeJs.modules` + `nodeJs.runtime` + `nodeJs.cjsInterop`).
+- For module loading and package usage, this targets broad Node-style behavior (`nodeJs.modules` + `nodeJs.runtime` + `nodeJs.cjsInterop`).
+- `cjsInterop` is best effort; use `nodeJs.cjsForcePaths` when deterministic CJS classification is required.
 - Deno Director is still a Deno runtime in-process, so non-module Node internals may differ from a full Node runtime.
 
 ### 🧪 Custom Loaders in 20 Seconds
@@ -624,7 +655,7 @@ Permission note:
 
 ### 📁 Worker CWD API
 
-`cwd` is explicit-only. If omitted, worker uses internal sandbox cwd (`<tmp>/deno-director/sandbox`) instead of host `process.cwd()`.
+`cwd` is explicit-only. If omitted, worker uses a unique internal sandbox cwd (`<tmp>/deno-director/sandbox/w-<id>`) instead of host `process.cwd()`.
 
 ```ts
 import { DenoWorker } from "deno-director";
@@ -642,8 +673,9 @@ await hostCwdWorker.close();
 // 2) Internal/default sandbox cwd (use worker.cwd.get() for host file operations)
 // Note: `cwd: true` is not a valid option. Omit `cwd` to use internal sandbox cwd.
 const worker = new DenoWorker({ imports: true, permissions: { read: true, write: true } });
+console.log(worker.id); // stable worker id (used in default cwd path)
 const sandboxCwd = await worker.cwd.get();
-console.log(sandboxCwd); // "<tmp>/deno-director/sandbox"
+console.log(sandboxCwd); // "<tmp>/deno-director/sandbox/w-<id>"
 
 // add/remove files using the runtime cwd path
 const demoFile = path.join(sandboxCwd, "tmp-note.txt");
@@ -702,6 +734,8 @@ Clears a previously registered module by name.
 Imports a module specifier through the runtime import pipeline and returns a callable Proxy namespace to the exports.
 * `stream.connect(key: string): Promise<Duplex>`
 Opens a bidirectional stream session and returns a Node.js `Duplex` stream.
+* `id: string`
+Stable worker id for correlation (also used in default internal cwd suffix).
 * `cwd.get(): Promise<string>`
 Returns current worker cwd (runtime `Deno.cwd()` when running).
 * `cwd.set(path: string): Promise<string>`
@@ -816,7 +850,7 @@ type DenoWorkerOptions = {
     streamBacklogLimit?: number; // Max unaccepted worker->Node stream opens to backlog (default 256)
     streamHighWaterMarkBytes?: number; // Reader-side high water mark (defaults to streamWindowBytes)
   };
-  cwd?: string;                 // Optional sandbox root. Omitted => <tmp>/deno-director/sandbox. Provided path must exist.
+  cwd?: string;                 // Optional sandbox root. Omitted => unique <tmp>/deno-director/sandbox/w-<id>. Provided path must exist.
   startup?: string;             // Script evaluated before user code runs
   permissions?: boolean | {     // true=allow all, false=deny all, or per-capability config
     read?: boolean | string[];  // Allow read everywhere, or specific paths
@@ -832,10 +866,11 @@ type DenoWorkerOptions = {
   };
   env?: boolean | string | Record<string, string>; // true enables runtime env access, string=dotenv path, map=explicit values
   envFile?: string | boolean;   // true => load <cwd>/.env with warning when missing; string => resolve from cwd and error when missing
-  nodeJs?: {                    // Centralized Node compatibility controls
+  nodeJs?: true | {             // true => { modules: true, runtime: true, cjsInterop: true }
     modules?: boolean;          // Node-style module resolution
     runtime?: boolean;          // Node runtime compatibility behavior
     cjsInterop?: boolean;       // CJS execution + ESM facade interop
+    cjsForcePaths?: Array<string | RegExp>; // Force CJS for matching files (literal, glob, regex)
   };
   imports?: boolean | ImportsCallback; // Custom module resolution interceptor
   sourceLoaders?: false | Array<(ctx: { // process custom source loader values. jsx, tsx and ts handled by built-in loader

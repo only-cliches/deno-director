@@ -17,6 +17,12 @@ All notable changes to this project will be documented in this file.
   - CJS entry shims for `@babel/parser` and `@babel/generator` now route to host-backed parser/generator globals to avoid unsupported runtime Node-op paths.
 - Fixed severe import-time overhead on Linux/Fedora for large transpiled-CJS graphs:
   - removed subprocess-based CJS conversion paths and replaced them with in-process Node-style CJS facade generation.
+- Fixed `nodeJs: true` interop with packages that publish ESM via `package.json.module` (for example `websocket-ts`):
+  - module-entry `.js` files are now treated as ESM (not CJS-wrapped), including compact `export*from` source forms.
+- Fixed CJS detection accuracy under `nodeJs.cjsInterop` by moving wrap decisions to parser-backed classification:
+  - module syntax classification now uses `deno_ast` and caches by source-content hash (not file path).
+  - runtime emits `import.classified` with classification details (`cjs`, `esm`, parser/cache metadata, and wrap decision).
+  - added `nodeJs.cjsForcePaths` overrides (literal, glob, regex) to force CJS behavior for matched files.
 
 ### Changed
 - Added `worker.module.eval(..., { cjs: true })` for eval-source CommonJS support:
@@ -31,9 +37,13 @@ All notable changes to this project will be documented in this file.
 - Updated Node compatibility API surface:
   - introduced top-level `nodeJs` bundle with `{ modules, runtime, cjsInterop }`.
   - module/runtime/CJS knobs are now centralized under `nodeJs`.
+  - `nodeJs: true` shorthand now enables all three (`modules`, `runtime`, `cjsInterop`).
 - Added worker cwd runtime API:
   - `worker.cwd.get()` returns effective worker cwd.
   - `worker.cwd.set(path)` updates worker cwd and performs restart when worker is running.
+- Added public worker identity:
+  - `worker.id` exposes stable host-side worker id.
+  - default internal cwd now uses `worker.id` suffix (`<tmp>/deno-director/sandbox/<worker.id>`).
 - Added worker env runtime API:
   - `worker.env.get(key)` reads runtime env (or configured startup env when closed).
   - `worker.env.set(key, value)` updates runtime env and persists value for restart/next start.
@@ -46,8 +56,9 @@ All notable changes to this project will be documented in this file.
   - `envFile: "path"` remains strict: path resolves from cwd and errors when missing.
 - Updated cwd bootstrap semantics:
   - omitted `cwd` no longer falls back to host `process.cwd()`.
-  - default worker cwd is now internal sandbox path: `<tmp>/deno-director/sandbox`.
+  - default worker cwd is now unique internal sandbox path: `<tmp>/deno-director/sandbox/w-<id>`.
   - explicit `cwd` values must exist as directories; missing/invalid cwd now fails worker startup.
+  - relative `cwd` values are resolved once at assignment time and remain stable across restarts.
 - Expanded startup module registration input:
   - `DenoWorkerOptions.modules` now accepts either `Record<string, ...>` or `Map<string, ...>` entries.
 - Improved internal virtual module URL readability for named registry entries:
@@ -59,9 +70,15 @@ All notable changes to this project will be documented in this file.
 - Added Jest coverage for `imports` callback string-shorthand returns with loader-transform parity.
 - Added Rust unit coverage for readable named virtual specifier formatting.
 - Added Jest coverage for `module.eval` runtime event/error telemetry.
+- Added runtime event coverage for parser-backed import classification (`import.classified`).
 - Updated node-compat resolve tests to assert directory subpath resolution (`package.json` entry and `index.*` fallback).
 - Added node-compat resolve coverage for CJS interop behavior (`cjsInterop` enabled/disabled and string-mode ignored) and Node-style default/namespace import semantics.
+- Added node-compat resolve coverage for `nodeJs.cjsForcePaths` override matching:
+  - literal path entries,
+  - glob entries (for example `node_modules/pkg/*`),
+  - regex entries.
 - Added coverage for new `nodeJs` API path (`modules`, `runtime`, `cjsInterop`) across module-resolution and env-runtime parity tests.
+- Added coverage for `nodeJs: true` shorthand behavior in module-resolution and runtime-env parity tests.
 - Added modules API coverage for constructor-time `modules: Map(...)` startup entries.
 - Added coverage for new cwd API behavior (`worker.cwd.get/set`) including closed-worker update + restart flow.
 - Added cwd bootstrap coverage for:
@@ -83,7 +100,7 @@ All notable changes to this project will be documented in this file.
 - Added Rust unit coverage for Node-style CJS facade generation:
   - named export detection from `exports.*`, `module.exports.*`, `defineProperty`, and object-literal assignment patterns,
   - wrapper source generation with `module`/`exports` runtime and require-map shim,
-  - CJS wrap decision by extension and nearest `package.json` `type`.
+  - CJS wrap decision by extension, nearest `package.json` `type`, and `package.json.module` entry behavior.
 
 ### Breaking Changes
 - Replaced legacy Node compatibility option keys with a centralized top-level bundle:
@@ -94,6 +111,7 @@ All notable changes to this project will be documented in this file.
 
 ### Docs & Examples
 - Updated README Node compatibility documentation to the new centralized `nodeJs` API.
+- Updated README + TS doc comments to clarify `nodeJs.cjsInterop` is best effort and to recommend `nodeJs.cjsForcePaths` for deterministic overrides.
 - Updated `examples/07-node-resolve.ts` to use `nodeJs`.
 - Added `examples/15-nodejs-cjs-interop.ts` showing `nodeJs` + CJS package interop.
 - Added README usage docs for `worker.cwd.get/set`.

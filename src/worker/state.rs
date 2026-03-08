@@ -91,6 +91,13 @@ pub enum CjsInteropMode {
 }
 
 #[derive(Debug, Clone)]
+pub enum CjsForcePathRule {
+    Literal(String),
+    Glob(String),
+    Regex { source: String, flags: String },
+}
+
+#[derive(Debug, Clone)]
 pub struct ModuleLoaderConfig {
     pub https_resolve: bool,
     pub http_resolve: bool,
@@ -102,6 +109,7 @@ pub struct ModuleLoaderConfig {
     pub cache_dir: Option<String>,
     pub reload: bool,
     pub max_payload_bytes: i64,
+    pub cjs_force_paths: Vec<CjsForcePathRule>,
 }
 
 impl Default for ModuleLoaderConfig {
@@ -119,6 +127,7 @@ impl Default for ModuleLoaderConfig {
             reload: false,
             // 10 MiB default cap for remote module payloads.
             max_payload_bytes: 10 * 1024 * 1024,
+            cjs_force_paths: Vec::new(),
         }
     }
 }
@@ -267,6 +276,14 @@ fn resolve_env_path(base_cwd: &Path, raw: &str) -> PathBuf {
 fn canonicalize_or_lexical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(path))
+}
+
+// Default internal worker cwd (unique per worker options parse).
+fn default_internal_cwd() -> PathBuf {
+    std::env::temp_dir()
+        .join("deno-director")
+        .join("sandbox")
+        .join(format!("w-{}", uuid::Uuid::new_v4()))
 }
 
 // Checks whether base dir and returns the boolean result for worker configuration/state parsing and runtime limits.
@@ -528,6 +545,17 @@ impl WorkerCreateOptions {
                     out.runtime_options.cwd = Some(resolved.to_string_lossy().to_string());
                 }
             }
+        }
+        if out.runtime_options.cwd.is_none() {
+            let generated = default_internal_cwd();
+            if let Err(e) = std::fs::create_dir_all(&generated) {
+                return cx.throw_error(format!(
+                    "failed to create default cwd: {} ({})",
+                    generated.to_string_lossy(),
+                    e
+                ));
+            }
+            out.runtime_options.cwd = Some(generated.to_string_lossy().to_string());
         }
 
         // `startup`.
@@ -838,9 +866,29 @@ impl WorkerCreateOptions {
             }
         }
 
-        // `nodeJs`: { modules?: boolean, runtime?: boolean, cjsInterop?: boolean }.
+        // `nodeJs`: true | { modules?: boolean, runtime?: boolean, cjsInterop?: boolean, cjsForcePaths?: Array<string|RegExp> }.
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeJs") {
-            if let Ok(o) = v.downcast::<JsObject, _>(cx) {
+            if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
+                if b.value(cx) {
+                    out.runtime_options.node_resolve = true;
+                    out.runtime_options.node_compat = true;
+                    let cfg = out
+                        .runtime_options
+                        .module_loader
+                        .get_or_insert_with(Default::default);
+                    cfg.node_resolve = true;
+                    cfg.cjs_interop = CjsInteropMode::Node;
+                } else {
+                    out.runtime_options.node_resolve = false;
+                    out.runtime_options.node_compat = false;
+                    let cfg = out
+                        .runtime_options
+                        .module_loader
+                        .get_or_insert_with(Default::default);
+                    cfg.node_resolve = false;
+                    cfg.cjs_interop = CjsInteropMode::Disabled;
+                }
+            } else if let Ok(o) = v.downcast::<JsObject, _>(cx) {
                 if let Ok(mv) = o.get::<JsValue, _, _>(cx, "modules") {
                     if let Ok(mb) = mv.downcast::<JsBoolean, _>(cx) {
                         out.runtime_options.node_resolve = mb.value(cx);
@@ -869,6 +917,61 @@ impl WorkerCreateOptions {
                         } else {
                             CjsInteropMode::Disabled
                         };
+                    }
+                }
+
+                if let Ok(fv) = o.get::<JsValue, _, _>(cx, "cjsForcePaths")
+                    && let Ok(arr) = fv.downcast::<JsArray, _>(cx)
+                {
+                    let len = arr.len(cx);
+                    let cfg = out
+                        .runtime_options
+                        .module_loader
+                        .get_or_insert_with(Default::default);
+                    for i in 0..len {
+                        if let Ok(entry) = arr.get::<JsValue, _, _>(cx, i) {
+                            if let Ok(s) = entry.downcast::<JsString, _>(cx) {
+                                let raw = s.value(cx);
+                                let t = raw.trim();
+                                if t.is_empty() {
+                                    continue;
+                                }
+                                let is_glob = t.contains('*')
+                                    || t.contains('?')
+                                    || t.contains('[')
+                                    || t.contains(']')
+                                    || t.contains('{')
+                                    || t.contains('}');
+                                if is_glob {
+                                    cfg.cjs_force_paths
+                                        .push(CjsForcePathRule::Glob(t.to_string()));
+                                } else {
+                                    cfg.cjs_force_paths
+                                        .push(CjsForcePathRule::Literal(t.to_string()));
+                                }
+                                continue;
+                            }
+
+                            if let Ok(obj) = entry.downcast::<JsObject, _>(cx)
+                                && let Ok(rv) = obj.get::<JsValue, _, _>(cx, "regex")
+                                && let Ok(rs) = rv.downcast::<JsString, _>(cx)
+                            {
+                                let source = rs.value(cx).trim().to_string();
+                                if source.is_empty() {
+                                    continue;
+                                }
+                                let flags = obj
+                                    .get::<JsValue, _, _>(cx, "flags")
+                                    .ok()
+                                    .and_then(|f| f.downcast::<JsString, _>(cx).ok())
+                                    .map(|s| s.value(cx))
+                                    .unwrap_or_default();
+                                cfg.cjs_force_paths.push(CjsForcePathRule::Regex {
+                                    source,
+                                    flags,
+                                });
+                            }
+                        }
                     }
                 }
             }

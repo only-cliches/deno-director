@@ -57,4 +57,15 @@ describe("deno_worker: nodeJs.runtime env parity", () => {
     await expect(dw.eval(`process.env["${denied}"]`)).rejects.toBeTruthy();
     await expect(dw.eval(`process.env["${denied}"] = "x"`)).rejects.toBeTruthy();
   });
+
+  test("nodeJs:true shorthand enables runtime process.env parity", async () => {
+    const dw = createTestWorker({
+      nodeJs: true,
+      permissions: { env: true },
+    });
+    workers.push(dw);
+
+    await dw.eval(`Deno.env.set("${key}", "from-deno-shorthand")`);
+    await expect(dw.eval(`process.env["${key}"]`)).resolves.toBe("from-deno-shorthand");
+  });
 });

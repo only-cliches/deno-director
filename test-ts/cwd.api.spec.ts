@@ -44,6 +44,7 @@ describe("deno_worker: cwd api", () => {
       const got = await dw.cwd.get();
       expect(path.resolve(got)).not.toBe(path.resolve(process.cwd()));
       expect(got).toContain(`${path.sep}deno-director${path.sep}sandbox`);
+      expect(got).toContain(dw.id);
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -94,5 +95,28 @@ describe("deno_worker: cwd api", () => {
   test("explicit cwd must exist", async () => {
     const missing = path.join(os.tmpdir(), `denojs-worker-cwd-missing-${Date.now()}`);
     expect(() => createTestWorker({ cwd: missing, imports: true })).toThrow(/configured cwd does not exist/i);
+  });
+
+  test("relative cwd is resolved once and remains stable across restart", async () => {
+    const root = await mkTempDir("denojs-worker-cwd-root-");
+    const relName = "runtime-dir";
+    const relDir = path.join(root, relName);
+    await fs.mkdir(relDir, { recursive: true });
+    const originalHostCwd = process.cwd();
+    let dw: ReturnType<typeof createTestWorker> | undefined;
+    try {
+      process.chdir(root);
+      dw = createTestWorker({ cwd: relName, imports: true });
+      const first = await dw.cwd.get();
+      expect(path.resolve(first)).toBe(path.resolve(relDir));
+      process.chdir(os.tmpdir());
+      await dw.restart();
+      const second = await dw.cwd.get();
+      expect(path.resolve(second)).toBe(path.resolve(relDir));
+    } finally {
+      process.chdir(originalHostCwd);
+      if (dw && !dw.isClosed()) await dw.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });

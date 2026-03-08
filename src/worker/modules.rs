@@ -3,6 +3,7 @@ use deno_runtime::deno_core::{self, ModuleLoader, ModuleSource, ModuleType};
 use deno_runtime::transpile::{JsParseDiagnostic, JsTranspileError};
 
 use crate::worker::messages::NodeMsg;
+use crate::worker::state::CjsForcePathRule;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -16,8 +17,18 @@ use std::sync::{
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use regex::Regex;
 
 use deno_core::url::Url;
+
+#[derive(Clone, Debug)]
+struct ModuleSyntaxClassification {
+    cjs: bool,
+    esm: bool,
+    parse_ok: bool,
+    parse_error: Option<String>,
+    cache_hit: bool,
+}
 
 enum CallbackDecisionWait {
     Decision(crate::worker::messages::ImportDecision),
@@ -383,6 +394,8 @@ pub struct DynamicModuleLoader {
 }
 
 impl DynamicModuleLoader {
+    const MODULE_SYNTAX_CACHE_LIMIT: usize = 8192;
+
     // Returns the shared HTTP client used for remote module fetches.
     fn shared_http_client() -> Result<&'static reqwest::Client, JsErrorBox> {
         static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
@@ -765,6 +778,42 @@ impl DynamicModuleLoader {
         }));
     }
 
+    // Emits `import.classified` event.
+    fn emit_import_classified(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        is_dynamic_import: bool,
+        resolved_specifier: &str,
+        source: &str,
+        wrapped_as_cjs: bool,
+        forced_cjs: bool,
+        force_match: Option<&str>,
+        classification: &ModuleSyntaxClassification,
+    ) {
+        self.emit_runtime_event(serde_json::json!({
+            "kind": "import.classified",
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            "specifier": specifier,
+            "referrer": referrer,
+            "isDynamicImport": is_dynamic_import,
+            "resolvedSpecifier": resolved_specifier,
+            "source": source,
+            "wrappedAsCjs": wrapped_as_cjs,
+            "forcedCjs": forced_cjs,
+            "forceMatch": force_match,
+            "cjs": classification.cjs,
+            "esm": classification.esm,
+            "parseOk": classification.parse_ok,
+            "cacheHit": classification.cache_hit,
+            "parser": "deno_ast",
+            "parseError": classification.parse_error
+        }));
+    }
+
     // Extracts original specifier/referrer from wrapped resolve URLs when present.
     fn original_spec_and_referrer(
         module_specifier: &Url,
@@ -880,7 +929,24 @@ impl DynamicModuleLoader {
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_else(|| "js".to_string());
-            if self.should_wrap_file_as_cjs(&path, &ext) {
+            let classification = self.classify_module_source(&path, &ext, &source);
+            let force_match = self.match_forced_cjs_rule(&path);
+            let should_wrap = force_match.is_some()
+                || self.should_wrap_file_as_cjs(&path, &ext, &classification);
+            let (orig_specifier, orig_referrer) =
+                Self::original_spec_and_referrer(&requested_specifier, maybe_referrer_owned.as_ref());
+            self.emit_import_classified(
+                &orig_specifier,
+                &orig_referrer,
+                options.is_dynamic_import,
+                resolved.as_str(),
+                "fs",
+                should_wrap,
+                force_match.is_some(),
+                force_match.as_deref(),
+                &classification,
+            );
+            if should_wrap {
                 if let Some(proxy) =
                     self.build_node_cjs_interop_module(&requested_specifier, &resolved, &source)
                 {
@@ -1412,6 +1478,22 @@ impl DynamicModuleLoader {
         chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
     }
 
+    // Returns nearest package root and parsed package.json if found.
+    fn nearest_package_json(path: &Path) -> Option<(PathBuf, serde_json::Value)> {
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            let pkg_json = dir.join("package.json");
+            if pkg_json.is_file() {
+                let parsed = std::fs::read_to_string(&pkg_json)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())?;
+                return Some((dir.to_path_buf(), parsed));
+            }
+            current = dir.parent();
+        }
+        None
+    }
+
     // Returns true when nearest package.json declares `type: "module"` for the path.
     fn js_file_is_package_module(path: &Path) -> bool {
         static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
@@ -1425,10 +1507,8 @@ impl DynamicModuleLoader {
 
             let pkg_json = dir.join("package.json");
             if pkg_json.is_file() {
-                let is_module = std::fs::read_to_string(&pkg_json)
-                    .ok()
-                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                let is_module = Self::nearest_package_json(path)
+                    .and_then(|(_, v)| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
                     .map(|ty| ty.trim().eq_ignore_ascii_case("module"))
                     .unwrap_or(false);
                 if let Ok(mut c) = cache.lock() {
@@ -1441,17 +1521,265 @@ impl DynamicModuleLoader {
         false
     }
 
+    // Returns true when nearest package.json `module` entry maps to this path.
+    fn js_file_is_package_module_entry(path: &Path) -> bool {
+        let Some((pkg_root, pkg)) = Self::nearest_package_json(path) else {
+            return false;
+        };
+        let Some(module_entry) = pkg.get("module").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let target = pkg_root.join(module_entry);
+        match (path.canonicalize(), target.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => path == target,
+        }
+    }
+
+    // Checks whether source appears to use CommonJS patterns.
+    fn looks_like_cjs_source(source: &str) -> bool {
+        source.contains("module.exports")
+            || source.contains("exports.")
+            || source.contains("exports[")
+            || source.contains("require(")
+            || source.contains("Object.defineProperty(exports")
+    }
+
+    // Normalizes a path for cross-platform path/glob/regex matching.
+    fn normalized_path_for_match(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    // Resolves user-provided force path/glob entry to absolute-like path when relative.
+    fn resolve_force_entry_path(&self, entry: &str) -> String {
+        let p = PathBuf::from(entry);
+        let out = if p.is_absolute() {
+            p
+        } else {
+            self.sandbox_root.join(p)
+        };
+        Self::normalized_path_for_match(&out)
+    }
+
+    // Compiles a regex pattern using JS-like flags (best effort).
+    fn compile_js_regex(source: &str, flags: &str) -> Option<Regex> {
+        let mut prefix = String::new();
+        if flags.contains('i') {
+            prefix.push_str("(?i)");
+        }
+        if flags.contains('m') {
+            prefix.push_str("(?m)");
+        }
+        if flags.contains('s') {
+            prefix.push_str("(?s)");
+        }
+        if flags.contains('x') {
+            prefix.push_str("(?x)");
+        }
+        let full = format!("{prefix}{source}");
+        Regex::new(&full).ok()
+    }
+
+    // Attempts to match configured forced-CJS rule for this path.
+    fn match_forced_cjs_rule(&self, path: &Path) -> Option<String> {
+        let cfg = self.module_loader_cfg();
+        if cfg.cjs_force_paths.is_empty() {
+            return None;
+        }
+        let normalized_path = Self::normalized_path_for_match(path);
+        for rule in cfg.cjs_force_paths {
+            match rule {
+                CjsForcePathRule::Literal(raw) => {
+                    let target = self.resolve_force_entry_path(&raw);
+                    if normalized_path == target {
+                        return Some(format!("literal:{raw}"));
+                    }
+                    if normalized_path.starts_with(&target)
+                        && normalized_path
+                            .as_bytes()
+                            .get(target.len())
+                            .map(|b| *b == b'/')
+                            .unwrap_or(false)
+                    {
+                        return Some(format!("literal-prefix:{raw}"));
+                    }
+                }
+                CjsForcePathRule::Glob(raw) => {
+                    let pattern = self.resolve_force_entry_path(&raw);
+                    static GLOB_CACHE: OnceLock<Mutex<HashMap<String, Option<globset::GlobMatcher>>>> =
+                        OnceLock::new();
+                    let cache = GLOB_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                    let compiled = if let Ok(mut c) = cache.lock() {
+                        if let Some(hit) = c.get(&pattern) {
+                            hit.clone()
+                        } else {
+                            let built = globset::Glob::new(&pattern)
+                                .ok()
+                                .map(|g| g.compile_matcher());
+                            c.insert(pattern.clone(), built.clone());
+                            built
+                        }
+                    } else {
+                        globset::Glob::new(&pattern)
+                            .ok()
+                            .map(|g| g.compile_matcher())
+                    };
+                    if let Some(m) = compiled
+                        && m.is_match(&normalized_path)
+                    {
+                        return Some(format!("glob:{raw}"));
+                    }
+                }
+                CjsForcePathRule::Regex { source, flags } => {
+                    static REGEX_CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> =
+                        OnceLock::new();
+                    let cache = REGEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                    let key = format!("{source}::{flags}");
+                    let compiled = if let Ok(mut c) = cache.lock() {
+                        if let Some(hit) = c.get(&key) {
+                            hit.clone()
+                        } else {
+                            let built = Self::compile_js_regex(&source, &flags);
+                            c.insert(key.clone(), built.clone());
+                            built
+                        }
+                    } else {
+                        Self::compile_js_regex(&source, &flags)
+                    };
+                    if let Some(re) = compiled
+                        && re.is_match(&normalized_path)
+                    {
+                        return Some(format!("regex:/{source}/{flags}"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Classifies module syntax using parser-backed analysis with source-content cache.
+    fn classify_module_source(
+        &self,
+        path: &Path,
+        ext: &str,
+        source: &str,
+    ) -> ModuleSyntaxClassification {
+        static CACHE: OnceLock<Mutex<HashMap<u64, ModuleSyntaxClassification>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+        let media_type = Self::media_type_for_ext(ext);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{media_type:?}").hash(&mut hasher);
+        source.hash(&mut hasher);
+        let key = hasher.finish();
+
+        if let Ok(c) = cache.lock()
+            && let Some(hit) = c.get(&key).cloned()
+        {
+            return ModuleSyntaxClassification {
+                cache_hit: true,
+                ..hit
+            };
+        }
+
+        let specifier = Url::from_file_path(path)
+            .ok()
+            .or_else(|| Url::parse("file:///__denojs_worker_syntax_probe__.js").ok())
+            .expect("fallback file url");
+
+        let computed = match deno_ast::parse_program(deno_ast::ParseParams {
+            specifier,
+            text: source.into(),
+            media_type,
+            capture_tokens: false,
+            scope_analysis: false,
+            maybe_syntax: None,
+        }) {
+            Ok(parsed) => {
+                let esm = !parsed.compute_is_script();
+                let cjs_analysis = parsed.analyze_cjs();
+                let cjs =
+                    !esm && (!cjs_analysis.exports.is_empty() || !cjs_analysis.reexports.is_empty() || Self::looks_like_cjs_source(source));
+                ModuleSyntaxClassification {
+                    cjs,
+                    esm,
+                    parse_ok: true,
+                    parse_error: None,
+                    cache_hit: false,
+                }
+            }
+            Err(err) => {
+                // Fallback when parser cannot process source; preserve old behavior.
+                let esm = Self::looks_like_esm_source(source);
+                let cjs = !esm && Self::looks_like_cjs_source(source);
+                ModuleSyntaxClassification {
+                    cjs,
+                    esm,
+                    parse_ok: false,
+                    parse_error: Some(err.to_string()),
+                    cache_hit: false,
+                }
+            }
+        };
+
+        if let Ok(mut c) = cache.lock() {
+            if c.len() >= Self::MODULE_SYNTAX_CACHE_LIMIT {
+                c.clear();
+            }
+            c.insert(
+                key,
+                ModuleSyntaxClassification {
+                    cache_hit: false,
+                    ..computed.clone()
+                },
+            );
+        }
+
+        computed
+    }
+
     // Checks whether file should be wrapped with Node-style CJS interop facade.
-    fn should_wrap_file_as_cjs(&self, path: &Path, ext: &str) -> bool {
+    fn should_wrap_file_as_cjs(
+        &self,
+        path: &Path,
+        ext: &str,
+        classification: &ModuleSyntaxClassification,
+    ) -> bool {
         if !self.cjs_interop_enabled() {
             return false;
         }
         match ext {
-            "cjs" => true,
-            "mjs" | "mts" | "ts" | "tsx" | "jsx" => false,
-            "js" => !Self::js_file_is_package_module(path),
-            _ => false,
+            "mjs" | "mts" => false,
+            "js" => {
+                if Self::js_file_is_package_module(path) {
+                    return false;
+                }
+                if Self::js_file_is_package_module_entry(path) {
+                    return false;
+                }
+                classification.cjs
+            }
+            _ => classification.cjs,
         }
+    }
+
+    // Best-effort guard to avoid wrapping obvious ESM source as CJS.
+    fn looks_like_esm_source(source: &str) -> bool {
+        for line in source.lines() {
+            let t = line.trim_start();
+            if t.starts_with("import ")
+                || t.starts_with("import{")
+                || t.starts_with("import*")
+                || t.starts_with("import\"")
+                || t.starts_with("import'")
+                || t.starts_with("export ")
+                || t.starts_with("export{")
+                || t.starts_with("export*")
+            {
+                return true;
+            }
+        }
+        false
     }
 
     // Maps Node core module names to `node:` specifiers for ESM import compatibility.
@@ -2238,7 +2566,7 @@ impl ModuleLoader for DynamicModuleLoader {
 mod tests {
     use super::{CallbackDecisionWait, DynamicModuleLoader, ModuleRegistry};
     use crate::worker::messages::{ImportDecision, NodeMsg};
-    use crate::worker::state::{ImportsPolicy, ModuleLoaderConfig};
+    use crate::worker::state::{CjsForcePathRule, ImportsPolicy, ModuleLoaderConfig};
     use deno_core::url::Url;
     use deno_runtime::deno_core;
     use deno_runtime::deno_core::ModuleType;
@@ -2932,10 +3260,194 @@ exports.value = 42;
         if let Some(cfg) = loader.module_loader.as_mut() {
             cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
         }
-        assert!(!loader.should_wrap_file_as_cjs(&root.join("esm/mod.js"), "js"));
-        assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.js"), "js"));
-        assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.cjs"), "cjs"));
-        assert!(!loader.should_wrap_file_as_cjs(&root.join("cjs/mod.mjs"), "mjs"));
+        let esm_js = loader.classify_module_source(&root.join("esm/mod.js"), "js", "export const x = 1;");
+        let cjs_js = loader.classify_module_source(&root.join("cjs/mod.js"), "js", "module.exports = { x: 1 };");
+        let cjs_cjs = loader.classify_module_source(&root.join("cjs/mod.cjs"), "cjs", "module.exports = 1;");
+        let esm_mjs = loader.classify_module_source(&root.join("cjs/mod.mjs"), "mjs", "export default 1;");
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("esm/mod.js"), "js", &esm_js));
+        assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.js"), "js", &cjs_js));
+        assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.cjs"), "cjs", &cjs_cjs));
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("cjs/mod.mjs"), "mjs", &esm_mjs));
+    }
+
+    #[test]
+    // ESM-like JS source is not wrapped as CJS even when package type is not module.
+    fn cjs_wrap_decision_skips_obvious_esm_js_source() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-wrap-esm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(
+            root.join("pkg/package.json"),
+            r#"{ "type": "commonjs" }"#,
+        )
+        .expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+        }
+        let cls = loader.classify_module_source(&root.join("pkg/index.js"), "js", r#"export*from "./x.js";"#);
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("pkg/index.js"), "js", &cls));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    // package.json `module` entry should be treated as ESM even without `type: module`.
+    fn cjs_wrap_decision_skips_package_module_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-wrap-module-entry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/dist/esm/src")).expect("mkdir");
+        std::fs::write(
+            root.join("pkg/package.json"),
+            r#"{ "type": "commonjs", "module": "dist/esm/src/index.js" }"#,
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("pkg/dist/esm/src/index.js"),
+            r#"export*from "./inner.js";"#,
+        )
+        .expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+        }
+        let cls = loader.classify_module_source(
+            &root.join("pkg/dist/esm/src/index.js"),
+            "js",
+            r#"export*from "./inner.js";"#,
+        );
+        assert!(!loader.should_wrap_file_as_cjs(
+            &root.join("pkg/dist/esm/src/index.js"),
+            "js",
+            &cls
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    // CJS detection now evaluates source for non-.mjs/.mts files (including ts/tsx/jsx).
+    fn cjs_wrap_decision_uses_source_signals_for_non_mjs_mts() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-wrap-source-signals-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(
+            root.join("pkg/package.json"),
+            r#"{ "type": "commonjs" }"#,
+        )
+        .expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+        }
+
+        let cjs_ts = loader.classify_module_source(
+            &root.join("pkg/mod.ts"),
+            "ts",
+            r#"const dep = require("./dep.js"); module.exports = dep;"#,
+        );
+        let cjs_tsx = loader.classify_module_source(
+            &root.join("pkg/mod.tsx"),
+            "tsx",
+            r#"exports.view = function View(){ return null; };"#,
+        );
+        let cjs_jsx = loader.classify_module_source(
+            &root.join("pkg/mod.jsx"),
+            "jsx",
+            r#"module.exports = { value: 1 };"#,
+        );
+        let esm_ts = loader.classify_module_source(
+            &root.join("pkg/mod.ts"),
+            "ts",
+            r#"export const value = 1;"#,
+        );
+        let mjs_with_cjs = loader.classify_module_source(
+            &root.join("pkg/mod.mjs"),
+            "mjs",
+            r#"module.exports = { nope: true };"#,
+        );
+        let mts_with_cjs = loader.classify_module_source(
+            &root.join("pkg/mod.mts"),
+            "mts",
+            r#"module.exports = { nope: true };"#,
+        );
+        assert!(loader.should_wrap_file_as_cjs(&root.join("pkg/mod.ts"), "ts", &cjs_ts));
+        assert!(loader.should_wrap_file_as_cjs(&root.join("pkg/mod.tsx"), "tsx", &cjs_tsx));
+        assert!(loader.should_wrap_file_as_cjs(&root.join("pkg/mod.jsx"), "jsx", &cjs_jsx));
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("pkg/mod.ts"), "ts", &esm_ts));
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("pkg/mod.mjs"), "mjs", &mjs_with_cjs));
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("pkg/mod.mts"), "mts", &mts_with_cjs));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    // Force CJS rules support literal/glob/regex matching.
+    fn cjs_force_rules_match_literal_glob_and_regex() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-force-rules-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("node_modules/pkg_a")).expect("mkdir");
+        std::fs::create_dir_all(root.join("node_modules/pkg_b")).expect("mkdir");
+        std::fs::write(root.join("node_modules/pkg_a/index.js"), "module.exports = 1;").expect("write");
+        std::fs::write(root.join("node_modules/pkg_b/index.js"), "module.exports = 1;").expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        loader.sandbox_root = root.clone();
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+            cfg.cjs_force_paths = vec![
+                CjsForcePathRule::Literal("node_modules/pkg_a/index.js".to_string()),
+                CjsForcePathRule::Glob("node_modules/pkg_b/*".to_string()),
+                CjsForcePathRule::Regex {
+                    source: "pkg_c/.+\\.js$".to_string(),
+                    flags: "".to_string(),
+                },
+            ];
+        }
+
+        assert!(loader
+            .match_forced_cjs_rule(&root.join("node_modules/pkg_a/index.js"))
+            .is_some());
+        assert!(loader
+            .match_forced_cjs_rule(&root.join("node_modules/pkg_b/index.js"))
+            .is_some());
+        assert!(loader
+            .match_forced_cjs_rule(&root.join("node_modules/pkg_c/main.js"))
+            .is_some());
+        assert!(loader
+            .match_forced_cjs_rule(&root.join("node_modules/pkg_d/index.js"))
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -371,12 +371,16 @@ pub fn spawn_worker_thread(
                 }
             });
 
-            let cwd_path = normalize_cwd(limits.cwd.as_deref());
             let cwd_explicit = limits
                 .cwd
                 .as_deref()
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
+            let cwd_path = if cwd_explicit {
+                normalize_cwd(limits.cwd.as_deref())
+            } else {
+                normalize_cwd(None).join(format!("w-{worker_id}"))
+            };
             if cwd_explicit {
                 if !cwd_path.exists() || !cwd_path.is_dir() {
                     eprintln!(
