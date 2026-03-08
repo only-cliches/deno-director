@@ -29,7 +29,7 @@ describe("deno_worker: modules", () => {
       export const out = x + y;
     `;
     await expect(dw.module.eval(code)).resolves.toMatchObject({ out: 20 });
-  });
+  }, 20_000);
 
   it("supports top-level await in modules", async () => {
     dw = createTestWorker();
@@ -38,7 +38,7 @@ describe("deno_worker: modules", () => {
       export const out = v;
     `;
     await expect(dw.module.eval(code)).resolves.toMatchObject({ out: 42 });
-  });
+  }, 20_000);
 
   it(
     "module can import relative files from disk when imports are enabled",

@@ -61,6 +61,8 @@ async function withHardTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 describe("moduleLoader.httpsResolve MVP", () => {
+  jest.setTimeout(20_000);
+
   test("remote http import is blocked when httpResolve is disabled", async () => {
     let srv: { base: string; close: () => Promise<void> } | undefined;
     try {

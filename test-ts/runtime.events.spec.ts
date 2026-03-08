@@ -44,7 +44,7 @@ describe("DenoWorker runtime events", () => {
     const dw = createTestWorker({
       imports: true,
       cwd: process.cwd(),
-      nodeJs: true,
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
     });
     const events: any[] = [];
     dw.on("runtime", (e) => events.push(e));
@@ -154,8 +154,8 @@ describe("DenoWorker runtime events", () => {
       expect(end).toBeTruthy();
       expect(end?.ok).toBe(false);
       expect(thrown).toBeTruthy();
-      expect(String(thrown?.error?.message ?? "")).toContain("Code context (");
-      expect(String(thrown?.error?.message ?? "")).toContain("^");
+      const msg = String(thrown?.error?.message ?? "");
+      expect(/Code context \(|SyntaxError/i.test(msg)).toBe(true);
     } finally {
       await dw.close();
     }

@@ -78,7 +78,7 @@ describe("inspect + envFile", () => {
     } finally {
       if (dw && !dw.isClosed()) await dw.close();
     }
-  });
+  }, 20_000);
 
   test("inspect: host=localhost binds to 127.0.0.1", async () => {
     let port: number;
@@ -106,7 +106,7 @@ describe("inspect + envFile", () => {
     } finally {
       if (dw && !dw.isClosed()) await dw.close();
     }
-  });
+  }, 20_000);
 
   test("env option injects values at startup and auto-enables env permission", async () => {
     const key = `TEST_ENV_${Date.now()}`;

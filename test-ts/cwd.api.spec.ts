@@ -108,11 +108,14 @@ describe("deno_worker: cwd api", () => {
       process.chdir(root);
       dw = createTestWorker({ cwd: relName, imports: true });
       const first = await dw.cwd.get();
-      expect(path.resolve(first)).toBe(path.resolve(relDir));
+      const firstReal = await fs.realpath(path.resolve(first));
+      const expectedReal = await fs.realpath(path.resolve(relDir));
+      expect(firstReal).toBe(expectedReal);
       process.chdir(os.tmpdir());
       await dw.restart();
       const second = await dw.cwd.get();
-      expect(path.resolve(second)).toBe(path.resolve(relDir));
+      const secondReal = await fs.realpath(path.resolve(second));
+      expect(secondReal).toBe(expectedReal);
     } finally {
       process.chdir(originalHostCwd);
       if (dw && !dw.isClosed()) await dw.close();
