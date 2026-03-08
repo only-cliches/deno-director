@@ -241,7 +241,9 @@ export type DenoWorkerInspectOption =
 /**
  * Runtime environment config.
  *
- * - `undefined`: default runtime env behavior.
+ * - `undefined`: no startup env seed.
+ * - `true`: enable runtime env access without seeding any initial values.
+ * - `false`: disable startup env seeding (equivalent to `undefined`).
  * - `string`: dotenv file path to load (throws if missing/unreadable).
  * - `Record<string,string>`: explicit env map.
  *
@@ -250,16 +252,15 @@ export type DenoWorkerInspectOption =
  * - when `env` is a map and `permissions.env` is missing (or `[]`), the runtime
  *   auto-populates `permissions.env` with those env-map keys.
  * - if `permissions.env` is already configured, it is not changed.
+ * - host process env is not copied by default; pass `env: process.env` for passthrough.
  */
-export type DenoWorkerEnvOption = undefined | string | Record<string, string>;
+export type DenoWorkerEnvOption = undefined | boolean | string | Record<string, string>;
 
 /**
  * Optional module loading extensions.
  *
  * `httpsResolve`: allow `https://` module specifiers.
  * `httpResolve`: allow `http://` module specifiers (warned at startup).
- * `nodeResolve`: enable Node-style disk/module resolution.
- * `cjsInterop`: wrap detected CommonJS modules with ESM proxy exports.
  * `jsrResolve`: resolve `jsr:` and `@std/*` via `https://jsr.io/...`.
  * `tsCompiler`: optional TS/JSX transpile settings.
  */
@@ -270,10 +271,6 @@ export type DenoWorkerModuleLoaderOption =
             httpsResolve?: boolean;
             /** Enable `http://` module specifiers (insecure; startup warning emitted). */
             httpResolve?: boolean;
-            /** Enable Node-style disk/module resolution behavior. */
-            nodeResolve?: boolean;
-            /** Enable CommonJS interop (`true` uses cjs2esm-first interop; `"esbuild"` is a legacy alias). */
-            cjsInterop?: boolean | "esbuild";
             /** Enable `jsr:` / `@std/*` resolution through jsr.io HTTPS URLs. */
             jsrResolve?: boolean;
             /** Directory used to cache remotely loaded modules. */
@@ -282,6 +279,37 @@ export type DenoWorkerModuleLoaderOption =
             reload?: boolean;
             /** Maximum remote module payload bytes. `-1` disables limit. */
             maxPayloadBytes?: number;
+      };
+
+/**
+ * Node.js compatibility controls.
+ *
+ * This groups all Node-facing runtime/module behaviors in one place.
+ *
+ * `modules`:
+ * - Enables Node-style module resolution for local/bare imports.
+ * - Includes extension/index fallback and package entry resolution behavior.
+ * - This is the switch that allows `node_modules` package resolution.
+ *
+ * `runtime`:
+ * - Enables Node compatibility runtime helpers (for example Node global/runtime parity behavior).
+ * - Useful when sandbox code expects Node-ish runtime semantics.
+ *
+ * `cjsInterop`:
+ * - Enables CommonJS execution interoperability.
+ * - CJS sources execute with Node-style wrapper semantics and expose ESM facade exports.
+ * - Default import reflects `module.exports` value.
+ * - In practice you usually pair this with `modules: true`.
+ */
+export type DenoWorkerNodeJsOption =
+    | undefined
+    | {
+            /** Enable Node-style module resolution behavior. */
+            modules?: boolean;
+            /** Enable Node compatibility runtime behavior. */
+            runtime?: boolean;
+            /** Enable CommonJS interop for package/module loading. */
+            cjsInterop?: boolean;
       };
 
 export type DenoWorkerTsCompilerOption =
@@ -519,7 +547,13 @@ export type DenoWorkerOptions = {
      */
     imports?: boolean | ImportsCallback;
 
-    /** Runtime working directory used for relative path resolution. */
+    /**
+     * Runtime working directory used for relative path resolution.
+     *
+     * - When omitted, worker uses an internal sandbox cwd (`<tmp>/deno-director/sandbox`).
+     * - When provided, path must exist and be a directory.
+     * - Relative paths are resolved from host process cwd.
+     */
     cwd?: string;
     /** Startup script evaluated before user code runs. */
     startup?: string;
@@ -531,8 +565,24 @@ export type DenoWorkerOptions = {
      */
     permissions?: DenoPermissionsConfig;
 
-    /** Enable broader Node compatibility helpers. */
-    nodeCompat?: boolean;
+    /**
+     * Node.js compatibility controls.
+     *
+     * Centralized entry-point for Node module/runtime interop behavior.
+     *
+     * Recommended combinations:
+     * - package resolution only: `{ modules: true }`
+     * - broader Node-like runtime + resolution: `{ runtime: true, modules: true }`
+     * - CJS-heavy ecosystems: `{ runtime: true, modules: true, cjsInterop: true }`
+     *
+     * Legacy keys are removed in this API version:
+     * - top-level `nodeCompat`
+     * - `moduleLoader.nodeResolve`
+     * - `moduleLoader.cjsInterop`
+     *
+     * See {@link DenoWorkerNodeJsOption}.
+     */
+    nodeJs?: DenoWorkerNodeJsOption;
 
     /**
      * Console routing behavior for runtime `console.*`.
@@ -550,8 +600,8 @@ export type DenoWorkerOptions = {
 
     /**
      * Convenience dotenv loader:
-     * - `true`: search `.env` upwards from `cwd`
-     * - `string`: load explicit dotenv path
+     * - `true`: load `<cwd>/.env` when present; emits startup warning when missing
+     * - `string`: load explicit dotenv path (resolved from `cwd`, errors when missing)
      *
      * Ignored when `env` is explicitly provided.
      * Env permissions follow the same rules as {@link DenoWorkerEnvOption}:
@@ -972,6 +1022,14 @@ export type DenoWorkerModuleEvalOptions = Omit<EvalOptions, "type"> & {
      * then imports that module name to execute through normal module loading.
      */
     moduleName?: string;
+    /**
+     * Treat provided source as CommonJS and bridge it into ESM exports.
+     *
+     * When `true`, `module.eval` wraps source with Node-style CJS parameters
+     * (`exports`, `require`, `module`, `__filename`, `__dirname`) and returns
+     * an ESM namespace facade (`default` + detected named exports).
+     */
+    cjs?: boolean;
 };
 
 export type DenoWorkerModuleApi = {
@@ -1167,6 +1225,45 @@ export type DenoWorkerGlobalApi = {
     getType(path?: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandleTypeInfo>;
     /** Check global value `instanceof` a constructor path rooted at `globalThis`. */
     instanceOf(path: string, constructorPath: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
+};
+
+/** Runtime cwd namespace exposed on `DenoWorker.cwd`. */
+export type DenoWorkerCwdApi = {
+    /**
+     * Return current worker cwd.
+     *
+     * - When worker is running, this reflects runtime `Deno.cwd()`.
+     * - When worker is closed, this reflects the configured cwd value to be used on next start.
+     */
+    get(): Promise<string>;
+    /**
+     * Update worker cwd and restart runtime when currently running.
+     *
+     * The runtime filesystem sandbox root is immutable while running, so this method
+     * applies a new cwd by updating worker options and performing an in-place restart.
+     *
+     * Returns the resulting cwd after the update.
+     */
+    set(path: string): Promise<string>;
+};
+
+/** Runtime env namespace exposed on `DenoWorker.env`. */
+export type DenoWorkerEnvApi = {
+    /**
+     * Read an environment variable from the worker runtime.
+     *
+     * - When worker is running, this reads runtime `Deno.env.get(key)`.
+     * - When worker is closed, this reads from configured startup env map (when available).
+     */
+    get(key: string): Promise<string | undefined>;
+    /**
+     * Set an environment variable on the worker runtime and persist it for next start.
+     *
+     * - Updates runtime env immediately when worker is running.
+     * - Updates startup env map so restarts keep the new value.
+     * - Throws when `permissions.env === false` (or top-level `permissions === false`).
+     */
+    set(key: string, value: string): Promise<void>;
 };
 
 /** Runtime stats namespace exposed on `DenoWorker.stats`. */

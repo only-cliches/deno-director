@@ -111,6 +111,7 @@ function normalizeConsoleOption(x: unknown): unknown {
 /** Normalizes environment input (`string` path or key/value object). */
 function normalizeEnvOption(x: unknown): unknown {
     if (x === undefined) return undefined;
+    if (typeof x === "boolean") return x;
 
     if (typeof x === "string") return nonEmptyTrimmed(x);
 
@@ -161,8 +162,6 @@ function normalizeModuleLoaderOption(x: unknown): unknown {
 
     if (typeof o.httpsResolve === "boolean") out.httpsResolve = o.httpsResolve;
     if (typeof o.httpResolve === "boolean") out.httpResolve = o.httpResolve;
-    if (typeof o.nodeResolve === "boolean") out.nodeResolve = o.nodeResolve;
-    if (typeof o.cjsInterop === "boolean" || o.cjsInterop === "esbuild") out.cjsInterop = o.cjsInterop;
     if (typeof o.jsrResolve === "boolean") out.jsrResolve = o.jsrResolve;
     if (typeof o.reload === "boolean") out.reload = o.reload;
     const maxPayloadBytes = finiteInt(o.maxPayloadBytes, Number.NEGATIVE_INFINITY);
@@ -170,6 +169,17 @@ function normalizeModuleLoaderOption(x: unknown): unknown {
     const cacheDir = nonEmptyTrimmed(o.cacheDir);
     if (cacheDir !== undefined) out.cacheDir = cacheDir;
 
+    return Object.keys(out).length ? out : undefined;
+}
+
+/** Normalizes the top-level `nodeJs` compatibility bundle. */
+function normalizeNodeJsOption(x: unknown): unknown {
+    if (!x || typeof x !== "object") return undefined;
+    const o: any = x as any;
+    const out: any = {};
+    if (typeof o.modules === "boolean") out.modules = o.modules;
+    if (typeof o.runtime === "boolean") out.runtime = o.runtime;
+    if (typeof o.cjsInterop === "boolean") out.cjsInterop = o.cjsInterop;
     return Object.keys(out).length ? out : undefined;
 }
 
@@ -247,18 +257,22 @@ export function normalizeWorkerOptions(options?: DenoWorkerOptions): DenoWorkerW
         if (typeof limits.maxMemoryBytes === "number") o.maxMemoryBytes = limits.maxMemoryBytes;
     }
 
-    if (typeof o.nodeCompat !== "boolean") delete o.nodeCompat;
-
     o.console = normalizeConsoleOption(o.console);
     o.env = normalizeEnvOption(o.env);
     o.inspect = normalizeInspectOption(o.inspect);
     o.moduleLoader = normalizeModuleLoaderOption(o.moduleLoader);
+    const nodeJs = normalizeNodeJsOption(o.nodeJs) as any;
+    if (nodeJs) o.nodeJs = nodeJs;
+    else delete o.nodeJs;
+    // Breaking API: ignore legacy nodeCompat/moduleLoader.nodeResolve/moduleLoader.cjsInterop/top-level nodeResolve.
+    delete o.nodeCompat;
+    delete o.nodeResolve;
     o.bridge = normalizeBridgeOption(o.bridge);
     delete o.channelSize;
     delete o.sourceLoaders;
     delete o.transpileTs;
     o.tsCompiler = normalizeTsCompilerOption(o.tsCompiler);
-    delete o.nodeResolve;
+
     if ((o.moduleLoader?.httpsResolve === true || o.moduleLoader?.httpResolve === true) && o.imports === undefined) {
         o.imports = true;
     }

@@ -31,14 +31,13 @@ async function main() {
     const resolverOnly = new DenoWorker({
         cwd: tmp,
         imports: true,
-        moduleLoader: { nodeResolve: true },
+        nodeJs: { modules: true },
     });
 
     const compatMode = new DenoWorker({
         cwd: tmp,
-        nodeCompat: true,
         imports: true,
-        moduleLoader: { nodeResolve: true },
+        nodeJs: { modules: true, runtime: true },
     });
 
     try {
@@ -52,8 +51,8 @@ async function main() {
             export const out = pkg.value;
         `);
 
-        console.log("nodeResolve out:", a.out);
-        console.log("nodeCompat out:", b.out);
+        console.log("nodeJs.modules out:", a.out);
+        console.log("nodeJs.runtime+modules out:", b.out);
     } finally {
         await resolverOnly.close();
         await compatMode.close();

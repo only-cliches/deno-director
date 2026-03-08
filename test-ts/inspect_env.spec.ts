@@ -145,6 +145,29 @@ describe("inspect + envFile", () => {
     }
   });
 
+  test("envFile true emits startup warning when cwd .env is missing", async () => {
+    const root = await mkTempDir("denojs-worker-envfile-missing-");
+    const warns: string[] = [];
+    const dw = createTestWorker({
+      cwd: root,
+      envFile: true,
+      permissions: { env: true, read: true },
+      console: {
+        warn: (...args: any[]) => {
+          warns.push(args.map((x) => String(x)).join(" "));
+        },
+      },
+    });
+
+    try {
+      await dw.eval("1");
+      expect(warns.some((w) => /envFile:true did not find \.env in cwd/i.test(w))).toBe(true);
+    } finally {
+      if (!dw.isClosed()) await dw.close({ force: true });
+      await rmRF(root);
+    }
+  }, 20_000);
+
   test("envFile true does not load parent .env outside worker cwd", async () => {
     const root = await mkTempDir("denojs-worker-envfile-parent-");
     const nested = path.join(root, "nested");

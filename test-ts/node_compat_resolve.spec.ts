@@ -15,7 +15,7 @@ async function writeFile(p: string, text: string): Promise<void> {
   await fs.writeFile(p, text, "utf8");
 }
 
-describe("DenoWorker nodeResolve/nodeCompat", () => {
+describe("DenoWorker nodeJs modules/runtime interop", () => {
   let dir: string;
 
   beforeEach(async () => {
@@ -43,7 +43,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: false },
+      nodeJs: { modules: false },
     });
 
     try {
@@ -61,7 +61,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: true },
+      nodeJs: { modules: true },
     });
 
     try {
@@ -75,11 +75,11 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     }
   });
 
-  it("nodeCompat behaves like nodeResolve (lightweight) for now", async () => {
+  it("nodeJs.modules resolves bare packages without runtime mode", async () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeCompat: true,
+      nodeJs: { modules: true },
     });
 
     try {
@@ -97,7 +97,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: true },
+      nodeJs: { modules: true },
     });
 
     try {
@@ -115,7 +115,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: true },
+      nodeJs: { modules: true },
     });
 
     try {
@@ -137,7 +137,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: true },
+      nodeJs: { modules: true },
     });
 
     try {
@@ -175,7 +175,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
       const dw = createTestWorker({
         cwd: dir,
         imports: true,
-        moduleLoader: { nodeResolve: true },
+        nodeJs: { modules: true },
       });
 
       try {
@@ -204,7 +204,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: true },
+      nodeJs: { modules: true },
     });
 
     try {
@@ -232,7 +232,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      moduleLoader: { nodeResolve: true },
+      nodeJs: { modules: true },
     });
 
     try {
@@ -260,7 +260,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
       const dw = createTestWorker({
         cwd: dir,
         imports: true,
-        moduleLoader: { nodeResolve: true },
+        nodeJs: { modules: true },
       });
 
       try {
@@ -284,7 +284,7 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
       const dw = createTestWorker({
         cwd: dir,
         imports: true,
-        moduleLoader: { nodeResolve: true },
+        nodeJs: { modules: true },
       });
 
       try {
@@ -322,8 +322,8 @@ describe("DenoWorker nodeResolve/nodeCompat", () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeCompat: true,
-      moduleLoader: { nodeResolve: true },
+      
+      nodeJs: { modules: true },
     });
 
     try {
@@ -358,8 +358,8 @@ exports.Storage = Storage;
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeCompat: true,
-      moduleLoader: { nodeResolve: true, cjsInterop: true },
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
     });
 
     try {
@@ -390,12 +390,12 @@ exports.Storage = Storage;
     }
   });
 
-  test("nodeResolve: cjsInterop accepts \"esbuild\" mode value", async () => {
+  test("nodeResolve: cjsInterop ignores string mode values", async () => {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeCompat: true,
-      moduleLoader: { nodeResolve: true, cjsInterop: "esbuild" },
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: "node" as any },
     });
 
     try {
@@ -418,7 +418,7 @@ exports.Provider = Provider;
         export const out = Provider;
       `;
 
-      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "provider" });
+      await expect(dw.module.eval(code)).rejects.toThrow(/does not provide an export named 'Provider'/i);
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
@@ -428,8 +428,8 @@ exports.Provider = Provider;
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeCompat: true,
-      moduleLoader: { nodeResolve: true, cjsInterop: true },
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
     });
 
     try {
@@ -475,8 +475,8 @@ function getAvailableAdapters() {
     const dw = createTestWorker({
       cwd: dir,
       imports: true,
-      nodeCompat: true,
-      moduleLoader: { nodeResolve: true, cjsInterop: true },
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
     });
 
     try {
@@ -503,6 +503,258 @@ exports.base = path_1.default.basename("/tmp/hello.txt");
       `;
 
       await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "hello.txt" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeResolve: cjsInterop handles Babel re-export chains consumed via require bindings", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbabel", "package.json"),
+        JSON.stringify({ name: "cjsbabel", version: "1.0.0", main: "lib/index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbabel", "lib", "builders", "generated", "lowercase.js"),
+        `"use strict";
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.unaryExpression = unaryExpression;
+exports.numericLiteral = numericLiteral;
+function unaryExpression(op, arg, prefix) {
+  return { op, arg, prefix };
+}
+function numericLiteral(n) {
+  return n;
+}
+`
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbabel", "lib", "builders", "generated", "index.js"),
+        `"use strict";
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+var _lowercase = require("./lowercase.js");
+Object.keys(_lowercase).forEach(function (key) {
+  if (key === "default" || key === "__esModule") return;
+  if (key in exports && exports[key] === _lowercase[key]) return;
+  Object.defineProperty(exports, key, {
+    enumerable: true,
+    get: function () {
+      return _lowercase[key];
+    }
+  });
+});
+`
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbabel", "lib", "builders", "productions.js"),
+        `"use strict";
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.buildUndefinedNode = buildUndefinedNode;
+var _index = require("./generated/index.js");
+function buildUndefinedNode() {
+  return (0, _index.unaryExpression)("void", (0, _index.numericLiteral)(0), true);
+}
+`
+      );
+
+      const code = `
+        import { buildUndefinedNode } from "cjsbabel/lib/builders/productions.js";
+        export const out = buildUndefinedNode();
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({
+        out: { op: "void", arg: 0, prefix: true },
+      });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("module.eval: cjsInterop supports default+named imports from CJS", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsrisk", "package.json"),
+        JSON.stringify({ name: "cjsrisk", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsrisk", "index.js"),
+        `"use strict";
+var __createBinding = (this && this.__createBinding) || function() {};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.named = named;
+exports.default = void 0;
+function named() { return "named"; }
+function main() { return "default"; }
+exports.default = main;
+`
+      );
+
+      const code = `
+        import defValue, { named as namedFn } from "cjsrisk";
+        export const out = [typeof defValue, defValue.default(), namedFn()];
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: ["object", "default", "named"] });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("module.eval: cjsInterop supports namespace imports from CJS", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsrisk", "package.json"),
+        JSON.stringify({ name: "cjsrisk", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsrisk", "index.js"),
+        `"use strict";
+var __createBinding = (this && this.__createBinding) || function() {};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.named = named;
+exports.default = void 0;
+function named() { return "named"; }
+function main() { return "default"; }
+exports.default = main;
+`
+      );
+
+      const code = `
+        import * as ns from "cjsrisk";
+        export const out = [typeof ns.default, typeof ns.default.default, ns.default.default(), ns.named()];
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: ["object", "function", "default", "named"] });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeResolve: cjsInterop supports function module.exports with attached named members", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsfn", "package.json"),
+        JSON.stringify({ name: "cjsfn", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsfn", "index.js"),
+        `"use strict";
+function main() { return "main"; }
+module.exports = main;
+module.exports.extra = function extra() { return "extra"; };
+`
+      );
+
+      const code = `
+        import defValue, { extra } from "cjsfn";
+        export const out = [typeof defValue, defValue(), extra()];
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: ["function", "main", "extra"] });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeResolve: cjsInterop supports CJS require() chains across local files", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjschain", "package.json"),
+        JSON.stringify({ name: "cjschain", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjschain", "dep.js"),
+        `"use strict";
+exports.n = 7;
+`
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjschain", "index.js"),
+        `"use strict";
+const dep = require("./dep.js");
+exports.value = dep.n + 1;
+`
+      );
+
+      const code = `
+        import { value } from "cjschain";
+        export const out = value;
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: 8 });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeResolve: cjsInterop supports require('path') builtins in CJS modules", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbuiltin", "package.json"),
+        JSON.stringify({ name: "cjsbuiltin", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbuiltin", "index.js"),
+        `"use strict";
+const path = require("path");
+exports.base = path.basename("/tmp/a.txt");
+`
+      );
+
+      const code = `
+        import { base } from "cjsbuiltin";
+        export const out = base;
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "a.txt" });
     } finally {
       if (!dw.isClosed()) await dw.close();
     }

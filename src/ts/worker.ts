@@ -2,7 +2,8 @@
 
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, join as joinPath } from "node:path";
 import { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { nativeAddon } from "./native";
@@ -41,6 +42,8 @@ import type {
     DenoWorkerLifecycleHooks,
     DenoWorkerLifecyclePhase,
     DenoWorkerCloseOptions,
+    DenoWorkerCwdApi,
+    DenoWorkerEnvApi,
     DenoWorkerMemory,
     DenoWorkerMessageHandler,
     DenoWorkerModuleApi,
@@ -734,8 +737,8 @@ export class DenoWorker {
     private closed = false;
     private closeRequested = false;
     private readonly lifecycleHooks?: DenoWorkerLifecycleHooks;
-    private readonly creationOptions?: DenoWorkerOptions;
-    private readonly nativeOptions?: DenoWorkerOptions;
+    private creationOptions?: DenoWorkerOptions;
+    private nativeOptions?: DenoWorkerOptions;
     private readonly loaderTransforms: DenoLoaderTransform[];
     private readonly loadersStrictJsOnly: boolean;
     private readonly messageHandlers = new Set<DenoWorkerMessageHandler>();
@@ -751,6 +754,9 @@ export class DenoWorker {
     private startupPromise: Promise<void> = Promise.resolve();
     private startupReady = true;
     private startupError: unknown = null;
+    private babelShimGlobalsReady = false;
+    private babelAstTokenCounter = 1;
+    private readonly babelAstByToken = new Map<number, any>();
     private streamCounter = 0;
     private readonly streamIncoming = new Map<string, StreamReaderImpl>();
     private readonly streamById = new Map<string, StreamSlotMeta>();
@@ -845,6 +851,16 @@ export class DenoWorker {
         register: (moduleName: string, source: string, options?: Pick<EvalOptions, "srcLoader">) =>
             this.moduleApiRegister(moduleName, source, options),
         clear: (moduleName: string) => this.moduleApiClear(moduleName),
+    };
+    /** Runtime cwd API for reading/updating worker sandbox root. */
+    readonly cwd: DenoWorkerCwdApi = {
+        get: () => this.cwdGet(),
+        set: (path: string) => this.cwdSet(path),
+    };
+    /** Runtime env API for reading/updating worker environment variables. */
+    readonly env: DenoWorkerEnvApi = {
+        get: (key: string) => this.envGet(key),
+        set: (key: string, value: string) => this.envSet(key, value),
     };
     /** Runtime stats API for lightweight wrapper-level telemetry. */
     get stats(): DenoWorkerStatsApi {
@@ -1776,6 +1792,102 @@ export class DenoWorker {
         }
 
         return out;
+    }
+
+    private configuredCwdFallback(): string {
+        const raw = this.creationOptions?.cwd;
+        const cwd = typeof raw === "string" ? raw.trim() : "";
+        return cwd || joinPath(tmpdir(), "deno-director", "sandbox");
+    }
+
+    private normalizeCwdInput(pathLike: string): string {
+        const value = String(pathLike ?? "").trim();
+        if (!value) throw new Error("cwd.set(path) requires a non-empty path");
+        return value;
+    }
+
+    private async cwdGet(): Promise<string> {
+        if (this.isClosed()) return this.configuredCwdFallback();
+        await this.startupPromise;
+        try {
+            return await this.eval<string>("Deno.cwd()");
+        } catch {
+            return this.configuredCwdFallback();
+        }
+    }
+
+    private async cwdSet(pathLike: string): Promise<string> {
+        const cwd = this.normalizeCwdInput(pathLike);
+        const nextOptions: DenoWorkerOptions = { ...(this.creationOptions ?? {}), cwd };
+        this.creationOptions = nextOptions;
+        this.nativeOptions = this.createNativeOptions(nextOptions);
+        if (!this.isClosed()) {
+            await this.restart();
+        }
+        return await this.cwdGet();
+    }
+
+    private normalizeEnvKeyInput(keyLike: string): string {
+        const key = String(keyLike ?? "").trim();
+        if (!key) throw new Error("env.get/set requires a non-empty key");
+        return key;
+    }
+
+    private normalizeEnvValueInput(valueLike: string): string {
+        return String(valueLike ?? "");
+    }
+
+    private ensureEnvApiAllowed(): void {
+        const permissions = (this.creationOptions as any)?.permissions;
+        if (permissions === false) {
+            throw new Error("worker.env API is disabled because permissions=false.");
+        }
+        if (permissions && typeof permissions === "object" && (permissions as any).env === false) {
+            throw new Error("worker.env API is disabled because permissions.env === false.");
+        }
+    }
+
+    private readConfiguredEnvValue(key: string): string | undefined {
+        const raw = (this.creationOptions as any)?.env;
+        if (!raw || typeof raw !== "object" || typeof raw === "string") return undefined;
+        const value = (raw as Record<string, unknown>)[key];
+        return typeof value === "string" ? value : undefined;
+    }
+
+    private async envGet(keyLike: string): Promise<string | undefined> {
+        this.ensureEnvApiAllowed();
+        const key = this.normalizeEnvKeyInput(keyLike);
+        if (this.isClosed()) return this.readConfiguredEnvValue(key);
+        await this.startupPromise;
+        try {
+            return await this.eval<string | undefined>("(k) => Deno.env.get(k)", { args: [key] });
+        } catch {
+            return this.readConfiguredEnvValue(key);
+        }
+    }
+
+    private buildUpdatedEnvOptions(key: string, value: string): DenoWorkerOptions {
+        const nextOptions: DenoWorkerOptions = { ...(this.creationOptions ?? {}) };
+        const existing = nextOptions.env;
+        const envMap: Record<string, string> =
+            existing && typeof existing === "object" && typeof existing !== "string"
+                ? { ...(existing as Record<string, string>) }
+                : {};
+        envMap[key] = value;
+        nextOptions.env = envMap;
+        return nextOptions;
+    }
+
+    private async envSet(keyLike: string, valueLike: string): Promise<void> {
+        this.ensureEnvApiAllowed();
+        const key = this.normalizeEnvKeyInput(keyLike);
+        const value = this.normalizeEnvValueInput(valueLike);
+        const nextOptions = this.buildUpdatedEnvOptions(key, value);
+        this.creationOptions = nextOptions;
+        this.nativeOptions = this.createNativeOptions(nextOptions);
+        if (this.isClosed()) return;
+        await this.startupPromise;
+        await this.eval("(k, v) => { Deno.env.set(k, v); return undefined; }", { args: [key, value] });
     }
 
     private buildResolvedEvalOptions(options: EvalOptions | undefined, srcLoader: DenoSourceLoader): EvalOptions | undefined {
@@ -3906,9 +4018,14 @@ export class DenoWorker {
     ): Promise<T> {
         await this.startupPromise;
         const opId = `module.eval:${randomUUID()}`;
+        const sourceText = String(source);
+        if (sourceText.includes("@babel/parser") || sourceText.includes("@babel/generator")) {
+            await this.ensureBabelShimGlobals();
+        }
+        const sourceForLoaders = options?.cjs === true ? this.buildCjsEvalEsmSource(sourceText) : sourceText;
         const transformed = await this.applyLoadersAsync({
             kind: "module-eval",
-            src: String(source),
+            src: sourceForLoaders,
             srcLoader: options?.srcLoader ?? (options as any)?.loader ?? "js",
         });
         const moduleName = typeof options?.moduleName === "string" ? options.moduleName.trim() : "";
@@ -3978,6 +4095,155 @@ export class DenoWorker {
         const wrapped = wrapModuleNamespace<T>(this, hydrateFromWire(raw));
         this.emitRuntimeEvent({ kind: "module.eval.end", opId, ok: true });
         return wrapped;
+    }
+
+    private normalizeCjsRequireSpecifier(specifier: string): string {
+        const raw = String(specifier ?? "").trim();
+        if (!raw) return raw;
+        if (raw.startsWith("node:")) return raw;
+        const core = new Set([
+            "assert",
+            "buffer",
+            "child_process",
+            "cluster",
+            "console",
+            "constants",
+            "crypto",
+            "dgram",
+            "diagnostics_channel",
+            "dns",
+            "domain",
+            "events",
+            "fs",
+            "http",
+            "http2",
+            "https",
+            "inspector",
+            "module",
+            "net",
+            "os",
+            "path",
+            "perf_hooks",
+            "process",
+            "punycode",
+            "querystring",
+            "readline",
+            "repl",
+            "stream",
+            "string_decoder",
+            "sys",
+            "timers",
+            "tls",
+            "tty",
+            "url",
+            "util",
+            "v8",
+            "vm",
+            "worker_threads",
+            "zlib",
+        ]);
+        return core.has(raw) ? `node:${raw}` : raw;
+    }
+
+    private collectCjsRequireSpecifiers(source: string): Array<{ raw: string; normalized: string }> {
+        const out: Array<{ raw: string; normalized: string }> = [];
+        const seen = new Set<string>();
+        const re = /\brequire\s*\(\s*(['"])([^"'\\]*(?:\\.[^"'\\]*)*)\1\s*\)/g;
+        let m: RegExpExecArray | null = null;
+        while ((m = re.exec(source))) {
+            const raw = String(m[2] ?? "");
+            if (!raw || seen.has(raw)) continue;
+            seen.add(raw);
+            out.push({ raw, normalized: this.normalizeCjsRequireSpecifier(raw) });
+        }
+        return out;
+    }
+
+    private isJsIdentifier(name: string): boolean {
+        return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(String(name ?? ""));
+    }
+
+    private collectCjsNamedExports(source: string): string[] {
+        const names = new Set<string>();
+        const add = (name: string) => {
+            const n = String(name ?? "").trim();
+            if (!n || n === "default" || n === "__esModule") return;
+            if (!this.isJsIdentifier(n)) return;
+            names.add(n);
+        };
+
+        const reA = /\bexports\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+        const reB = /\bmodule\.exports\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+        const reC = /\bObject\.defineProperty\(\s*(?:exports|module\.exports)\s*,\s*(['"])([A-Za-z_$][A-Za-z0-9_$]*)\1/g;
+        let m: RegExpExecArray | null = null;
+        while ((m = reA.exec(source))) add(m[1]);
+        while ((m = reB.exec(source))) add(m[1]);
+        while ((m = reC.exec(source))) add(m[2]);
+        return [...names.values()];
+    }
+
+    private buildCjsEvalEsmSource(source: string): string {
+        const requires = this.collectCjsRequireSpecifiers(source);
+        const names = this.collectCjsNamedExports(source);
+        const q = (v: string) => JSON.stringify(v);
+        const lines: string[] = [];
+        for (let i = 0; i < requires.length; i += 1) {
+            lines.push(`import * as __ddReq${i} from ${q(requires[i].normalized)};`);
+        }
+        lines.push("const exports = {};");
+        lines.push("const module = { exports, filename: \"<module.eval:cjs>\", id: \"<module.eval:cjs>\", loaded: false, parent: null, children: [], paths: [] };");
+        lines.push("const __ddRequireMap = new Map();");
+        for (let i = 0; i < requires.length; i += 1) {
+            lines.push(`__ddRequireMap.set(${q(requires[i].raw)}, __ddReq${i});`);
+            if (requires[i].raw !== requires[i].normalized) {
+                lines.push(`__ddRequireMap.set(${q(requires[i].normalized)}, __ddReq${i});`);
+            }
+        }
+        lines.push("const require = (spec) => {");
+        lines.push("  const m = __ddRequireMap.get(String(spec));");
+        lines.push("  if (!m) throw new Error(`Unsupported require() in module.eval({ cjs: true }): ${String(spec)}`);");
+        lines.push("  try {");
+        lines.push("    const d = m && (typeof m === \"object\" || typeof m === \"function\") ? m.default : undefined;");
+        lines.push("    if (d && (typeof d === \"object\" || typeof d === \"function\")) return d;");
+        lines.push("  } catch {}");
+        lines.push("  if (m && (typeof m === \"object\" || typeof m === \"function\")) {");
+        lines.push("    const out = Object.create(null);");
+        lines.push("    for (const k of Object.keys(m)) { try { out[k] = m[k]; } catch {} }");
+        lines.push("    return out;");
+        lines.push("  }");
+        lines.push("  return m;");
+        lines.push("};");
+        lines.push(`const __ddSource = ${q(source)};`);
+        lines.push("const __ddFn = new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\", __ddSource);");
+        lines.push("try { __ddFn.call(module.exports, module.exports, require, module, module.filename, \".\"); } finally { module.loaded = true; }");
+        lines.push("const __ddFinal = module.exports;");
+        lines.push("const __ddNamed = (__ddFinal && (typeof __ddFinal === \"object\" || typeof __ddFinal === \"function\")) ? __ddFinal : Object.create(null);");
+        lines.push("export default __ddFinal;");
+        for (const name of names) {
+            lines.push(`export const ${name} = __ddNamed[${q(name)}];`);
+        }
+        return `${lines.join("\n")}\n`;
+    }
+
+    private async ensureBabelShimGlobals(): Promise<void> {
+        if (this.babelShimGlobalsReady) return;
+        const parserMod: any = await import("@babel/parser");
+        const generatorMod: any = await import("@babel/generator");
+        const parseShim = (code: any, options?: any) => {
+            const ast = parserMod.parse(String(code ?? ""), options ?? {});
+            const token = this.babelAstTokenCounter++;
+            this.babelAstByToken.set(token, ast);
+            return { __deno_director_babel_ast_token: token };
+        };
+        const generateShim = (astLike: any, options?: any) => {
+            const token =
+                astLike && typeof astLike === "object" ? Number((astLike as any).__deno_director_babel_ast_token) : NaN;
+            const ast = Number.isFinite(token) && this.babelAstByToken.has(token) ? this.babelAstByToken.get(token) : astLike;
+            return generatorMod.generate(ast, options ?? {});
+        };
+        await this.setGlobalInternal("__deno_director_babel_parser", { parse: parseShim });
+        await this.setGlobalInternal("__deno_director_babel_generator", { generate: generateShim });
+        this.babelShimGlobalsReady = true;
     }
 
     /** Module API entrypoint: register module source under a stable module name. */

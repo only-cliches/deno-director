@@ -5,6 +5,7 @@
 **Run Deno inside Node.js like a boss.**
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/only-cliches/deno-director)](https://github.com/only-cliches/deno-director)
+[![NPM Version](https://img.shields.io/npm/v/deno-director)](https://www.npmjs.com/package/deno-director)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -20,6 +21,7 @@ You get one process, two ecosystems, and clean runtime seperation.
 * **Host function bridging:** inject Node functions into Deno and call them from sandboxed code, sync or async.
 * **Real sandbox controls:** enforce `read`, `write`, `net`, `env`, `run`, `ffi`, `sys`, `import`, `hrtime`, and `wasm` permissions per worker.
 * **TS/JSX first-class:** run TypeScript and TSX through `eval`, `evalSync`, and module APIs with built-in transpilation.
+* **Node-style module compatibility:** use centralized `nodeJs` config (`modules`, `runtime`, `cjsInterop`) for near-full Node package/runtime interop.
 * **Fast stream transport:** push bytes through `worker.stream.connect(...)` when message-style APIs are not enough.
 * **Handles and global ops:** mutate and inspect runtime object graphs through `worker.handle.*` and `worker.global.*` APIs.
 * **Fleet controls:** orchestrate large runtime pools with `DenoDirector`.
@@ -71,7 +73,7 @@ const sandbox = await worker.module.eval(`
         const rawData: {  // Typescript is OK!
           id: string,
           secret: string 
-        } = await globalThis.hostFetchData(userId);
+        } = await hostFetchData(userId);
         
         // Return the processed data back to Node
         return { 
@@ -450,42 +452,79 @@ Notes:
 - If `args` are provided but the evaluated value is not callable, the value is returned as-is.
 ---
 
-### 🧩 nodeCompat and nodeResolve Examples
+### 🧩 NodeJS Compatibility
 
-Use `nodeCompat` when you want broader Node compatibility behavior, and `moduleLoader.nodeResolve` when you specifically just want Node-style package resolution.
+Use `nodeJs` as the centralized API for Node-style module/runtime compatibility.
 
 ```ts
 import { DenoWorker } from "deno-director";
 
-// Example 1: broader Node compatibility mode
-const compatWorker = new DenoWorker({
-  nodeCompat: true,
+// Example 1: module resolution only
+const modulesWorker = new DenoWorker({
   imports: true,
-  moduleLoader: { nodeResolve: true },
+  nodeJs: { modules: true },
 });
 
-const compatOut = await compatWorker.module.eval(`
+const modulesOut = await modulesWorker.module.eval(`
+  import path from "path";
+  export const out = path.basename("/tmp/demo.txt");
+`);
+console.log(modulesOut.out); // "demo.txt"
+
+await modulesWorker.close();
+
+// Example 2: runtime + modules
+const runtimeWorker = new DenoWorker({
+  imports: true,
+  nodeJs: { runtime: true, modules: true },
+});
+
+const runtimeOut = await runtimeWorker.module.eval(`
   import path from "path";
   export const out = path.join("a", "b");
 `);
-console.log(compatOut.out); // "a/b" (platform-dependent separators may vary)
+console.log(runtimeOut.out); // "a/b" (platform separators may vary)
 
-await compatWorker.close();
+await runtimeWorker.close();
+```
 
-// Example 2: targeted Node-style resolver only
-const resolveWorker = new DenoWorker({
+### 📦 CommonJS Interop (`cjsInterop`)
+
+Enable `nodeJs.cjsInterop: true` to run CJS packages with Node-style wrapper semantics (`exports`, `require`, `module`, `__filename`, `__dirname`) and expose an ESM facade.
+
+```ts
+import { DenoWorker } from "deno-director";
+
+const worker = new DenoWorker({
   imports: true,
-  moduleLoader: { nodeResolve: true },
+  nodeJs: {
+    modules: true,
+    runtime: true,
+    cjsInterop: true,
+  },
 });
 
-const resolveOut = await resolveWorker.module.eval(`
-  import path from "path";
-  export const base = path.basename("/tmp/some-installed-package");
+const out = await worker.module.eval(`
+  import cjsPkg, { named } from "some-cjs-package";
+  // Node-style behavior:
+  // - default import is module.exports
+  // - named imports map to properties on module.exports
+  export const result = [typeof cjsPkg, typeof named];
 `);
-console.log(resolveOut.base); // "some-installed-package"
 
-await resolveWorker.close();
+console.log(out.result);
+await worker.close();
 ```
+
+Interop semantics:
+- `nodeJs.cjsInterop` is boolean-only (`true` = enabled, `false`/omitted = disabled).
+- Default import follows Node CJS interop semantics (`default` is the full `module.exports` value).
+- `exports.default` (when present in transpiled CJS) remains nested at `default.default`.
+- CJS heavy Babel paths are shimmed for runtime stability (`@babel/parser`, `@babel/generator`).
+
+Compatibility scope:
+- For module loading and package usage, this is near-full Node-style behavior (`nodeJs.modules` + `nodeJs.runtime` + `nodeJs.cjsInterop`).
+- Deno Director is still a Deno runtime in-process, so non-module Node internals may differ from a full Node runtime.
 
 ### 🧪 Custom Loaders in 20 Seconds
 
@@ -520,7 +559,9 @@ await worker.close();
 
 ### 🌍 Environment Variables: The Secure Way
 
-By default, Deno Director locks down environment variables.  You can inject explicit key value pairs, or have the worker dynamically load a `.env` file from disk.
+By default, Deno Director does not copy host process env into the worker.
+Use `env: process.env` for host-env passthrough, `envFile: true` to load `<cwd>/.env` at startup
+(and emit a startup warning when missing), or `env: true` to enable runtime env access without seeding values.
 
 ```ts
 import { DenoWorker } from "deno-director";
@@ -531,11 +572,17 @@ const worker = new DenoWorker({
     DB_PASS: "super_secret",
     NODE_ENV: "production"
   },
-  
-  // OR 2. Auto-load from a .env file in the worker cwd
+
+  // OR 2. Pass host env explicitly
+  // env: process.env,
+
+  // OR 3. Enable runtime env usage with no startup data
+  // env: true,
+
+  // OR 4. Auto-load <cwd>/.env at startup; warns if file is missing
   // envFile: true, 
 
-  // OR 3. provide exact file to load, errors out if the file doesn't exist
+  // OR 5. provide exact file path (resolved from cwd); errors if missing
   // envFile: ".my.env"
 });
 
@@ -547,12 +594,69 @@ await worker.eval(`
 await worker.close();
 ```
 
+Use `worker.env.get(key)` / `worker.env.set(key, value)` for runtime env access with startup persistence.
+
+```ts
+import { DenoWorker } from "deno-director";
+
+const worker = new DenoWorker({
+  permissions: { env: true }, // enable env in the worker
+  env: { APP_MODE: "dev" }, // pass a value at startup or restart
+});
+
+console.log(await worker.env.get("APP_MODE")); // "dev"
+await worker.env.set("APP_MODE", "prod");
+console.log(await worker.env.get("APP_MODE")); // "prod"
+
+await worker.restart();
+console.log(await worker.env.get("APP_MODE")); // "prod" (persisted across restart)
+
+await worker.close();
+```
+
 Permission note:
 - If you provide `env` as a map and `permissions.env` is missing (or `[]`), the runtime auto-populates `permissions.env` with those env-map keys.
 - If `permissions.env` is already set, it is not changed.
+- `worker.env.get/set` throw when `permissions.env === false` (or `permissions === false`).
 - If configured env keys are not readable under `permissions.env`, startup emits a warning.
 - If `permissions.run` is enabled, spawned subprocesses may observe host environment values unless command env is explicitly constrained.
 
+
+### 📁 Worker CWD API
+
+`cwd` is explicit-only. If omitted, worker uses internal sandbox cwd (`<tmp>/deno-director/sandbox`) instead of host `process.cwd()`.
+
+```ts
+import { DenoWorker } from "deno-director";
+import fs from "node:fs/promises";
+import path from "node:path";
+
+// 1) Explicitly pass host cwd into runtime (opt-in passthrough)
+const hostCwdWorker = new DenoWorker({
+  cwd: process.cwd(),
+  imports: true,
+});
+console.log(await hostCwdWorker.cwd.get()); // host process cwd
+await hostCwdWorker.close();
+
+// 2) Internal/default sandbox cwd (use worker.cwd.get() for host file operations)
+// Note: `cwd: true` is not a valid option. Omit `cwd` to use internal sandbox cwd.
+const worker = new DenoWorker({ imports: true, permissions: { read: true, write: true } });
+const sandboxCwd = await worker.cwd.get();
+console.log(sandboxCwd); // "<tmp>/deno-director/sandbox"
+
+// add/remove files using the runtime cwd path
+const demoFile = path.join(sandboxCwd, "tmp-note.txt");
+await fs.writeFile(demoFile, "hello sandbox", "utf8");
+await fs.unlink(demoFile);
+
+await worker.cwd.set("/var/sandbox"); // path must already exist
+await worker.close();
+```
+
+Notes:
+- Provided `cwd` must exist and be a directory, or worker startup fails.
+- Relative `cwd` values are resolved from host `process.cwd()` when explicitly provided.
 
 
 ---
@@ -598,10 +702,22 @@ Clears a previously registered module by name.
 Imports a module specifier through the runtime import pipeline and returns a callable Proxy namespace to the exports.
 * `stream.connect(key: string): Promise<Duplex>`
 Opens a bidirectional stream session and returns a Node.js `Duplex` stream.
+* `cwd.get(): Promise<string>`
+Returns current worker cwd (runtime `Deno.cwd()` when running).
+* `cwd.set(path: string): Promise<string>`
+Updates worker cwd and restarts runtime when currently running.
+* `env.get(key: string): Promise<string | undefined>`
+Reads worker environment value for `key`.
+* `env.set(key: string, value: string): Promise<void>`
+Sets worker environment value and persists it for restart/next start.
 
 `EvalOptions.srcLoader` (and `module.eval(..., { srcLoader })`) defaults to `"js"`.
 Use `"ts"`, `"tsx"`, or `"jsx"` to request TS/JSX transpilation for that call.
 Custom loader names are supported through `DenoWorkerOptions.sourceLoaders` callback pipelines.
+`module.eval(..., { cjs: true })` enables Node-style CommonJS wrapping for eval source
+(`exports`, `require`, `module`, `__filename`, `__dirname`) and returns an ESM facade
+with `default` mapped to `module.exports` plus detected named exports.
+- `worker.env` throws when env permission is explicitly disabled (`permissions.env === false` or `permissions === false`).
 - async iteration: `for await (const chunk of reader) { ... }`
 
 #### **Environment & Memory**
@@ -700,7 +816,7 @@ type DenoWorkerOptions = {
     streamBacklogLimit?: number; // Max unaccepted worker->Node stream opens to backlog (default 256)
     streamHighWaterMarkBytes?: number; // Reader-side high water mark (defaults to streamWindowBytes)
   };
-  cwd?: string;                 // Virtual root for the filesystem sandbox
+  cwd?: string;                 // Optional sandbox root. Omitted => <tmp>/deno-director/sandbox. Provided path must exist.
   startup?: string;             // Script evaluated before user code runs
   permissions?: boolean | {     // true=allow all, false=deny all, or per-capability config
     read?: boolean | string[];  // Allow read everywhere, or specific paths
@@ -714,9 +830,13 @@ type DenoWorkerOptions = {
     hrtime?: boolean;           // High-resolution timing access
     wasm?: boolean;             // Enable/disable .wasm module loading (default true)
   };
-  env?: string | Record<string, string>; // Dotenv path or explicit environment map
-  envFile?: string | boolean;   // Load from a .env file
-  nodeCompat?: boolean;         // Enable Node compatibility mode
+  env?: boolean | string | Record<string, string>; // true enables runtime env access, string=dotenv path, map=explicit values
+  envFile?: string | boolean;   // true => load <cwd>/.env with warning when missing; string => resolve from cwd and error when missing
+  nodeJs?: {                    // Centralized Node compatibility controls
+    modules?: boolean;          // Node-style module resolution
+    runtime?: boolean;          // Node runtime compatibility behavior
+    cjsInterop?: boolean;       // CJS execution + ESM facade interop
+  };
   imports?: boolean | ImportsCallback; // Custom module resolution interceptor
   sourceLoaders?: false | Array<(ctx: { // process custom source loader values. jsx, tsx and ts handled by built-in loader
     src: string;
@@ -735,7 +855,6 @@ type DenoWorkerOptions = {
   moduleLoader?: {
     httpsResolve?: boolean;     // Enable https:// imports
     httpResolve?: boolean;      // Enable http:// imports (insecure; startup warning emitted)
-    nodeResolve?: boolean;      // Enable Node-style disk/module resolution
     jsrResolve?: boolean;       // Resolve jsr: and @std/* via jsr.io
     cacheDir?: string;          // Where to cache remote imports
     reload?: boolean;           // Bypass cache
@@ -744,7 +863,7 @@ type DenoWorkerOptions = {
   console?: DenoWorkerConsoleOption; // Route/disable console methods
   inspect?: boolean | { host?: string; port?: number; break?: boolean; }; // V8 Debugging
   globals?: Record<string, any>; // Startup globals applied to globalThis
-  modules?: Record<string, string | { src: string; srcLoader?: string }>; // string shorthand => { src: string, srcLoader: "js" }
+  modules?: Record<string, string | { src: string; srcLoader?: string }> | Map<string, string | { src: string; srcLoader?: string }>; // string shorthand => { src: string, srcLoader: "js" }
   lifecycle?: DenoWorkerLifecycleHooks; // beforeStart/afterStart/beforeStop/afterStop/onCrash hooks
 };
 
@@ -763,6 +882,7 @@ Source-loader notes:
   - disables custom callbacks and built-in TS/TSX/JSX transpilation
   - only final source loader `"js"` is allowed
 - For `module.eval(..., { moduleName })`, built-in loaders (`"js"`, `"ts"`, `"tsx"`, `"jsx"`) are supported.
+- For `modules` startup registration entries, both `Record<string, ...>` and `Map<string, ...>` are supported.
 - For `modules` startup registration entries, object form `{ src, srcLoader? }` is supported.
 - For `modules` startup registration entries, string values are shorthand for `{ src: "...", srcLoader: "js" }`.
 - Custom loader names must still resolve (through `sourceLoaders`) to a built-in runtime loader.
@@ -777,6 +897,15 @@ type EvalOptions = {
   args?: any[];
   maxEvalMs?: number;
   maxCpuMs?: number;
+};
+```
+
+`module.eval`-specific options:
+
+```ts
+type DenoWorkerModuleEvalOptions = Omit<EvalOptions, "type"> & {
+  moduleName?: string;
+  cjs?: boolean; // Node-style CJS wrapper for eval source
 };
 ```
 

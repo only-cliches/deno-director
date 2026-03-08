@@ -5,40 +5,104 @@ All notable changes to this project will be documented in this file.
 ## [0.9.20] Future
 
 ### Fixed
-- Fixed package install flow for consumers by compiling the platform-specific native addon during install:
-  - added package lifecycle `install` hook that runs the native build step and emits local `index.node`.
 - Fixed runtime observability gap for module evaluation failures:
   - `worker.module.eval(...)` now emits `error.thrown` runtime events with `surface: "module.eval"`.
 - Fixed runtime error diagnostics to include local code context:
   - thrown `eval`, `evalSync`, and `module.eval` errors now append a small code frame (a few lines before/after the failing location) when source is available.
 - Fixed Node-style disk resolution returning directory URLs for extensionless directory targets:
-  - `moduleLoader.nodeResolve` now resolves directory imports via nested `package.json` (`module`/`main`) and `index.*` fallback.
+  - Node modules mode now resolves directory imports via nested `package.json` (`module`/`main`) and `index.*` fallback.
 - Fixed CommonJS package interop gap for ESM named imports under Node-style resolution:
-  - added opt-in `moduleLoader.cjsInterop` to rewrite common transpiled CJS patterns into ESM exports at load time.
+  - `nodeJs.cjsInterop` now executes detected CJS modules with a Node-style wrapper (`exports`, `require`, `module`, `__filename`, `__dirname`) and emits an ESM facade (`default` + named aliases).
+- Fixed runtime crashes from CJS heavy Babel loads in `module.eval`:
+  - CJS entry shims for `@babel/parser` and `@babel/generator` now route to host-backed parser/generator globals to avoid unsupported runtime Node-op paths.
+- Fixed severe import-time overhead on Linux/Fedora for large transpiled-CJS graphs:
+  - removed subprocess-based CJS conversion paths and replaced them with in-process Node-style CJS facade generation.
 
 ### Changed
+- Added `worker.module.eval(..., { cjs: true })` for eval-source CommonJS support:
+  - wraps source with Node-style CJS parameters and exposes an ESM facade (`default` + detected named exports).
 - Expanded `imports` callback return contract:
   - string return values are now supported as shorthand for `{ src: "...", srcLoader: "js" }`.
   - string shorthand now passes through `sourceLoaders` transforms the same way object `{ src, srcLoader }` returns do.
 - Updated CommonJS interop implementation:
-  - `moduleLoader.cjsInterop: true` now attempts `cjs2esm` conversion first for non-TypeScript-emitted CJS.
-  - when `cjs2esm` cannot produce safe ESM output, interop falls back to the existing internal transpile path to preserve runtime compatibility.
+  - removed the old CJS rewrite/conversion pipeline.
+  - `nodeJs.cjsInterop` is boolean-only; set `true` to enable Node-style CJS interop.
+  - CJS default-import behavior now matches Node semantics (`default` is `module.exports`; `exports.default` remains nested under that object).
+- Updated Node compatibility API surface:
+  - introduced top-level `nodeJs` bundle with `{ modules, runtime, cjsInterop }`.
+  - module/runtime/CJS knobs are now centralized under `nodeJs`.
+- Added worker cwd runtime API:
+  - `worker.cwd.get()` returns effective worker cwd.
+  - `worker.cwd.set(path)` updates worker cwd and performs restart when worker is running.
+- Added worker env runtime API:
+  - `worker.env.get(key)` reads runtime env (or configured startup env when closed).
+  - `worker.env.set(key, value)` updates runtime env and persists value for restart/next start.
+  - API throws when env permission is explicitly disabled (`permissions.env === false` or `permissions === false`).
+- Updated env bootstrap semantics:
+  - worker runtime no longer auto-copies host process env by default.
+  - use `env: process.env` for explicit host-env passthrough.
+  - `env: true` enables runtime env usage without startup seeding.
+  - `envFile: true` now loads only `<cwd>/.env` and emits startup warning when missing.
+  - `envFile: "path"` remains strict: path resolves from cwd and errors when missing.
+- Updated cwd bootstrap semantics:
+  - omitted `cwd` no longer falls back to host `process.cwd()`.
+  - default worker cwd is now internal sandbox path: `<tmp>/deno-director/sandbox`.
+  - explicit `cwd` values must exist as directories; missing/invalid cwd now fails worker startup.
+- Expanded startup module registration input:
+  - `DenoWorkerOptions.modules` now accepts either `Record<string, ...>` or `Map<string, ...>` entries.
 - Improved internal virtual module URL readability for named registry entries:
   - canonical specifiers now include a sanitized module-name label and stable fingerprint suffix
   - runtime `import.*` events and stack traces now surface user-relevant module context more clearly.
 - Added runtime event lifecycle for module evaluation:
   - emits `module.eval.begin` and `module.eval.end` on `on("runtime")` subscribers.
-
 ### Tests
 - Added Jest coverage for `imports` callback string-shorthand returns with loader-transform parity.
 - Added Rust unit coverage for readable named virtual specifier formatting.
 - Added Jest coverage for `module.eval` runtime event/error telemetry.
 - Updated node-compat resolve tests to assert directory subpath resolution (`package.json` entry and `index.*` fallback).
-- Added node-compat resolve coverage for CJS interop behavior (`cjsInterop` enabled/disabled/`"esbuild"` mode value).
+- Added node-compat resolve coverage for CJS interop behavior (`cjsInterop` enabled/disabled and string-mode ignored) and Node-style default/namespace import semantics.
+- Added coverage for new `nodeJs` API path (`modules`, `runtime`, `cjsInterop`) across module-resolution and env-runtime parity tests.
+- Added modules API coverage for constructor-time `modules: Map(...)` startup entries.
+- Added coverage for new cwd API behavior (`worker.cwd.get/set`) including closed-worker update + restart flow.
+- Added cwd bootstrap coverage for:
+  - omitted `cwd` uses internal sandbox path,
+  - explicit missing `cwd` fails startup.
+- Added coverage for new env API behavior (`worker.env.get/set`) including permission-denied and restart-persistence behavior.
+- Added env bootstrap coverage for:
+  - no implicit host-env copy by default,
+  - `env:true` runtime-env enablement,
+  - `envFile:true` startup warning when cwd `.env` is missing.
+- Added `module.eval` CJS coverage:
+  - rejects plain CJS source without opt-in,
+  - validates `{ cjs: true }` default/named export bridging,
+  - validates Babel-style `Object.defineProperty(exports, "__esModule", ...)` plus static builtin `require(...)`.
+- Added edge-case CJS interop coverage for:
+  - function-valued `module.exports` with attached named members,
+  - local `require("./dep")` CJS chaining,
+  - builtin `require("path")` usage from CJS packages.
+- Added Rust unit coverage for Node-style CJS facade generation:
+  - named export detection from `exports.*`, `module.exports.*`, `defineProperty`, and object-literal assignment patterns,
+  - wrapper source generation with `module`/`exports` runtime and require-map shim,
+  - CJS wrap decision by extension and nearest `package.json` `type`.
+
+### Breaking Changes
+- Replaced legacy Node compatibility option keys with a centralized top-level bundle:
+  - removed top-level `nodeCompat`
+  - removed `moduleLoader.nodeResolve`
+  - removed `moduleLoader.cjsInterop`
+  - use `nodeJs: { modules, runtime, cjsInterop }` instead
+
+### Docs & Examples
+- Updated README Node compatibility documentation to the new centralized `nodeJs` API.
+- Updated `examples/07-node-resolve.ts` to use `nodeJs`.
+- Added `examples/15-nodejs-cjs-interop.ts` showing `nodeJs` + CJS package interop.
+- Added README usage docs for `worker.cwd.get/set`.
 
 ## [0.9.12] Mar 6, 2026
 
 ### Fixed
+- Fixed package install flow for consumers by compiling the platform-specific native addon during install:
+  - added package lifecycle `install` hook that runs the native build step and emits local `index.node`.
 - Hardened `permissions.net` / `permissions.import` host allow-list matching for IPv6 entries:
   - bracketed IPv6 `host:port` values now enforce port constraints correctly
   - malformed bracketed IPv6 entries are rejected instead of falling back to host-only matching

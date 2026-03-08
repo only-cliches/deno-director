@@ -46,6 +46,59 @@ describe("module.eval: module namespace API", () => {
     }
   });
 
+  test("CJS source fails under plain module.eval without cjs option", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      await expect(
+        dw.module.eval(`
+          "use strict";
+          exports.add = function add(a, b) { return a + b; };
+        `),
+      ).rejects.toBeTruthy();
+    } finally {
+      await dw.close();
+    }
+  });
+
+  test("module.eval supports CJS source when cjs:true is enabled", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const mod = await dw.module.eval(`
+        "use strict";
+        exports.add = function add(a, b) { return a + b; };
+        exports.kind = "cjs";
+      `, { cjs: true });
+
+      expect(typeof mod.add).toBe("function");
+      expect(mod.add(2, 5)).toBe(7);
+      expect(mod.kind).toBe("cjs");
+      expect(mod.default).toBeDefined();
+    } finally {
+      await dw.close();
+    }
+  });
+
+  test("module.eval cjs:true supports static require and Babel-style exports", async () => {
+    const dw = createTestWorker({ console: false, nodeJs: { modules: true } });
+    try {
+      const mod = await dw.module.eval(`
+        "use strict";
+        Object.defineProperty(exports, "__esModule", { value: true });
+        exports.basename = basename;
+        const path = require("path");
+        function basename(input) {
+          return path.basename(input);
+        }
+      `, { cjs: true });
+
+      expect(typeof mod.basename).toBe("function");
+      expect(mod.basename("/tmp/demo/file.ts")).toBe("file.ts");
+      expect(mod.default).toBeDefined();
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("module evaluation can return expanded types via exports", async () => {
     const dw = createTestWorker({ console: false });
     try {

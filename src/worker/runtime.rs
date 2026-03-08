@@ -31,6 +31,7 @@ use crate::worker::ops::{
 use crate::worker::state::RuntimeLimits;
 use crate::worker::stream_plane::NativeIncomingPlane;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc as std_mpsc;
@@ -371,8 +372,33 @@ pub fn spawn_worker_thread(
             });
 
             let cwd_path = normalize_cwd(limits.cwd.as_deref());
+            let cwd_explicit = limits
+                .cwd
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if cwd_explicit {
+                if !cwd_path.exists() || !cwd_path.is_dir() {
+                    eprintln!(
+                        "[deno-director] configured cwd is invalid: {}",
+                        cwd_path.to_string_lossy()
+                    );
+                    let _ = node_tx.blocking_send(NodeMsg::EmitClose);
+                    mark_worker_closed(worker_id);
+                    return;
+                }
+            } else if let Err(e) = std::fs::create_dir_all(&cwd_path) {
+                eprintln!(
+                    "[deno-director] failed to create default worker cwd {}: {}",
+                    cwd_path.to_string_lossy(),
+                    e
+                );
+                let _ = node_tx.blocking_send(NodeMsg::EmitClose);
+                mark_worker_closed(worker_id);
+                return;
+            }
 
-            let env_snapshot = merge_env_snapshot(std::env::vars().collect(), limits.env.as_ref());
+            let env_snapshot = merge_env_snapshot(HashMap::new(), limits.env.as_ref());
             let env_access = env_access_from_permissions(limits.permissions.as_ref());
 
             let startup_url = normalize_startup_url(&cwd_path, limits.startup.as_deref());

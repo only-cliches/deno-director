@@ -29,6 +29,26 @@ describe("deno_worker: runtime-local env namespace", () => {
     await expect(dw2.eval(`Deno.env.get("${key}")`)).resolves.toBeUndefined();
   });
 
+  test("host process env is not copied by default", async () => {
+    const hostKey = `TEST_HOST_ONLY_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    process.env[hostKey] = "host-only";
+    const dw = createTestWorker({ permissions: { env: true } });
+    workers.push(dw);
+    try {
+      await expect(dw.eval(`Deno.env.get("${hostKey}")`)).resolves.toBeUndefined();
+    } finally {
+      delete process.env[hostKey];
+    }
+  });
+
+  test("env:true enables runtime env usage without startup env seeding", async () => {
+    const key2 = `TEST_ENV_TRUE_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const dw = createTestWorker({ env: true });
+    workers.push(dw);
+    await expect(dw.eval(`Deno.env.get("${key2}")`)).resolves.toBeUndefined();
+    await expect(dw.eval(`Deno.env.set("${key2}", "ok"); Deno.env.get("${key2}")`)).resolves.toBe("ok");
+  });
+
   test("Deno.env.set/delete are isolated across running workers", async () => {
     const dw1 = createTestWorker({ permissions: { env: true } });
     const dw2 = createTestWorker({ permissions: { env: true } });

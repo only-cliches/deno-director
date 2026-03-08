@@ -560,7 +560,7 @@ impl FileSystem for SandboxFs {
 
 /// Normalizes cwd into a canonical form before it is used by sandboxed filesystem access and path normalization.
 pub fn normalize_cwd(raw: Option<&str>) -> PathBuf {
-    let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let fallback = std::env::temp_dir().join("deno-director").join("sandbox");
 
     let Some(raw) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         return fallback;
@@ -572,14 +572,15 @@ pub fn normalize_cwd(raw: Option<&str>) -> PathBuf {
                 return p;
             }
         }
-        return fallback;
+        return PathBuf::from(raw);
     }
 
     let p = Path::new(raw);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
-        fallback.join(p)
+        let host_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        host_cwd.join(p)
     }
 }
 
@@ -682,7 +683,7 @@ mod tests {
     #[test]
     // Normalizes cwd handles file urls and relative paths into a canonical form before it is used by sandboxed filesystem access and path normalization.
     fn normalize_cwd_handles_file_urls_and_relative_paths() {
-        let fallback = std::env::current_dir().expect("cwd");
+        let fallback = std::env::temp_dir().join("deno-director").join("sandbox");
         assert_eq!(normalize_cwd(None), fallback);
         assert_eq!(normalize_cwd(Some("   ")), fallback);
 
@@ -693,7 +694,8 @@ mod tests {
         assert_eq!(normalize_cwd(Some(&as_url)), root);
 
         let rel = normalize_cwd(Some("subdir"));
-        assert_eq!(rel, fallback.join("subdir"));
+        let host_cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(rel, host_cwd.join("subdir"));
 
         let _ = std::fs::remove_dir_all(root);
     }

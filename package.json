@@ -43,6 +43,8 @@
   "author": "me@scottlott.com",
   "license": "MIT",
   "dependencies": {
+    "@babel/generator": "^7.29.1",
+    "@babel/parser": "^7.29.0",
     "cargo-cp-artifact": "^0.1.9",
     "cjs2esm": "^6.0.0",
     "p-limit": "^3.1.0"

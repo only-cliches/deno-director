@@ -19,6 +19,7 @@ Run these first to see the core behavior quickly.
 - `12-handles.ts`: operate on long-lived runtime object graphs with handles.
 - `13-serverless-style.ts`: Node HTTP server that routes by `Host` header to warm runtime pools.
 - `14-custom-loaders.ts`: chain custom loader callbacks to alias, override, or block loader modes.
+- `15-nodejs-cjs-interop.ts`: centralized `nodeJs` config with CJS package interop (`modules` + `runtime` + `cjsInterop`).
 
 ## Run One
 

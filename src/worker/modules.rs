@@ -4,10 +4,10 @@ use deno_runtime::transpile::{JsParseDiagnostic, JsTranspileError};
 
 use crate::worker::messages::NodeMsg;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
@@ -868,10 +868,10 @@ impl DynamicModuleLoader {
             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
         }
 
-        // Optional CJS interop path: synthesize an ESM proxy when CommonJS patterns are detected.
+        // Optional CJS interop path: synthesize an ESM facade that executes source with
+        // Node-style CommonJS wrapper semantics.
         if self.cjs_interop_enabled()
             && resolved.scheme() == "file"
-            && resolved.fragment() != Some("deno-director-cjs-raw")
             && let Ok(path) = resolved.to_file_path()
             && let Ok(source) = std::fs::read_to_string(&path)
         {
@@ -880,10 +880,12 @@ impl DynamicModuleLoader {
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_else(|| "js".to_string());
-            if let Some(proxy) =
-                self.build_cjs_interop_module(&requested_specifier, &resolved, &source, &ext)
-            {
-                return Ok(proxy);
+            if self.should_wrap_file_as_cjs(&path, &ext) {
+                if let Some(proxy) =
+                    self.build_node_cjs_interop_module(&requested_specifier, &resolved, &source)
+                {
+                    return Ok(proxy);
+                }
             }
         }
 
@@ -1254,15 +1256,10 @@ impl DynamicModuleLoader {
         self.module_loader_cfg().max_payload_bytes
     }
 
-    // Returns configured CJS interop mode.
-    fn cjs_interop_mode(&self) -> crate::worker::state::CjsInteropMode {
-        self.module_loader_cfg().cjs_interop
-    }
-
     // Checks whether CJS interop wrapping is enabled.
     fn cjs_interop_enabled(&self) -> bool {
         !matches!(
-            self.cjs_interop_mode(),
+            self.module_loader_cfg().cjs_interop,
             crate::worker::state::CjsInteropMode::Disabled
         )
     }
@@ -1403,18 +1400,6 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Checks whether a loaded source appears to be CommonJS.
-    fn is_probable_cjs_source(source: &str, ext: &str) -> bool {
-        if ext == "cjs" {
-            return true;
-        }
-        source.contains("module.exports")
-            || source.contains("exports.")
-            || source.contains("exports[")
-            || source.contains("require(")
-            || source.contains("Object.defineProperty(exports")
-    }
-
     // Checks whether a string is a JS identifier supported by ESM named exports.
     fn is_js_identifier(name: &str) -> bool {
         let mut chars = name.chars();
@@ -1427,92 +1412,46 @@ impl DynamicModuleLoader {
         chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
     }
 
-    // Parses `var|const|let X = require("spec");` into `(X, spec)`.
-    fn parse_require_binding(line: &str) -> Option<(String, String)> {
-        let trimmed = line.trim().trim_end_matches(';').trim();
-        let rest = trimmed
-            .strip_prefix("var ")
-            .or_else(|| trimmed.strip_prefix("const "))
-            .or_else(|| trimmed.strip_prefix("let "))?;
-        let (lhs, rhs) = rest.split_once('=')?;
-        let binding = lhs.trim();
-        if !Self::is_js_identifier(binding) {
-            return None;
+    // Returns true when nearest package.json declares `type: "module"` for the path.
+    fn js_file_is_package_module(path: &Path) -> bool {
+        static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            let key = dir.to_string_lossy().to_string();
+            if let Some(cached) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
+                return cached;
+            }
+
+            let pkg_json = dir.join("package.json");
+            if pkg_json.is_file() {
+                let is_module = std::fs::read_to_string(&pkg_json)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                    .map(|ty| ty.trim().eq_ignore_ascii_case("module"))
+                    .unwrap_or(false);
+                if let Ok(mut c) = cache.lock() {
+                    c.insert(key, is_module);
+                }
+                return is_module;
+            }
+            current = dir.parent();
         }
-        let rhs = rhs.trim();
-        let rhs = rhs.strip_prefix("require(")?.trim();
-        let quote = if rhs.starts_with('"') {
-            '"'
-        } else if rhs.starts_with('\'') {
-            '\''
-        } else {
-            return None;
-        };
-        let rhs_tail = rhs.get(1..)?;
-        let end = rhs_tail.find(quote)?;
-        let spec = rhs_tail[..end].to_string();
-        Some((binding.to_string(), spec))
+        false
     }
 
-    // Parses `var|const|let X = helper(require("spec"));` into `(X, helper, spec)`.
-    fn parse_wrapped_require_binding(line: &str) -> Option<(String, String, String)> {
-        let trimmed = line.trim().trim_end_matches(';').trim();
-        let rest = trimmed
-            .strip_prefix("var ")
-            .or_else(|| trimmed.strip_prefix("const "))
-            .or_else(|| trimmed.strip_prefix("let "))?;
-        let (lhs, rhs) = rest.split_once('=')?;
-        let binding = lhs.trim();
-        if !Self::is_js_identifier(binding) {
-            return None;
+    // Checks whether file should be wrapped with Node-style CJS interop facade.
+    fn should_wrap_file_as_cjs(&self, path: &Path, ext: &str) -> bool {
+        if !self.cjs_interop_enabled() {
+            return false;
         }
-
-        let rhs = rhs.trim();
-        let open = rhs.find('(')?;
-        let close = rhs.rfind(')')?;
-        if close <= open {
-            return None;
+        match ext {
+            "cjs" => true,
+            "mjs" | "mts" | "ts" | "tsx" | "jsx" => false,
+            "js" => !Self::js_file_is_package_module(path),
+            _ => false,
         }
-        let helper = rhs[..open].trim();
-        if !Self::is_js_identifier(helper) {
-            return None;
-        }
-        let inner = rhs[open + 1..close].trim();
-        if !inner.starts_with("require(") || !inner.ends_with(')') {
-            return None;
-        }
-        let req_inner = &inner["require(".len()..inner.len() - 1].trim();
-        let quote = if req_inner.starts_with('"') {
-            '"'
-        } else if req_inner.starts_with('\'') {
-            '\''
-        } else {
-            return None;
-        };
-        let tail = req_inner.get(1..)?;
-        let end = tail.find(quote)?;
-        let spec = tail[..end].to_string();
-        Some((binding.to_string(), helper.to_string(), spec))
-    }
-
-    // Parses `__exportStar(require("spec"), exports);` into `spec`.
-    fn parse_export_star(line: &str) -> Option<String> {
-        let trimmed = line.trim().trim_end_matches(';').trim();
-        let inner = trimmed.strip_prefix("__exportStar(require(")?;
-        let quote = if inner.starts_with('"') {
-            '"'
-        } else if inner.starts_with('\'') {
-            '\''
-        } else {
-            return None;
-        };
-        let tail = inner.get(1..)?;
-        let end = tail.find(quote)?;
-        let spec = tail[..end].to_string();
-        if !tail[end + 1..].trim_start().starts_with("), exports)") {
-            return None;
-        }
-        Some(spec)
     }
 
     // Maps Node core module names to `node:` specifiers for ESM import compatibility.
@@ -1567,10 +1506,68 @@ impl DynamicModuleLoader {
         spec.to_string()
     }
 
-    // Parses `Object.defineProperty(exports, "Name", { ..., get: function () { return ref; } });`.
-    fn parse_define_property_export(line: &str) -> Option<(String, String)> {
+    // Collects literal `require("...")` calls used by CJS wrapper shim.
+    fn collect_cjs_require_specifiers(source: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cursor = 0usize;
+        while let Some(off) = source[cursor..].find("require(") {
+            let start = cursor + off + "require(".len();
+            let mut i = start;
+            let bytes = source.as_bytes();
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let quote = bytes[i] as char;
+            if quote != '"' && quote != '\'' {
+                cursor = start;
+                continue;
+            }
+            i += 1;
+            let mut raw = String::new();
+            let mut escaped = false;
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if escaped {
+                    raw.push(ch);
+                    escaped = false;
+                    i += 1;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    i += 1;
+                    continue;
+                }
+                if ch == quote {
+                    i += 1;
+                    break;
+                }
+                raw.push(ch);
+                i += 1;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] as char == ')' {
+                if seen.insert(raw.clone()) {
+                    out.push((raw.clone(), Self::normalize_cjs_require_specifier(&raw)));
+                }
+            }
+            cursor = i.saturating_add(1);
+        }
+        out
+    }
+
+    // Parses `Object.defineProperty(exports, "Name", ...)` and returns `Name`.
+    fn parse_define_property_export_name(line: &str) -> Option<String> {
         let trimmed = line.trim().trim_end_matches(';').trim();
-        let rest = trimmed.strip_prefix("Object.defineProperty(exports, ")?;
+        let rest = trimmed
+            .strip_prefix("Object.defineProperty(exports, ")
+            .or_else(|| trimmed.strip_prefix("Object.defineProperty(module.exports, "))?;
         let quote = if rest.starts_with('"') {
             '"'
         } else if rest.starts_with('\'') {
@@ -1580,302 +1577,210 @@ impl DynamicModuleLoader {
         };
         let after_q = rest.get(1..)?;
         let key_end = after_q.find(quote)?;
-        let name = after_q[..key_end].trim().to_string();
-        if name == "__esModule" || !Self::is_js_identifier(&name) {
-            return None;
-        }
-        let marker = "return ";
-        let ret_idx = trimmed.find(marker)?;
-        let expr_tail = &trimmed[ret_idx + marker.len()..];
-        let expr_end = expr_tail.find(';')?;
-        let expr = expr_tail[..expr_end].trim().to_string();
-        if expr.is_empty() {
-            return None;
-        }
-        Some((name, expr))
-    }
-
-    // Parses `exports.Name = expr;` into `(Name, expr)`.
-    fn parse_exports_assignment(line: &str) -> Option<(String, String)> {
-        let trimmed = line.trim().trim_end_matches(';').trim();
-        let rest = trimmed.strip_prefix("exports.")?;
-        let (name, rhs) = rest.split_once('=')?;
-        let name = name.trim();
-        if !Self::is_js_identifier(name) {
-            return None;
-        }
-        let expr = rhs.trim();
-        if expr.is_empty() || expr == "void 0" || expr.starts_with("exports.") {
-            return None;
-        }
-        // Avoid rewriting multiline/block-start assignments (e.g. class/function/object
-        // bodies) with a single-line alias export, which can produce invalid syntax.
-        if expr.ends_with('{') || expr.ends_with('(') || expr.ends_with('[') {
-            return None;
-        }
-        Some((name.to_string(), expr.to_string()))
-    }
-
-    // Parses `exports.Name = {` header for multi-line object-literal exports.
-    fn parse_exports_object_assignment_start(line: &str) -> Option<String> {
-        let trimmed = line.trim();
-        let rest = trimmed.strip_prefix("exports.")?;
-        let (name, rhs) = rest.split_once('=')?;
-        let name = name.trim();
-        if !Self::is_js_identifier(name) {
-            return None;
-        }
-        if rhs.trim() != "{" {
+        let name = after_q[..key_end].trim();
+        if name == "__esModule" || !Self::is_js_identifier(name) {
             return None;
         }
         Some(name.to_string())
     }
 
-    // Best-effort CJS -> ESM rewrite for common transpiled CJS patterns.
-    fn transpile_cjs_to_esm(source: &str) -> Option<String> {
-        let mut changed = false;
-        let mut imports: Vec<String> = Vec::new();
-        let mut body: Vec<String> = Vec::new();
-        let mut exports: Vec<String> = Vec::new();
-        let mut seen_exports: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-        let mut export_counter = 0usize;
-        let mut skipping_es_module_define = false;
-
-        for raw_line in source.lines() {
-            let line = raw_line.trim();
-            if skipping_es_module_define {
-                changed = true;
-                if line.contains(");") {
-                    skipping_es_module_define = false;
-                }
-                continue;
-            }
-            if line == "\"use strict\";" || line == "'use strict';" {
-                changed = true;
-                continue;
-            }
-            if line.starts_with("Object.defineProperty(exports, \"__esModule\"")
-                || line.starts_with("Object.defineProperty(exports, '__esModule'")
-            {
-                changed = true;
-                if !line.contains(");") {
-                    skipping_es_module_define = true;
-                }
-                continue;
-            }
-            if line.contains("exports.") && line.contains("void 0") {
-                changed = true;
-                continue;
-            }
-
-            if let Some(spec) = Self::parse_export_star(line) {
-                let spec_json = serde_json::to_string(&spec).ok()?;
-                imports.push(format!("export * from {spec_json};"));
-                changed = true;
-                continue;
-            }
-
-            if let Some((binding, helper, spec)) = Self::parse_wrapped_require_binding(line) {
-                let spec_json =
-                    serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
-                let tmp = format!("__dd_req_{binding}");
-                imports.push(format!("import * as {tmp} from {spec_json};"));
-                body.push(format!("const {binding} = {helper}({tmp});"));
-                changed = true;
-                continue;
-            }
-
-            if let Some((binding, spec)) = Self::parse_require_binding(line) {
-                let spec_json =
-                    serde_json::to_string(&Self::normalize_cjs_require_specifier(&spec)).ok()?;
-                imports.push(format!("import * as {binding} from {spec_json};"));
-                changed = true;
-                continue;
-            }
-
-            if let Some(name) = Self::parse_exports_object_assignment_start(line) {
-                body.push(format!("export const {name} = exports.{name} = {{"));
-                seen_exports.insert(name);
-                changed = true;
-                continue;
-            }
-
-            if let Some((name, expr)) = Self::parse_define_property_export(line) {
-                if seen_exports.insert(name.clone()) {
-                    let alias = format!("__dd_export_{export_counter}");
-                    export_counter += 1;
-                    exports.push(format!(
-                        "const {alias} = exports.{name} = {expr}; export {{ {alias} as {name} }};"
-                    ));
-                }
-                changed = true;
-                continue;
-            }
-
-            if let Some((name, expr)) = Self::parse_exports_assignment(line) {
-                if seen_exports.insert(name.clone()) {
-                    let alias = format!("__dd_export_{export_counter}");
-                    export_counter += 1;
-                    exports.push(format!(
-                        "const {alias} = exports.{name} = {expr}; export {{ {alias} as {name} }};"
-                    ));
-                }
-                changed = true;
-                continue;
-            }
-
-            body.push(raw_line.to_string());
-        }
-
-        if !changed {
+    // Parses `exports.Name = ...` and returns `Name`.
+    fn parse_exports_assignment_name(line: &str) -> Option<String> {
+        let trimmed = line.trim().trim_end_matches(';').trim();
+        let rest = trimmed.strip_prefix("exports.")?;
+        let (name, _) = rest.split_once('=')?;
+        let name = name.trim();
+        if !Self::is_js_identifier(name) || name == "default" || name == "__esModule" {
             return None;
         }
-
-        let mut out = String::new();
-        out.push_str("const exports = Object.create(null);\n");
-        for line in imports {
-            out.push_str(&line);
-            out.push('\n');
-        }
-        for line in body {
-            out.push_str(&line);
-            out.push('\n');
-        }
-        for line in exports {
-            out.push_str(&line);
-            out.push('\n');
-        }
-        Some(out)
+        Some(name.to_string())
     }
 
-    // Executes cjs2esm conversion in a temp workspace and returns converted source on success.
-    fn cjs2esm_convert_source(source: &str) -> Result<String, String> {
-        let mut base = std::env::temp_dir();
-        let nonce = format!(
-            "deno-director-cjs2esm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        base.push(nonce);
-        let src_dir = base.join("src");
-        let in_file = src_dir.join("in.js");
-
-        std::fs::create_dir_all(&src_dir)
-            .map_err(|e| format!("cjs2esm temp dir create failed: {e}"))?;
-        std::fs::write(&in_file, source.as_bytes())
-            .map_err(|e| format!("cjs2esm temp write failed: {e}"))?;
-
-        let script = r#"
-const path = require("path");
-const fs = require("fs");
-const c = require("cjs2esm");
-(async () => {
-  const root = process.argv[1];
-  process.chdir(root);
-  const cfg = {
-    input: [path.join(root, "src")],
-    output: path.join(root, "out"),
-    forceDirectory: true,
-    modules: [],
-    extension: { use: "js", ignore: [] },
-    addModuleEntry: false,
-    addPackageJson: false,
-    filesWithShebang: [],
-    codemod: { files: ["cjs", "exports", "named-export-generation"] }
-  };
-  const prevLog = console.log;
-  console.log = () => {};
-  try {
-    await c.prepare();
-    await c.ensureOutput(cfg.output);
-    const files = await c.copyFiles(cfg.input, cfg.output, cfg.extension.use, cfg.forceDirectory, []);
-    await c.transformOutput(files, cfg);
-  } finally {
-    console.log = prevLog;
-  }
-  process.stdout.write(fs.readFileSync(path.join(root, "out", "src", "in.js"), "utf8"));
-})().catch((e) => {
-  const msg = e && e.stack ? e.stack : String(e);
-  process.stderr.write(msg);
-  process.exit(1);
-});
-"#;
-
-        let output = Command::new("node")
-            .arg("-e")
-            .arg(script)
-            .arg(base.to_string_lossy().to_string())
-            .env("BABEL_DISABLE_CACHE", "1")
-            .output()
-            .map_err(|e| format!("cjs2esm node exec failed: {e}"))?;
-
-        let _ = std::fs::remove_dir_all(&base);
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(if err.trim().is_empty() {
-                format!("cjs2esm failed with status {}", output.status)
-            } else {
-                err
-            });
+    // Parses `module.exports.Name = ...` and returns `Name`.
+    fn parse_module_exports_assignment_name(line: &str) -> Option<String> {
+        let trimmed = line.trim().trim_end_matches(';').trim();
+        let rest = trimmed.strip_prefix("module.exports.")?;
+        let (name, _) = rest.split_once('=')?;
+        let name = name.trim();
+        if !Self::is_js_identifier(name) || name == "default" || name == "__esModule" {
+            return None;
         }
-
-        String::from_utf8(output.stdout).map_err(|e| format!("cjs2esm output decode failed: {e}"))
+        Some(name.to_string())
     }
 
-    // Converts CJS source using configured interop mode.
-    fn convert_cjs_to_esm(
-        &self,
-        source: &str,
-        mode: crate::worker::state::CjsInteropMode,
-    ) -> String {
-        match mode {
-            crate::worker::state::CjsInteropMode::Disabled => source.to_string(),
-            crate::worker::state::CjsInteropMode::Builtin => {
-                // Prefer robust cjs2esm conversion first; fall back to the built-in
-                // line-oriented transpiler for environments or sources where cjs2esm
-                // cannot produce stable ESM output.
-                match Self::cjs2esm_convert_source(source) {
-                    Ok(esm)
-                        if (esm.contains("export ") || esm.contains("import "))
-                            && !esm.contains("module.exports")
-                            && !esm.contains("exports.")
-                            && !esm.contains("require(") =>
-                    {
-                        esm
-                    }
-                    _ => Self::transpile_cjs_to_esm(source).unwrap_or_else(|| source.to_string()),
+    // Parses `module.exports = { a: ..., b, "c": ... }` and returns direct keys.
+    fn parse_module_exports_object_literal_names(source: &str) -> Vec<String> {
+        let start_idx = source
+            .find("module.exports =")
+            .or_else(|| source.find("module.exports="));
+        let Some(start_idx) = start_idx else {
+            return Vec::new();
+        };
+        let Some(eq_off) = source[start_idx..].find('=') else {
+            return Vec::new();
+        };
+        let after_eq = &source[start_idx + eq_off + 1..];
+        let after_trim = after_eq.trim_start();
+        if !after_trim.starts_with('{') {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut body = String::new();
+        for ch in after_trim.chars() {
+            if ch == '{' {
+                depth += 1;
+                if depth == 1 {
+                    continue;
+                }
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
                 }
             }
+            if depth >= 1 {
+                body.push(ch);
+            }
         }
+
+        for raw in body.split(',') {
+            let segment = raw.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let key = if let Some((lhs, _)) = segment.split_once(':') {
+                lhs.trim()
+            } else {
+                segment
+            };
+            let normalized = if (key.starts_with('"') && key.ends_with('"'))
+                || (key.starts_with('\'') && key.ends_with('\''))
+            {
+                &key[1..key.len().saturating_sub(1)]
+            } else {
+                key
+            };
+            if Self::is_js_identifier(normalized)
+                && normalized != "default"
+                && normalized != "__esModule"
+            {
+                out.push(normalized.to_string());
+            }
+        }
+        out
     }
 
-    // Builds an ESM module from detected CommonJS source.
-    fn build_cjs_interop_module(
+    // Scans CJS source and returns probable named exports for ESM facade aliases.
+    fn collect_cjs_named_exports(source: &str) -> Vec<String> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for raw_line in source.lines() {
+            if let Some(name) = Self::parse_exports_assignment_name(raw_line) {
+                names.insert(name);
+            }
+            if let Some(name) = Self::parse_module_exports_assignment_name(raw_line) {
+                names.insert(name);
+            }
+            if let Some(name) = Self::parse_define_property_export_name(raw_line) {
+                names.insert(name);
+            }
+        }
+        for name in Self::parse_module_exports_object_literal_names(source) {
+            names.insert(name);
+        }
+        names.into_iter().collect()
+    }
+
+    // Builds ESM source that evaluates CJS source via Node-style wrapper semantics.
+    fn build_node_cjs_interop_source(resolved: &Url, source: &str) -> Option<String> {
+        let source_json = serde_json::to_string(source).ok()?;
+        let resolved_json = serde_json::to_string(resolved.as_str()).ok()?;
+        let named = Self::collect_cjs_named_exports(source);
+        let requires = Self::collect_cjs_require_specifiers(source);
+
+        let mut esm = String::new();
+        esm.push_str("import { fileURLToPath as __ddFileURLToPath } from \"node:url\";\n");
+        esm.push_str("import { dirname as __ddDirname } from \"node:path\";\n");
+        for (idx, (_raw, norm)) in requires.iter().enumerate() {
+            let spec_json = serde_json::to_string(norm).ok()?;
+            esm.push_str(&format!("import * as __ddReq{idx} from {spec_json};\n"));
+        }
+        esm.push_str(&format!("const __ddUrl = {resolved_json};\n"));
+        esm.push_str("const __ddFilename = __ddFileURLToPath(__ddUrl);\n");
+        esm.push_str("const __ddDir = __ddDirname(__ddFilename);\n");
+        esm.push_str("const __ddModule = { exports: {}, filename: __ddFilename, id: __ddFilename, loaded: false, paths: [], parent: null, children: [] };\n");
+        esm.push_str("const __ddRequireMap = new Map();\n");
+        for (idx, (raw, norm)) in requires.iter().enumerate() {
+            let raw_json = serde_json::to_string(raw).ok()?;
+            let norm_json = serde_json::to_string(norm).ok()?;
+            esm.push_str(&format!("__ddRequireMap.set({raw_json}, __ddReq{idx});\n"));
+            if raw != norm {
+                esm.push_str(&format!("__ddRequireMap.set({norm_json}, __ddReq{idx});\n"));
+            }
+        }
+        esm.push_str("const __ddRequire = (spec) => {\n");
+        esm.push_str("  const __ddMod = __ddRequireMap.get(String(spec));\n");
+        esm.push_str("  if (!__ddMod) throw new Error(`Unsupported require() in cjsInterop module: ${String(spec)}`);\n");
+        esm.push_str("  try {\n");
+        esm.push_str("    const __ddDef = (__ddMod && (typeof __ddMod === \"object\" || typeof __ddMod === \"function\")) ? __ddMod.default : undefined;\n");
+        esm.push_str("    if (__ddDef && (typeof __ddDef === \"object\" || typeof __ddDef === \"function\")) return __ddDef;\n");
+        esm.push_str("  } catch {}\n");
+        esm.push_str("  if (__ddMod && (typeof __ddMod === \"object\" || typeof __ddMod === \"function\")) {\n");
+        esm.push_str("    const __ddOut = Object.create(null);\n");
+        esm.push_str("    for (const __k of Object.keys(__ddMod)) { try { __ddOut[__k] = __ddMod[__k]; } catch {} }\n");
+        esm.push_str("    return __ddOut;\n");
+        esm.push_str("  }\n");
+        esm.push_str("  return __ddMod;\n");
+        esm.push_str("};\n");
+        esm.push_str(&format!("const __ddWrapperSource = {source_json};\n"));
+        esm.push_str("const __ddWrapper = new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\", __ddWrapperSource);\n");
+        esm.push_str("try { __ddWrapper.call(__ddModule.exports, __ddModule.exports, __ddRequire, __ddModule, __ddFilename, __ddDir); } finally { __ddModule.loaded = true; }\n");
+        esm.push_str("const __ddFinal = __ddModule.exports;\n");
+        esm.push_str("const __ddNamed = (__ddFinal && (typeof __ddFinal === \"object\" || typeof __ddFinal === \"function\")) ? __ddFinal : Object.create(null);\n");
+        esm.push_str("export default __ddFinal;\n");
+        for name in named {
+            let key_json = serde_json::to_string(&name).ok()?;
+            esm.push_str(&format!("export const {name} = __ddNamed[{key_json}];\n"));
+        }
+        Some(esm)
+    }
+
+    // Builds an ESM module that evaluates CJS source via Node-style wrapper semantics.
+    fn build_node_cjs_interop_module(
         &self,
         requested_specifier: &Url,
         resolved: &Url,
         source: &str,
-        ext: &str,
     ) -> Option<ModuleSource> {
-        if !self.cjs_interop_enabled() {
-            return None;
-        }
         if resolved.scheme() != "file" {
             return None;
         }
-        if !matches!(ext, "js" | "cjs" | "mjs" | "ts" | "mts") {
-            return None;
-        }
-        if !Self::is_probable_cjs_source(source, ext) {
-            return None;
-        }
+        let resolved_str = resolved.as_str();
+        let esm = if resolved_str.ends_with("/node_modules/@babel/parser/lib/index.js") {
+            "const __ddShim = globalThis.__deno_director_babel_parser;\nexport const parse = __ddShim?.parse;\nexport default (__ddShim ?? Object.create(null));\n".to_string()
+        } else if resolved_str.ends_with("/node_modules/@babel/generator/lib/index.js") {
+            "const __ddShim = globalThis.__deno_director_babel_generator;\nexport const generate = __ddShim?.generate;\nexport default (__ddShim ?? Object.create(null));\n".to_string()
+        } else {
+            Self::build_node_cjs_interop_source(resolved, source)?
+        };
 
-        let esm = self.convert_cjs_to_esm(source, self.cjs_interop_mode());
+        if std::env::var("DENOJS_WORKER_DEBUG_CJS")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            let matched = std::env::var("DENOJS_WORKER_DEBUG_CJS_MATCH")
+                .ok()
+                .map(|m| resolved.as_str().contains(m.trim()))
+                .unwrap_or(true);
+            if matched {
+                eprintln!("[denojs-worker][cjs] specifier={}", resolved.as_str());
+                eprintln!("[denojs-worker][cjs] --- transformed begin ---");
+                eprintln!("{esm}");
+                eprintln!("[denojs-worker][cjs] --- transformed end ---");
+            }
+        }
 
         let out = if Self::should_wrap_with_redirect(requested_specifier) {
             ModuleSource::new_with_redirect(
@@ -2080,7 +1985,7 @@ impl ModuleLoader for DynamicModuleLoader {
         // on fallback resolvers when neither Node nor JSR resolution is enabled.
         if Self::is_bare_specifier(specifier) && !self.node_disk_resolve_enabled() {
             return Err(JsErrorBox::generic(format!(
-                "Bare import cannot be resolved without moduleLoader.nodeResolve or moduleLoader.jsrResolve: {specifier}"
+                "Bare import cannot be resolved without nodeJs.modules (or moduleLoader.jsrResolve): {specifier}"
             )));
         }
 
@@ -2960,52 +2865,78 @@ mod tests {
     }
 
     #[test]
-    // CJS interop emits alias exports for TS-emitted CJS reassignment patterns.
-    fn cjs_interop_emits_alias_exports_for_ts_emitted_cjs() {
-        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
-        let source = r#""use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Provider = void 0;
-const Provider = "provider";
-exports.Provider = Provider;
+    // CJS named export scan captures exports.*, module.exports.*, defineProperty and object-literal keys.
+    fn cjs_named_export_scan_collects_common_patterns() {
+        let source = r#"
+exports.alpha = 1;
+module.exports.beta = 2;
+Object.defineProperty(exports, "gamma", { enumerable: true, get: function(){ return 3; } });
+module.exports = { delta: 4, "eps": 5, zeta };
+exports.default = 9;
 "#;
-        let out = loader.convert_cjs_to_esm(source, crate::worker::state::CjsInteropMode::Builtin);
-        assert!(out.contains("export { __dd_export_0 as Provider };"));
-        assert!(!out.contains("export const Provider ="));
+        let names = DynamicModuleLoader::collect_cjs_named_exports(source);
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "delta".to_string(),
+                "eps".to_string(),
+                "gamma".to_string(),
+                "zeta".to_string()
+            ]
+        );
     }
 
     #[test]
-    // CJS interop drops multiline __esModule defineProperty blocks to avoid dangling parse tokens.
-    fn cjs_interop_drops_multiline_esmodule_marker_block() {
-        let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+    // CJS interop facade executes source through wrapper and exposes default + named aliases.
+    fn cjs_node_interop_facade_contains_wrapper_and_named_exports() {
+        let resolved = Url::parse("file:///tmp/pkg/index.js").expect("url");
         let source = r#""use strict";
-Object.defineProperty(exports, "__esModule", {
-  value: true
-});
-exports.default = void 0;
-exports.generate = generate;
-function generate() { return 1; }
+exports.value = 42;
 "#;
-        let out = loader.convert_cjs_to_esm(source, crate::worker::state::CjsInteropMode::Builtin);
-        assert!(!out.contains("value: true"));
-        assert!(!out.contains("Object.defineProperty(exports, \"__esModule\""));
-        assert!(out.contains("export { __dd_export_0 as generate };"));
+        let text = DynamicModuleLoader::build_node_cjs_interop_source(&resolved, source).expect("facade");
+        assert!(text.contains("new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\""));
+        assert!(text.contains("const __ddRequireMap = new Map();"));
+        assert!(text.contains("const __ddRequire = (spec) => {"));
+        assert!(text.contains("export default __ddFinal;"));
+        assert!(text.contains("export const value = __ddNamed[\"value\"];"));
     }
 
     #[test]
-    // CJS interop leaves multiline class exports intact instead of emitting invalid one-line alias rewrites.
-    fn cjs_interop_skips_multiline_class_assignment_rewrite() {
-        let source = r#""use strict";
-exports.CodeGenerator = class CodeGenerator {
-  generate() { return 1; }
-};
-exports.generate = generate;
-function generate() { return 2; }
-"#;
-        let out = DynamicModuleLoader::transpile_cjs_to_esm(source).expect("converted");
-        assert!(out.contains("exports.CodeGenerator = class CodeGenerator {"));
-        assert!(!out.contains("class CodeGenerator {;"));
-        assert!(!out.contains("as CodeGenerator"));
-        assert!(out.contains("export { __dd_export_0 as generate };"));
+    // CJS file detection follows extension and nearest package.json type.
+    fn cjs_wrap_decision_respects_ext_and_package_type() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-wrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("esm")).expect("mkdir");
+        std::fs::create_dir_all(root.join("cjs")).expect("mkdir");
+        std::fs::write(
+            root.join("esm/package.json"),
+            r#"{ "type": "module" }"#,
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("cjs/package.json"),
+            r#"{ "type": "commonjs" }"#,
+        )
+        .expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+        }
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("esm/mod.js"), "js"));
+        assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.js"), "js"));
+        assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.cjs"), "cjs"));
+        assert!(!loader.should_wrap_file_as_cjs(&root.join("cjs/mod.mjs"), "mjs"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

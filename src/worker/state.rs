@@ -87,7 +87,7 @@ pub struct TsCompilerConfig {
 pub enum CjsInteropMode {
     #[default]
     Disabled,
-    Builtin,
+    Node,
 }
 
 #[derive(Debug, Clone)]
@@ -276,33 +276,6 @@ fn within_base_dir(base_dir: &Path, candidate: &Path) -> bool {
     cand_abs.starts_with(&base_abs)
 }
 
-// Find dotenv upwards without escaping the configured sandbox base directory.
-fn find_dotenv_upwards(start_dir: &Path, sandbox_base_dir: &Path) -> Option<PathBuf> {
-    // Walk up to (and including) sandbox base, first .env wins.
-    let sandbox_base = canonicalize_or_lexical(sandbox_base_dir);
-    let mut cur = canonicalize_or_lexical(start_dir);
-    loop {
-        if !within_base_dir(&sandbox_base, &cur) {
-            return None;
-        }
-        let cand = cur.join(".env");
-        if cand.is_file() {
-            return Some(cand);
-        }
-        if cur == sandbox_base {
-            return None;
-        }
-        let parent = cur.parent().map(|p| p.to_path_buf());
-        let Some(p) = parent else {
-            return None;
-        };
-        if p == cur {
-            return None;
-        }
-        cur = p;
-    }
-}
-
 // Env map from js object.
 fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -422,12 +395,13 @@ fn expand_permissions_shorthand(value: serde_json::Value) -> serde_json::Value {
 fn ensure_env_permission_enabled(
     permissions: Option<serde_json::Value>,
     env_keys: Option<&HashMap<String, String>>,
+    enable_env: bool,
 ) -> (Option<serde_json::Value>, Vec<String>) {
-    let Some(env_keys) = env_keys else {
+    let has_env_keys = env_keys.map(|m| !m.is_empty()).unwrap_or(false);
+    if !enable_env && !has_env_keys {
         return (permissions, Vec::new());
-    };
+    }
 
-    let env_keys_set: std::collections::HashSet<String> = env_keys.keys().cloned().collect();
     let mut warnings = Vec::new();
 
     let permissions = permissions.map(expand_permissions_shorthand);
@@ -435,6 +409,21 @@ fn ensure_env_permission_enabled(
         Some(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    if !has_env_keys {
+        match out.get("env") {
+            None => {
+                out.insert("env".to_string(), serde_json::Value::Bool(true));
+            }
+            Some(serde_json::Value::Array(arr)) if arr.is_empty() => {
+                out.insert("env".to_string(), serde_json::Value::Bool(true));
+            }
+            Some(_) => {}
+        }
+        return (Some(serde_json::Value::Object(out)), warnings);
+    }
+
+    let env_keys = env_keys.expect("checked non-empty env keys above");
+    let env_keys_set: std::collections::HashSet<String> = env_keys.keys().cloned().collect();
     let env_keys_json = || {
         let mut keys: Vec<String> = env_keys_set.iter().cloned().collect();
         keys.sort();
@@ -523,7 +512,20 @@ impl WorkerCreateOptions {
                 let raw = s.value(cx);
                 let trimmed = raw.trim();
                 if !trimmed.is_empty() {
-                    out.runtime_options.cwd = Some(trimmed.to_string());
+                    let resolved = crate::worker::filesystem::normalize_cwd(Some(trimmed));
+                    if !resolved.exists() {
+                        return cx.throw_error(format!(
+                            "configured cwd does not exist: {}",
+                            resolved.to_string_lossy()
+                        ));
+                    }
+                    if !resolved.is_dir() {
+                        return cx.throw_error(format!(
+                            "configured cwd is not a directory: {}",
+                            resolved.to_string_lossy()
+                        ));
+                    }
+                    out.runtime_options.cwd = Some(resolved.to_string_lossy().to_string());
                 }
             }
         }
@@ -536,13 +538,6 @@ impl WorkerCreateOptions {
                 if !trimmed.is_empty() {
                     out.runtime_options.startup = Some(trimmed.to_string());
                 }
-            }
-        }
-
-        // `nodeCompat`.
-        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeCompat") {
-            if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
-                out.runtime_options.node_compat = b.value(cx);
             }
         }
 
@@ -664,18 +659,24 @@ impl WorkerCreateOptions {
             .cwd
             .as_deref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .unwrap_or_else(|| crate::worker::filesystem::normalize_cwd(None));
 
         // `envFile`: boolean | string(path).
-        // - `true`: search `.env` upward from cwd.
+        // - `true`: load `<cwd>/.env` when present; emit startup warning when missing.
         // - `string`: load explicit path.
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "envFile") {
             if !(v.is_a::<JsUndefined, _>(cx) || v.is_a::<JsNull, _>(cx)) {
                 if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
                     if b.value(cx) {
-                        if let Some(p) = find_dotenv_upwards(&base_cwd, &base_cwd) {
+                        let p = base_cwd.join(".env");
+                        if p.is_file() {
                             let map = load_dotenv_file_strict(cx, &p)?;
                             out.runtime_options.env = Some(EnvConfig::Map(map));
+                        } else {
+                            out.runtime_options.startup_warnings.push(format!(
+                                "envFile:true did not find .env in cwd: {}",
+                                base_cwd.to_string_lossy()
+                            ));
                         }
                     }
                 } else if let Ok(s) = v.downcast::<JsString, _>(cx) {
@@ -694,11 +695,20 @@ impl WorkerCreateOptions {
             }
         }
 
-        // `env`: undefined | string(path) | Record<string,string>.
+        let mut env_enabled = false;
+
+        // `env`: undefined | boolean | string(path) | Record<string,string>.
         // Note: `env` overrides `envFile` if both are provided.
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "env") {
             if v.is_a::<JsUndefined, _>(cx) || v.is_a::<JsNull, _>(cx) {
                 // Default behavior.
+            } else if let Ok(b) = v.downcast::<JsBoolean, _>(cx) {
+                if b.value(cx) {
+                    out.runtime_options.env = Some(EnvConfig::Map(HashMap::new()));
+                    env_enabled = true;
+                } else {
+                    out.runtime_options.env = None;
+                }
             } else if let Ok(s) = v.downcast::<JsString, _>(cx) {
                 let raw_path = s.value(cx);
                 let trimmed = raw_path.trim();
@@ -772,8 +782,6 @@ impl WorkerCreateOptions {
         // {
         //   httpsResolve?: boolean;
         //   httpResolve?: boolean;
-        //   nodeResolve?: boolean;
-        //   cjsInterop?: boolean | "esbuild";
         //   jsrResolve?: boolean;
         //   cacheDir?: string;
         //   reload?: boolean;
@@ -786,28 +794,6 @@ impl WorkerCreateOptions {
                 if let Ok(rv) = o.get::<JsValue, _, _>(cx, "httpsResolve") {
                     if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
                         cfg.https_resolve = rb.value(cx);
-                    }
-                }
-
-                if let Ok(nv) = o.get::<JsValue, _, _>(cx, "nodeResolve") {
-                    if let Ok(nb) = nv.downcast::<JsBoolean, _>(cx) {
-                        cfg.node_resolve = nb.value(cx);
-                        out.runtime_options.node_resolve = cfg.node_resolve;
-                    }
-                }
-
-                if let Ok(cv) = o.get::<JsValue, _, _>(cx, "cjsInterop") {
-                    if let Ok(cb) = cv.downcast::<JsBoolean, _>(cx) {
-                        cfg.cjs_interop = if cb.value(cx) {
-                            CjsInteropMode::Builtin
-                        } else {
-                            CjsInteropMode::Disabled
-                        };
-                    } else if let Ok(cs) = cv.downcast::<JsString, _>(cx) {
-                        // Backward-compat alias: route legacy "esbuild" to builtin cjs2esm path.
-                        if cs.value(cx).trim().eq_ignore_ascii_case("esbuild") {
-                            cfg.cjs_interop = CjsInteropMode::Builtin;
-                        }
                     }
                 }
 
@@ -852,6 +838,42 @@ impl WorkerCreateOptions {
             }
         }
 
+        // `nodeJs`: { modules?: boolean, runtime?: boolean, cjsInterop?: boolean }.
+        if let Ok(v) = obj.get::<JsValue, _, _>(cx, "nodeJs") {
+            if let Ok(o) = v.downcast::<JsObject, _>(cx) {
+                if let Ok(mv) = o.get::<JsValue, _, _>(cx, "modules") {
+                    if let Ok(mb) = mv.downcast::<JsBoolean, _>(cx) {
+                        out.runtime_options.node_resolve = mb.value(cx);
+                        let cfg = out
+                            .runtime_options
+                            .module_loader
+                            .get_or_insert_with(Default::default);
+                        cfg.node_resolve = mb.value(cx);
+                    }
+                }
+
+                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "runtime") {
+                    if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
+                        out.runtime_options.node_compat = rb.value(cx);
+                    }
+                }
+
+                if let Ok(cv) = o.get::<JsValue, _, _>(cx, "cjsInterop") {
+                    if let Ok(cb) = cv.downcast::<JsBoolean, _>(cx) {
+                        let cfg = out
+                            .runtime_options
+                            .module_loader
+                            .get_or_insert_with(Default::default);
+                        cfg.cjs_interop = if cb.value(cx) {
+                            CjsInteropMode::Node
+                        } else {
+                            CjsInteropMode::Disabled
+                        };
+                    }
+                }
+            }
+        }
+
         // Top-level `tsCompiler` (preferred).
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "tsCompiler") {
             if let Ok(tco) = v.downcast::<JsObject, _>(cx) {
@@ -870,7 +892,7 @@ impl WorkerCreateOptions {
             EnvConfig::Map(map) => Some(map),
         });
         let (permissions, env_warnings) =
-            ensure_env_permission_enabled(out.runtime_options.permissions.take(), env_keys);
+            ensure_env_permission_enabled(out.runtime_options.permissions.take(), env_keys, env_enabled);
         out.runtime_options.permissions = permissions;
         out.runtime_options.startup_warnings.extend(env_warnings);
         if run_permission_enabled(out.runtime_options.permissions.as_ref()) {
@@ -916,7 +938,7 @@ mod tests {
     // Ensure env permission enabled keeps permissions when env not configured.
     fn ensure_env_permission_enabled_keeps_permissions_when_env_not_configured() {
         let original = Some(serde_json::json!({ "read": true, "env": false }));
-        let (out, warnings) = ensure_env_permission_enabled(original.clone(), None);
+        let (out, warnings) = ensure_env_permission_enabled(original.clone(), None, false);
         assert_eq!(out, original);
         assert!(warnings.is_empty());
     }
@@ -926,7 +948,7 @@ mod tests {
     fn ensure_env_permission_enabled_sets_env_allow_list_when_missing() {
         let env = env_map(&["A", "B"]);
         let (out, warnings) =
-            ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), Some(&env));
+            ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), Some(&env), false);
         let obj = out.expect("permissions");
         let env_val = obj
             .as_object()
@@ -944,6 +966,7 @@ mod tests {
         let (out, warnings) = ensure_env_permission_enabled(
             Some(serde_json::json!({ "env": ["A"], "write": ["./tmp"] })),
             Some(&env),
+            false,
         );
         assert_eq!(
             out,
@@ -958,7 +981,7 @@ mod tests {
     fn ensure_env_permission_enabled_keeps_env_false_and_warns() {
         let env = env_map(&["A"]);
         let (out, warnings) =
-            ensure_env_permission_enabled(Some(serde_json::json!({ "env": false })), Some(&env));
+            ensure_env_permission_enabled(Some(serde_json::json!({ "env": false })), Some(&env), false);
         assert_eq!(out, Some(serde_json::json!({ "env": false })));
         assert_eq!(warnings.len(), 1);
     }
@@ -968,12 +991,21 @@ mod tests {
     fn ensure_env_permission_enabled_expands_permissions_true_shorthand() {
         let env = env_map(&["A"]);
         let (out, warnings) =
-            ensure_env_permission_enabled(Some(serde_json::Value::Bool(true)), Some(&env));
+            ensure_env_permission_enabled(Some(serde_json::Value::Bool(true)), Some(&env), false);
         let env_allow = out
             .and_then(|v| v.as_object().cloned())
             .and_then(|o| o.get("env").cloned())
             .and_then(|v| v.as_bool());
         assert_eq!(env_allow, Some(true));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    // Ensure explicit env enable sets permissions.env=true when missing.
+    fn ensure_env_permission_enabled_sets_env_true_for_explicit_enable() {
+        let (out, warnings) =
+            ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), None, true);
+        assert_eq!(out, Some(serde_json::json!({ "read": true, "env": true })));
         assert!(warnings.is_empty());
     }
 
