@@ -1,4 +1,16 @@
 import { createTestWorker } from "./helpers.worker-harness";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "deno-director-runtime-events-"));
+  try {
+    return await fn(dir);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
 
 
 describe("DenoWorker runtime events", () => {
@@ -41,39 +53,47 @@ describe("DenoWorker runtime events", () => {
   });
 
   test("emits import.classified with parser-backed CJS decision", async () => {
-    const dw = createTestWorker({
-      imports: true,
-      cwd: process.cwd(),
-      nodeJs: { modules: true, runtime: true, cjsInterop: true },
-    });
-    const events: any[] = [];
-    dw.on("runtime", (e) => events.push(e));
-
-    try {
-      await expect(
-        dw.module.eval(`
-          import { WebsocketBuilder } from "websocket-ts";
-          export const out = typeof WebsocketBuilder;
-        `),
-      ).resolves.toMatchObject({ out: "function" });
-
-      const classified = events.find(
-        (e) =>
-          e.kind === "import.classified" &&
-          (
-            /websocket-ts/.test(String(e.specifier ?? "")) ||
-            /websocket-ts/.test(String(e.resolvedSpecifier ?? ""))
-          ),
+    await withTempDir(async (dir) => {
+      await fs.writeFile(
+        path.join(dir, "websocket-ts.js"),
+        `export class WebsocketBuilder { static kind = "ok"; }\n`,
+        "utf8",
       );
-      expect(classified).toBeTruthy();
-      expect(typeof classified.cjs).toBe("boolean");
-      expect(typeof classified.esm).toBe("boolean");
-      expect(classified.parser).toBe("deno_ast");
-      expect(typeof classified.cacheHit).toBe("boolean");
-      expect(classified.wrappedAsCjs).toBe(false);
-    } finally {
-      await dw.close();
-    }
+
+      const dw = createTestWorker({
+        imports: true,
+        cwd: dir,
+        nodeJs: { modules: true, runtime: true, cjsInterop: true },
+      });
+      const events: any[] = [];
+      dw.on("runtime", (e) => events.push(e));
+
+      try {
+        await expect(
+          dw.module.eval(`
+            import { WebsocketBuilder } from "./websocket-ts.js";
+            export const out = typeof WebsocketBuilder;
+          `),
+        ).resolves.toMatchObject({ out: "function" });
+
+        const classified = events.find(
+          (e) =>
+            e.kind === "import.classified" &&
+            (
+              /websocket-ts/.test(String(e.specifier ?? "")) ||
+              /websocket-ts/.test(String(e.resolvedSpecifier ?? ""))
+            ),
+        );
+        expect(classified).toBeTruthy();
+        expect(typeof classified.cjs).toBe("boolean");
+        expect(typeof classified.esm).toBe("boolean");
+        expect(classified.parser).toBe("deno_ast");
+        expect(typeof classified.cacheHit).toBe("boolean");
+        expect(classified.wrappedAsCjs).toBe(false);
+      } finally {
+        await dw.close();
+      }
+    });
   });
 
   test("emits handle create/call/dispose runtime events", async () => {
