@@ -231,4 +231,27 @@ describe("deno_worker: eval", () => {
     },
     20_000
   );
+
+  it("supports $args in non-function eval source", async () => {
+    await expect(
+      dw.eval(
+        `
+          (() => ({
+            sum: Number($args[0]) + Number($args[1]),
+            token: String($args[2]?.token ?? ""),
+          }))()
+        `,
+        { args: [20, 22, { token: "eval-token" }] },
+      ),
+    ).resolves.toMatchObject({ sum: 42, token: "eval-token" });
+  });
+
+  it("supports $args in callable eval source", async () => {
+    await expect(
+      dw.eval(
+        `(a, b) => ({ sum: a + b, fromDollar: Number($args[0]) + Number($args[1]) })`,
+        { args: [20, 22] },
+      ),
+    ).resolves.toMatchObject({ sum: 42, fromDollar: 42 });
+  });
 });

@@ -31,6 +31,7 @@ type BenchConfig = {
   warmup: number;
   iterations: number;
   repeats: number;
+  unsafeStreamMemory: boolean;
   workersList: number[];
   scenarios: ScenarioKey[];
 };
@@ -350,6 +351,7 @@ function parseArgs(): BenchConfig {
     warmup: 1,
     iterations: 3,
     repeats: 1,
+    unsafeStreamMemory: false,
     workersList: [1, 2, 4],
     scenarios: [...scenarioOrder],
   };
@@ -364,6 +366,7 @@ function parseArgs(): BenchConfig {
     else if (a === "--warmup") out.warmup = Number(args[++i]);
     else if (a === "--iterations") out.iterations = Number(args[++i]);
     else if (a === "--repeats") out.repeats = Number(args[++i]);
+    else if (a === "--unsafe-stream-memory") out.unsafeStreamMemory = true;
     else if (a === "--workers") out.workersList = [Number(args[++i])];
     else if (a === "--workers-list") {
       out.workersList = args[++i].split(",").map((v) => Number(v.trim())).filter((v) => Number.isFinite(v) && v > 0).map((v) => Math.trunc(v));
@@ -387,6 +390,13 @@ function parseArgs(): BenchConfig {
   if (out.workersList.length === 0) throw new Error("No valid workers configured");
   if (out.scenarios.length === 0) throw new Error("No scenarios selected");
   return out;
+}
+
+function createBenchDenoWorker(cfg: BenchConfig): DenoWorker {
+  const opts = cfg.unsafeStreamMemory
+    ? { console: false as const, bridge: { enableUnsafeStreamMemory: true } }
+    : { console: false as const };
+  return new DenoWorker(opts);
 }
 
 function isRuntimeOnPath(runtimeBin: string): boolean {
@@ -590,7 +600,7 @@ async function runNodeNodeHttp(cfg: BenchConfig, workers: number): Promise<Itera
 }
 
 async function runNodeDenoPostMessage(cfg: BenchConfig, workers: number): Promise<IterationStats> {
-  const denoWorkers = Array.from({ length: workers }, () => new DenoWorker({ console: false }));
+  const denoWorkers = Array.from({ length: workers }, () => createBenchDenoWorker(cfg));
   await Promise.all(denoWorkers.map((w) => w.eval(DENO_POSTMESSAGE_SCRIPT)));
   const pending = new Map<number, { resolve: (x: TileResult) => void }>();
   let nextId = 1;
@@ -626,7 +636,7 @@ async function runNodeDenoPostMessage(cfg: BenchConfig, workers: number): Promis
 }
 
 async function runNodeDenoEval(cfg: BenchConfig, workers: number): Promise<IterationStats> {
-  const denoWorkers = Array.from({ length: workers }, () => new DenoWorker({ console: false }));
+  const denoWorkers = Array.from({ length: workers }, () => createBenchDenoWorker(cfg));
   await Promise.all(denoWorkers.map((w) => w.eval(RAYTRACE_SOURCE)));
   try {
     const runOne = async (): Promise<{ checksum: number; pixels: number }> => {
@@ -644,7 +654,7 @@ async function runNodeDenoEval(cfg: BenchConfig, workers: number): Promise<Itera
 }
 
 async function runNodeDenoHandle(cfg: BenchConfig, workers: number): Promise<IterationStats> {
-  const denoWorkers = Array.from({ length: workers }, () => new DenoWorker({ console: false }));
+  const denoWorkers = Array.from({ length: workers }, () => createBenchDenoWorker(cfg));
   await Promise.all(denoWorkers.map((w) => w.eval(RAYTRACE_SOURCE)));
   const handles = await Promise.all(denoWorkers.map((w) => w.handle.eval("globalThis.__raytraceTile")));
 
@@ -675,9 +685,9 @@ async function endDuplex(duplex: Duplex): Promise<void> {
 }
 
 async function runNodeDenoStream(cfg: BenchConfig, workers: number): Promise<IterationStats> {
-  const denoWorkers = Array.from({ length: workers }, () => new DenoWorker({ console: false }));
+  const denoWorkers = Array.from({ length: workers }, () => createBenchDenoWorker(cfg));
   const keys = denoWorkers.map(() => `raybench:${randomUUID()}`);
-  const duplexes = await Promise.all(denoWorkers.map((w, i) => w.stream.connect(keys[i])));
+  const duplexes = await Promise.all(denoWorkers.map((w, i) => w.stream.connect(keys[i], cfg.unsafeStreamMemory ? { unsafeSharedMemory: true } : undefined)));
   for (const d of duplexes) {
     // Force-close path can emit stream errors while tearing down workers.
     d.on("error", () => {});
@@ -719,20 +729,44 @@ async function runNodeDenoStream(cfg: BenchConfig, workers: number): Promise<Ite
   try {
     const runOne = async (): Promise<{ checksum: number; pixels: number }> => {
       const jobs = jobsFor(cfg, workers);
-      const promises = jobs.map((job, i) => {
+      const pendingPromises = jobs.map((job, i) => {
         const wi = i % workers;
         const id = nextId++;
         const req = JSON.stringify({ id, job }) + "\n";
-        return new Promise<TileResult>((resolve, reject) => {
+        const promise = new Promise<TileResult>((resolve, reject) => {
           const map = pendingByWorker.get(wi)!;
           map.set(id, { resolve, reject });
-          void writeLine(duplexes[wi], req).catch((err) => {
-            map.delete(id);
-            reject(err);
-          });
         });
+        return { wi, req, id, promise };
       });
-      const parts = await Promise.all(promises);
+      const perWorkerReq = new Map<number, string[]>();
+      const perWorkerIds = new Map<number, number[]>();
+      for (const p of pendingPromises) {
+        const arr = perWorkerReq.get(p.wi) || [];
+        arr.push(p.req);
+        perWorkerReq.set(p.wi, arr);
+        const ids = perWorkerIds.get(p.wi) || [];
+        ids.push(p.id);
+        perWorkerIds.set(p.wi, ids);
+      }
+      await Promise.all(
+        Array.from(perWorkerReq.entries()).map(async ([wi, reqs]) => {
+          try {
+            await writeLine(duplexes[wi], reqs.join(""));
+          } catch (err) {
+            const ids = perWorkerIds.get(wi) || [];
+            const map = pendingByWorker.get(wi);
+            for (const id of ids) {
+              const pending = map?.get(id);
+              if (!pending) continue;
+              map!.delete(id);
+              pending.reject(err);
+            }
+            throw err;
+          }
+        }),
+      );
+      const parts = await Promise.all(pendingPromises.map((p) => p.promise));
       return aggregate(parts);
     };
 
@@ -831,6 +865,7 @@ async function runExternalBunScenario(cfg: BenchConfig, workers: number, scenari
     "--iterations",
     String(cfg.iterations),
     "--json",
+    ...(cfg.unsafeStreamMemory ? ["--unsafe-stream-memory"] : []),
   ]);
   return {
     medianMs: Number(out.medianMs),
@@ -864,6 +899,7 @@ async function runExternalDenoScenario(cfg: BenchConfig, workers: number, scenar
     "--iterations",
     String(cfg.iterations),
     "--json",
+    ...(cfg.unsafeStreamMemory ? ["--unsafe-stream-memory"] : []),
   ]);
   return {
     medianMs: Number(out.medianMs),
@@ -999,7 +1035,7 @@ async function main(): Promise<void> {
 
   console.log("# Ray Bench");
   console.log(
-    `config: width=${cfg.width} height=${cfg.height} samples=${cfg.samples} maxDepth=${cfg.maxDepth} tileSize=${cfg.tileSize === 0 ? "auto" : cfg.tileSize} warmup=${cfg.warmup} iterations=${cfg.iterations} repeats=${cfg.repeats} workers=${cfg.workersList.join(",")} scenarios=${cfg.scenarios.join(",")}`,
+    `config: width=${cfg.width} height=${cfg.height} samples=${cfg.samples} maxDepth=${cfg.maxDepth} tileSize=${cfg.tileSize === 0 ? "auto" : cfg.tileSize} warmup=${cfg.warmup} iterations=${cfg.iterations} repeats=${cfg.repeats} unsafeStreamMemory=${cfg.unsafeStreamMemory} workers=${cfg.workersList.join(",")} scenarios=${cfg.scenarios.join(",")}`,
   );
   if (!hasBun) console.log("runtime: bun not found in PATH (bun+bun-* scenarios skipped)");
   if (!hasDeno) console.log("runtime: deno not found in PATH (deno+deno-* scenarios skipped)");

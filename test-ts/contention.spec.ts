@@ -371,6 +371,145 @@ describe("deno_worker: contention", () => {
   );
 
   test(
+    "args contention: overlapping eval args and handle.call args do not clobber",
+    async () => {
+      const runtimeCount = 12;
+      const startAt = Date.now() + 600;
+      const workers: DenoWorker[] = Array.from({ length: runtimeCount }, () =>
+        createTestWorker({ bridge: { channelSize: 512 } }),
+      );
+
+      try {
+        const perWorker = workers.map(async (dw, idx) => {
+          const handleFn = await dw.handle.eval(`
+            async (targetTs, payload) => {
+              const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+              while (Date.now() < targetTs) await wait(1);
+              await wait(Number(payload?.delayMs ?? 0));
+              return {
+                lane: "handle",
+                id: String(payload?.id ?? ""),
+                token: String(payload?.token ?? ""),
+                bytes: Number(payload?.bytes ?? -1),
+                deep: Number(payload?.nested?.deep ?? -1),
+              };
+            }
+          `);
+
+          const payloadA = {
+            id: `w${idx}-A`,
+            token: `tok-${idx}-A-${"a".repeat(24)}`,
+            delayMs: 180,
+            bytes: 1024 + idx,
+            nested: { deep: idx * 10 + 1 },
+          };
+          const payloadB = {
+            id: `w${idx}-B`,
+            token: `tok-${idx}-B-${"b".repeat(24)}`,
+            delayMs: 40,
+            bytes: 2048 + idx,
+            nested: { deep: idx * 10 + 2 },
+          };
+
+          const evalTaskA = dw.eval(
+            `
+              async (targetTs, payload) => {
+                const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                while (Date.now() < targetTs) await wait(1);
+                await wait(Number(payload?.delayMs ?? 0));
+                return {
+                  lane: "eval",
+                  id: String(payload?.id ?? ""),
+                  token: String(payload?.token ?? ""),
+                  bytes: Number(payload?.bytes ?? -1),
+                  deep: Number(payload?.nested?.deep ?? -1),
+                };
+              }
+            `,
+            { args: [startAt, payloadA] },
+          );
+
+          const evalTaskB = dw.eval(
+            `
+              async (targetTs, payload) => {
+                const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                while (Date.now() < targetTs) await wait(1);
+                await wait(Number(payload?.delayMs ?? 0));
+                return {
+                  lane: "eval",
+                  id: String(payload?.id ?? ""),
+                  token: String(payload?.token ?? ""),
+                  bytes: Number(payload?.bytes ?? -1),
+                  deep: Number(payload?.nested?.deep ?? -1),
+                };
+              }
+            `,
+            { args: [startAt, payloadB] },
+          );
+
+          const handleTaskA = handleFn.call([startAt, payloadA]);
+          const handleTaskB = handleFn.call([startAt, payloadB]);
+
+          const [evalA, evalB, handleA, handleB] = await withHardTimeout(
+            Promise.all([evalTaskA, evalTaskB, handleTaskA, handleTaskB]),
+            25_000,
+            `args-clobber-worker-${idx}`,
+          );
+
+          await handleFn.dispose();
+
+          return { idx, payloadA, payloadB, evalA, evalB, handleA, handleB };
+        });
+
+        const out = await withHardTimeout(
+          Promise.all(perWorker),
+          45_000,
+          "args-clobber-all-workers",
+        );
+
+        expect(out).toHaveLength(runtimeCount);
+        for (const row of out) {
+          expect(row.evalA).toMatchObject({
+            lane: "eval",
+            id: row.payloadA.id,
+            token: row.payloadA.token,
+            bytes: row.payloadA.bytes,
+            deep: row.payloadA.nested.deep,
+          });
+          expect(row.evalB).toMatchObject({
+            lane: "eval",
+            id: row.payloadB.id,
+            token: row.payloadB.token,
+            bytes: row.payloadB.bytes,
+            deep: row.payloadB.nested.deep,
+          });
+          expect(row.handleA).toMatchObject({
+            lane: "handle",
+            id: row.payloadA.id,
+            token: row.payloadA.token,
+            bytes: row.payloadA.bytes,
+            deep: row.payloadA.nested.deep,
+          });
+          expect(row.handleB).toMatchObject({
+            lane: "handle",
+            id: row.payloadB.id,
+            token: row.payloadB.token,
+            bytes: row.payloadB.bytes,
+            deep: row.payloadB.nested.deep,
+          });
+        }
+      } finally {
+        await Promise.all(
+          workers.map(async (dw) => {
+            await closeWorkerFully(dw);
+          }),
+        );
+      }
+    },
+    60_000,
+  );
+
+  test(
     "ABSURD contention: multi-wave runtime swarm with dense stream and host-call pressure",
     async () => {
       const runtimeCount = envInt("DENO_DIRECTOR_ABSURD_RUNTIMES", 28);

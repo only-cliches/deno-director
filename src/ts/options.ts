@@ -233,6 +233,7 @@ function normalizeBridgeOption(x: unknown): unknown {
     if (streamBacklogLimit !== undefined) out.streamBacklogLimit = streamBacklogLimit;
     const streamHighWaterMarkBytes = finiteInt(o.streamHighWaterMarkBytes, 1);
     if (streamHighWaterMarkBytes !== undefined) out.streamHighWaterMarkBytes = streamHighWaterMarkBytes;
+    if (typeof o.enableUnsafeStreamMemory === "boolean") out.enableUnsafeStreamMemory = o.enableUnsafeStreamMemory;
 
     return Object.keys(out).length ? out : undefined;
 }

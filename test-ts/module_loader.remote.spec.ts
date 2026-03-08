@@ -181,6 +181,49 @@ describe("moduleLoader.httpsResolve MVP", () => {
     }
   });
 
+  test("imports:true and imports:() => true are parity-equivalent for remote graph resolution", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    const cacheDir = await makeTempCacheDir();
+    try {
+      srv = await startServer({
+        "/oak/mod.ts": `
+          import { leaf } from "./leaf.ts";
+          export const out = "oak-" + leaf;
+        `,
+        "/oak/leaf.ts": `export const leaf = "leaf";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const src = `
+      import { out } from "${srv.base}/oak/mod.ts";
+      export const result = out;
+    `;
+
+    const run = async (imports: true | (() => true)) => {
+      const dw = createTestWorker({
+        imports,
+        moduleLoader: { httpsResolve: true, httpResolve: true, cacheDir },
+        permissions: { import: true, net: true },
+      });
+      try {
+        return await dw.module.eval(src);
+      } finally {
+        if (!dw.isClosed()) await dw.close();
+      }
+    };
+
+    try {
+      await expect(run(true)).resolves.toMatchObject({ result: "oak-leaf" });
+      await expect(run(() => true)).resolves.toMatchObject({ result: "oak-leaf" });
+    } finally {
+      await srv.close();
+      await fs.rm(cacheDir, { recursive: true, force: true });
+    }
+  });
+
   test("callback import path still enforces net/import permissions for remote URLs", async () => {
     let srv: { base: string; close: () => Promise<void> } | undefined;
     try {
@@ -206,6 +249,43 @@ describe("moduleLoader.httpsResolve MVP", () => {
       await expect(dw.module.eval(src)).rejects.toBeTruthy();
     } finally {
       if (!dw.isClosed()) await dw.close();
+      await srv.close();
+    }
+  });
+
+  test("imports:true and imports:() => true are parity-equivalent for remote permission denial", async () => {
+    let srv: { base: string; close: () => Promise<void> } | undefined;
+    try {
+      srv = await startServer({
+        "/oak/mod.ts": `export const v: string = "ok";`,
+      });
+    } catch (e: any) {
+      if (isBindPermissionError(e)) return;
+      throw e;
+    }
+
+    const src = `
+      import { v } from "${srv.base}/oak/mod.ts";
+      export const out = v;
+    `;
+
+    const run = async (imports: true | (() => true)) => {
+      const dw = createTestWorker({
+        imports,
+        moduleLoader: { httpsResolve: true, httpResolve: true },
+        permissions: { import: true, net: false },
+      });
+      try {
+        return await dw.module.eval(src);
+      } finally {
+        if (!dw.isClosed()) await dw.close();
+      }
+    };
+
+    try {
+      await expect(run(true)).rejects.toBeTruthy();
+      await expect(run(() => true)).rejects.toBeTruthy();
+    } finally {
       await srv.close();
     }
   });

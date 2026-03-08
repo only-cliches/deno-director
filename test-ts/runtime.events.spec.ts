@@ -95,6 +95,36 @@ describe("DenoWorker runtime events", () => {
     }
   });
 
+  test("emits stream.connect runtime event with negotiated mode metadata", async () => {
+    const dw = createTestWorker();
+    const events: any[] = [];
+    dw.on("runtime", (e) => events.push(e));
+
+    try {
+      const key = "runtime-event-stream-connect";
+      const duplex = await dw.stream.connect(key, { unsafeSharedMemory: true });
+      await dw.eval(`
+        (async () => {
+          const s = hostStreams.create(${JSON.stringify(`${key}::w2h`)});
+          await s.write(new TextEncoder().encode("ok"));
+          await s.close();
+        })()
+      `);
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of duplex) chunks.push(chunk);
+      const text = new TextDecoder().decode(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks.map((c) => Buffer.from(c))));
+      expect(text).toBe("ok");
+
+      const evt = events.find((e) => e.kind === "stream.connect" && e.key === key);
+      expect(evt).toBeTruthy();
+      expect(evt.requestedUnsafeSharedMemory).toBe(true);
+      expect(evt.mode).toBe("copy");
+      expect(evt.negotiatedUnsafeSharedMemory).toBe(false);
+    } finally {
+      await dw.close({ force: true });
+    }
+  });
+
   test("emits error.thrown for user-visible thrown eval errors", async () => {
     const dw = createTestWorker();
     const events: any[] = [];
@@ -160,7 +190,10 @@ describe("DenoWorker runtime events", () => {
       try {
         await dw.module.import("named:stacked-error");
       } catch (e) {
-        const err = e as any;
+        const err = e as {
+          message?: unknown;
+          codeContext?: { srcFileName?: unknown; srcDenoRef?: unknown };
+        };
         const msg = String(err?.message ?? "");
         expect(msg).toMatch(/Code context \(/);
         const count = (msg.match(/Code context \(/g) || []).length;

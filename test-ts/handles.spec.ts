@@ -483,4 +483,21 @@ describe("deno_worker: handles", () => {
     }
   });
 
+  test("handle.call exposes $args for the active call only", async () => {
+    const fn = await dw.handle.eval(`(a, b) => ({ sum: a + b, fromDollar: Number($args[0]) + Number($args[1]) })`);
+    await expect(fn.call([20, 22])).resolves.toMatchObject({ sum: 42, fromDollar: 42 });
+  });
+
+  test("handle.apply call operation exposes $args for the active call only", async () => {
+    const h = await dw.handle.eval(`({ add(a, b) { return { sum: a + b, fromDollar: Number($args[0]) + Number($args[1]) }; } })`);
+    await expect(h.apply([{ op: "call", path: "add", args: [20, 22] }])).resolves.toEqual([
+      { sum: 42, fromDollar: 42 },
+    ]);
+  });
+
+  test("handle.construct exposes $args for the active construct call", async () => {
+    const ctor = await dw.handle.eval(`(function Thing(a, b) { this.sum = a + b; this.fromDollar = Number($args[0]) + Number($args[1]); })`);
+    await expect(ctor.construct([20, 22])).resolves.toMatchObject({ sum: 42, fromDollar: 42 });
+  });
+
 });

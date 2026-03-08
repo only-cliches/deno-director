@@ -61,6 +61,7 @@ import type {
     DenoWorkerStreamStats,
     DenoWorkerTotalsStats,
     DenoWorkerStreamApi,
+    DenoWorkerStreamConnectOptions,
     DenoWorkerStreamReader,
     DenoWorkerStreamWriter,
     EvalOptions,
@@ -83,6 +84,9 @@ const STREAM_CREDIT_FLUSH_THRESHOLD = 256 * 1024;
 const STREAM_V2_MAX_QUEUED_CHUNKS = 2048;
 const STREAM_V2_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
 const STREAM_V2_BATCH_MAX_CHUNK_BYTES = 1024 * 1024;
+const STREAM_V2_UNSAFE_MAX_QUEUED_CHUNKS = 8192;
+const STREAM_V2_UNSAFE_MAX_QUEUED_BYTES = 64 * 1024 * 1024;
+const STREAM_V2_UNSAFE_BATCH_MAX_CHUNK_BYTES = 4 * 1024 * 1024;
 const NATIVE_STREAM_DEBUG = process.env.DENO_DIRECTOR_NATIVE_STREAM_DEBUG === "1";
 const STREAM_READER_DEFAULT_HIGH_WATER_MARK_BYTES = STREAM_DEFAULT_WINDOW_BYTES;
 const STREAM_BACKLOG_DEFAULT_LIMIT = 256;
@@ -125,7 +129,8 @@ const WIRE_MARKER_KEY_SET = new Set([
     "__denojs_worker_graph_value",
 ]);
 const HANDLE_RUNTIME_KEY = "__denojs_worker_handle_v1";
-const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
+const HANDLE_RUNTIME_INSTALL_SOURCE = `var $args = globalThis.$args ?? [];
+(() => {
     const mkErr = (code, message) => {
         const e = new Error(message);
         e.code = code;
@@ -235,6 +240,23 @@ const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
                 reject(e);
             }
         });
+    const withCallArgs = (args, invoke) => {
+        const prevArgs = $args;
+        $args = Array.isArray(args) ? args : [];
+        try {
+            const out = invoke();
+            if (isPromiseLike(out)) {
+                return Promise.resolve(out).finally(() => {
+                    $args = prevArgs;
+                });
+            }
+            $args = prevArgs;
+            return out;
+        } catch (e) {
+            $args = prevArgs;
+            throw e;
+        }
+    };
     const typeInfo = (value) => {
         const tag = Object.prototype.toString.call(value);
         let type = "object";
@@ -327,18 +349,18 @@ const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
                 const args = Array.isArray(payload.args) ? payload.args : [];
                 if (!path) {
                     if (typeof root !== "function") mkErr("HANDLE_NOT_CALLABLE", "Handle root is not callable");
-                    return root(...args);
+                    return withCallArgs(args, () => root(...args));
                 }
                 const { parent, key } = resolveParent(root, path);
                 mustObjectLike(parent, path);
                 const fn = parent[key];
                 if (typeof fn !== "function") mkErr("HANDLE_NOT_CALLABLE", \`Handle path is not callable: \${path}\`);
-                return fn.apply(parent, args);
+                return withCallArgs(args, () => fn.apply(parent, args));
             }
             if (op === "construct") {
                 const args = Array.isArray(payload.args) ? payload.args : [];
                 if (typeof root !== "function") mkErr("HANDLE_NOT_CONSTRUCTABLE", "Handle root is not constructable");
-                return new root(...args);
+                return withCallArgs(args, () => new root(...args));
             }
             if (op === "await") {
                 const returnValue = payload.returnValue !== false;
@@ -387,7 +409,7 @@ const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
                         const args = Array.isArray(item.args) ? item.args : [];
                         if (!path) {
                             if (typeof root !== "function") mkErr("HANDLE_NOT_CALLABLE", "Handle root is not callable");
-                            let result = root(...args);
+                            let result = withCallArgs(args, () => root(...args));
                             if (isPromiseLike(result)) result = await Promise.resolve(result);
                             out.push(result);
                         } else {
@@ -395,7 +417,7 @@ const HANDLE_RUNTIME_INSTALL_SOURCE = `(() => {
                             mustObjectLike(parent, path);
                             const fn = parent[key];
                             if (typeof fn !== "function") mkErr("HANDLE_NOT_CALLABLE", \`Handle path is not callable: \${path}\`);
-                            let result = fn.apply(parent, args);
+                            let result = withCallArgs(args, () => fn.apply(parent, args));
                             if (isPromiseLike(result)) result = await Promise.resolve(result);
                             out.push(result);
                         }
@@ -784,6 +806,7 @@ export class DenoWorker {
     private readonly streamCreditFlushBytes: number;
     private readonly streamBacklogLimit: number;
     private readonly streamReaderHighWaterMarkBytes: number;
+    private readonly unsafeStreamMemoryEnabled: boolean;
     private readonly streamHeaderCache = new HeaderCache();
     private handleGeneration = 1;
     private handleCounter = 0;
@@ -807,7 +830,7 @@ export class DenoWorker {
     };
     /** Stream transport API for creating writers and accepting incoming readers. */
     readonly stream: DenoWorkerStreamApi = {
-        connect: (key: string) => this.streamConnect(key),
+        connect: (key: string, options?: DenoWorkerStreamConnectOptions) => this.streamConnect(key, options),
         create: (key?: string) => this.streamCreate(key),
         accept: (key: string) => this.streamAccept(key),
     };
@@ -2782,6 +2805,7 @@ export class DenoWorker {
         const parsedFlush = Number(rawBridge?.streamCreditFlushBytes);
         const parsedBacklogLimit = Number(rawBridge?.streamBacklogLimit);
         const parsedHighWaterMark = Number(rawBridge?.streamHighWaterMarkBytes);
+        this.unsafeStreamMemoryEnabled = rawBridge?.enableUnsafeStreamMemory === true;
         this.streamWindowBytes =
             Number.isFinite(parsedWindow) && parsedWindow >= 1
                 ? Math.trunc(parsedWindow)
@@ -2815,7 +2839,7 @@ export class DenoWorker {
      * - `message`: receives payloads posted from runtime `postMessage(...)`.
      * - `close`: emitted once runtime closes.
      * - `lifecycle`: emits lifecycle transitions and crash/requested flags.
-     * - `runtime`: emits runtime execution/import/handle events.
+     * - `runtime`: emits runtime execution/import/handle/stream events.
      *
      * @example
      * ```ts
@@ -3129,14 +3153,29 @@ export class DenoWorker {
     }
 
     /** Connects a bidirectional Node.js duplex stream over paired stream lanes. */
-    private async streamConnect(key: string): Promise<Duplex> {
+    private async streamConnect(key: string, options?: DenoWorkerStreamConnectOptions): Promise<Duplex> {
+        const requestedUnsafe = options?.unsafeSharedMemory ?? this.unsafeStreamMemoryEnabled;
+        const negotiatedUnsafe = requestedUnsafe && this.unsafeStreamMemoryEnabled;
+        const mode = negotiatedUnsafe ? "unsafe-shared-memory" : "copy";
+        const fallbackReason =
+            requestedUnsafe && !negotiatedUnsafe
+                ? "unsafe shared-memory stream mode is not available for this runtime; using copy mode"
+                : undefined;
+        this.emitRuntimeEvent({
+            kind: "stream.connect",
+            key,
+            mode,
+            requestedUnsafeSharedMemory: requestedUnsafe,
+            negotiatedUnsafeSharedMemory: negotiatedUnsafe,
+            fallbackReason,
+        } as any);
         const { hostToWorker, workerToHost } = this.connectDirectionalKeys(key);
         const writer = this.streamCreate(hostToWorker);
         return this.createDuplexBridge(writer, () => this.streamAccept(workerToHost), key);
     }
 
     /** Creates an outgoing stream writer and manages writer-side flow-control + lifecycle. */
-    private streamCreate(key?: string): DenoWorkerStreamWriter {
+    private streamCreate(key?: string, options?: { preferUnsafeBurst?: boolean }): DenoWorkerStreamWriter {
         const provided = key != null;
         const streamKey = provided ? String(key || "").trim() : "";
         if (provided && !streamKey) {
@@ -3357,6 +3396,12 @@ export class DenoWorker {
         const canUseFastChunkPosting =
             canPostNativeChunkRawBin || canPostNativeChunkRaw || canPostNativeChunk || canPostTypedChunk;
         const streamV2 = STREAM_V2_ENABLED && canUseFastChunkPosting;
+        const preferUnsafeBurst = options?.preferUnsafeBurst === true;
+        const fastMaxQueuedChunks = preferUnsafeBurst ? STREAM_V2_UNSAFE_MAX_QUEUED_CHUNKS : STREAM_V2_MAX_QUEUED_CHUNKS;
+        const fastMaxQueuedBytes = preferUnsafeBurst ? STREAM_V2_UNSAFE_MAX_QUEUED_BYTES : STREAM_V2_MAX_QUEUED_BYTES;
+        const fastMaxBatchChunkBytes = preferUnsafeBurst
+            ? STREAM_V2_UNSAFE_BATCH_MAX_CHUNK_BYTES
+            : STREAM_V2_BATCH_MAX_CHUNK_BYTES;
         let queuedFastChunks: Uint8Array[] = [];
         let queuedFastBytes = 0;
         let fastFlushQueued = false;
@@ -3403,13 +3448,17 @@ export class DenoWorker {
             if (fastFlushError) throw fastFlushError;
             queuedFastChunks.push(chunk);
             queuedFastBytes += chunk.byteLength;
-            if (queuedFastChunks.length >= STREAM_V2_MAX_QUEUED_CHUNKS || queuedFastBytes >= STREAM_V2_MAX_QUEUED_BYTES) {
+            if (
+                queuedFastChunks.length >= fastMaxQueuedChunks ||
+                queuedFastBytes >= fastMaxQueuedBytes ||
+                (preferUnsafeBurst && queuedFastBytes >= 128 * 1024)
+            ) {
                 flushFastChunks();
             }
             else scheduleFastFlush();
         };
         const shouldBatchFastChunk = (byteLength: number): boolean =>
-            streamV2 && byteLength > 0 && byteLength <= STREAM_V2_BATCH_MAX_CHUNK_BYTES;
+            streamV2 && byteLength > 0 && byteLength <= fastMaxBatchChunkBytes;
         const writeChunkWithCallbacks = (u8: Uint8Array, onDone: () => void, onError: (err: unknown) => void): void => {
             try {
                 ensureOpen();

@@ -34,6 +34,48 @@ enum EvalTimerCmd {
     },
 }
 
+static NEXT_EVAL_ARGS_ID: AtomicU64 = AtomicU64::new(1);
+
+// Allocates a per-eval unique global key used to bind `$args` without clobbering concurrent evals.
+fn next_eval_args_key() -> String {
+    let id = NEXT_EVAL_ARGS_ID.fetch_add(1, Ordering::Relaxed);
+    format!("__denojs_worker_eval_args_{id}")
+}
+
+// Injects a lexical `$args` binding into eval/module source.
+fn inject_eval_args_binding(source: &str, key: &str) -> String {
+    let key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"__denojs_worker_eval_args\"".into());
+    format!("const $args = globalThis[{key_json}];\n{source}")
+}
+
+// Sets per-call eval args on globalThis under a unique key.
+fn set_eval_args_global(
+    worker: &mut MainWorker,
+    key: &str,
+    args: &[JsValueBridge],
+) -> Result<(), JsValueBridge> {
+    deno_core::scope!(scope, &mut worker.js_runtime);
+    let global = scope.get_current_context().global(scope);
+    let key_v8 =
+        v8::String::new(scope, key).ok_or_else(|| mk_err("BridgeError", "Failed to allocate args key".into()))?;
+    let arr = v8::Array::new(scope, args.len() as i32);
+    for (idx, item) in args.iter().enumerate() {
+        let vv = v8_codec::to_v8(scope, item).map_err(|e| mk_err("BridgeError", e))?;
+        let _ = arr.set_index(scope, idx as u32, vv);
+    }
+    let _ = global.set(scope, key_v8.into(), arr.into());
+    Ok(())
+}
+
+// Clears per-call eval args from globalThis.
+fn clear_eval_args_global(worker: &mut MainWorker, key: &str) {
+    deno_core::scope!(scope, &mut worker.js_runtime);
+    let global = scope.get_current_context().global(scope);
+    if let Some(key_v8) = v8::String::new(scope, key) {
+        let _ = global.delete(scope, key_v8.into());
+    }
+}
+
 #[derive(Clone)]
 struct EvalTimerService {
     tx: mpsc::Sender<EvalTimerCmd>,
@@ -488,10 +530,32 @@ pub async fn eval_in_runtime(
         options.filename.clone()
     };
 
-    let transpiled_source =
-        match maybe_transpile_eval_source(limits, &filename, &options.loader, source) {
+    let mut source_with_args_binding = source.to_string();
+    let mut eval_args_key: Option<String> = None;
+    if options.args_provided {
+        let key = next_eval_args_key();
+        if let Err(error) = set_eval_args_global(worker, &key, &options.args) {
+            let stats = ExecStats {
+                cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
+                eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
+            };
+            return EvalReply::Err { error, stats };
+        }
+        source_with_args_binding = inject_eval_args_binding(source, &key);
+        eval_args_key = Some(key);
+    }
+
+    let transpiled_source = match maybe_transpile_eval_source(
+        limits,
+        &filename,
+        &options.loader,
+        &source_with_args_binding,
+    ) {
             Ok(s) => s,
             Err(error) => {
+                if let Some(key) = eval_args_key.as_deref() {
+                    clear_eval_args_global(worker, key);
+                }
                 let stats = ExecStats {
                     cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
                     eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
@@ -519,6 +583,10 @@ pub async fn eval_in_runtime(
     } else {
         eval_script_or_callable(worker, &transpiled_source, &options).await
     };
+
+    if let Some(key) = eval_args_key.as_deref() {
+        clear_eval_args_global(worker, key);
+    }
 
     cancel.store(true, Ordering::SeqCst);
     if let Some(id) = timeout_id {

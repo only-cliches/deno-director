@@ -168,6 +168,23 @@ describe("inspect + envFile", () => {
     }
   }, 20_000);
 
+  test("bridge.enableUnsafeStreamMemory is disabled when permissions.hrtime is enabled", async () => {
+    const root = await mkTempDir("denojs-worker-unsafe-stream-memory-");
+    const dw = createTestWorker({
+      cwd: root,
+      permissions: { hrtime: true },
+      bridge: { enableUnsafeStreamMemory: true },
+    });
+
+    try {
+      const enabled = await dw.eval("globalThis.__denojs_worker_bridge?.enableUnsafeStreamMemory === true");
+      expect(enabled).toBe(false);
+    } finally {
+      if (!dw.isClosed()) await dw.close({ force: true });
+      await rmRF(root);
+    }
+  }, 20_000);
+
   test("envFile true does not load parent .env outside worker cwd", async () => {
     const root = await mkTempDir("denojs-worker-envfile-parent-");
     const nested = path.join(root, "nested");

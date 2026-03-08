@@ -698,7 +698,30 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 return cx.throw_error("postStreamChunk streamId must be non-empty");
             }
             let payload_js = cx.argument::<JsValue>(1)?;
-            let payload = crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?;
+            let payload = if let Ok(buf) = payload_js.downcast::<JsBuffer, _>(&mut cx) {
+                crate::bridge::types::JsValueBridge::BufferView {
+                    kind: "Uint8Array".to_string(),
+                    bytes: bytes::Bytes::from(buf.as_slice(&cx).to_vec()),
+                    byte_offset: 0,
+                    length: buf.as_slice(&cx).len(),
+                }
+            } else if let Ok(u8) = payload_js.downcast::<JsUint8Array, _>(&mut cx) {
+                crate::bridge::types::JsValueBridge::BufferView {
+                    kind: "Uint8Array".to_string(),
+                    bytes: bytes::Bytes::from(u8.as_slice(&cx).to_vec()),
+                    byte_offset: 0,
+                    length: u8.len(&mut cx) as usize,
+                }
+            } else if let Ok(ab) = payload_js.downcast::<JsArrayBuffer, _>(&mut cx) {
+                crate::bridge::types::JsValueBridge::BufferView {
+                    kind: "ArrayBuffer".to_string(),
+                    bytes: bytes::Bytes::from(ab.as_slice(&cx).to_vec()),
+                    byte_offset: 0,
+                    length: ab.as_slice(&cx).len(),
+                }
+            } else {
+                crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?
+            };
 
             let tx = deno_data_tx_for_worker(id2);
             let Some(tx) = tx else {

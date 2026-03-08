@@ -731,7 +731,7 @@ Registers source under a module name for future imports.
 Clears a previously registered module by name.
 * `module.import<T>(specifier: string): Promise<T>`
 Imports a module specifier through the runtime import pipeline and returns a callable Proxy namespace to the exports.
-* `stream.connect(key: string): Promise<Duplex>`
+* `stream.connect(key: string, options?: { unsafeSharedMemory?: boolean }): Promise<Duplex>`
 Opens a bidirectional stream session and returns a Node.js `Duplex` stream.
 * `id: string`
 Stable worker id for correlation (also used in default internal cwd suffix).
@@ -820,7 +820,7 @@ Returns granular V8 heap statistics (`totalHeapSize`, `mallocedMemory`, etc.).
 Fires an event into Deno's `globalThis.onmessage`.
 * `on(event: "message" | "close" | "lifecycle" | "runtime", cb: Function)`
 Listen for messages from Deno (`hostPostMessage`), close events, or lifecycle transitions (`beforeStart`, `onCrash`, etc.).
-`"runtime"` events emit operation telemetry such as `eval.begin/end`, `evalSync.begin/end`, `import.requested/resolved`, `handle.*`, and `error.thrown`.
+`"runtime"` events emit operation telemetry such as `eval.begin/end`, `evalSync.begin/end`, `import.requested/resolved`, `stream.connect`, `handle.*`, and `error.thrown`.
 * `close(options?: { force?: boolean }): Promise<void>`
 Gracefully shuts down the V8 isolate. Use `force: true` to instantly terminate execution.
 * `restart(options?: { force?: boolean }): Promise<void>`
@@ -848,6 +848,7 @@ type DenoWorkerOptions = {
     streamCreditFlushBytes?: number; // Credit flush threshold
     streamBacklogLimit?: number; // Max unaccepted worker->Node stream opens to backlog (default 256)
     streamHighWaterMarkBytes?: number; // Reader-side high water mark (defaults to streamWindowBytes)
+    enableUnsafeStreamMemory?: boolean; // Experimental unsafe shared-memory stream mode (untrusted-code risk)
   };
   cwd?: string;                 // Optional sandbox root. Omitted => unique <tmp>/deno-director/sandbox/w-<id>. Provided path must exist.
   startup?: string;             // Script evaluated before user code runs

@@ -12,6 +12,11 @@ use crate::worker::messages::{DenoMsg, EvalReply, ExecStats, NodeMsg, ResolvePay
 use crate::worker::state::RuntimeLimits;
 use crate::worker::stream_plane::NativeIncomingPlane;
 
+fn use_native_stream_plane(limits: &RuntimeLimits) -> bool {
+    let _ = limits;
+    native_stream_plane_enabled()
+}
+
 /// Handle deno msg.
 pub async fn handle_deno_msg(
     worker: &mut MainWorker,
@@ -19,7 +24,8 @@ pub async fn handle_deno_msg(
     limits: &RuntimeLimits,
     msg: DenoMsg,
 ) -> bool {
-    if native_stream_plane_enabled() && native_stream_debug_enabled() {
+    let use_native_stream_plane = use_native_stream_plane(limits);
+    if use_native_stream_plane && native_stream_debug_enabled() {
         match &msg {
             DenoMsg::PostMessage { .. } => eprintln!("[native-stream] msg:PostMessage"),
             DenoMsg::PostMessageTyped { message_type, .. } => {
@@ -75,30 +81,48 @@ pub async fn handle_deno_msg(
             payload,
         } => handle_post_message_typed_msg(worker, message_type, id, payload),
         DenoMsg::PostStreamChunk { stream_id, payload } => {
-            handle_post_stream_chunk_msg(worker, stream_id, payload)
+            handle_post_stream_chunk_msg(worker, stream_id, payload, use_native_stream_plane)
         }
         DenoMsg::PostStreamChunkRaw {
             stream_id,
             payload,
             credit,
-        } => handle_post_stream_chunk_raw_msg(worker, stream_id, payload, credit),
+        } => handle_post_stream_chunk_raw_msg(
+            worker,
+            stream_id,
+            payload,
+            credit,
+            use_native_stream_plane,
+        ),
         DenoMsg::PostStreamChunkRawBin {
             stream_id,
             payload,
             credit,
-        } => handle_post_stream_chunk_raw_bin_msg(worker, stream_id, payload, credit),
+        } => handle_post_stream_chunk_raw_bin_msg(
+            worker,
+            stream_id,
+            payload,
+            credit,
+            use_native_stream_plane,
+        ),
         DenoMsg::PostStreamChunks {
             stream_id,
             payloads,
-        } => handle_post_stream_chunks_msg(worker, stream_id, payloads),
+        } => handle_post_stream_chunks_msg(worker, stream_id, payloads, use_native_stream_plane),
         DenoMsg::PostStreamChunksRaw { stream_id, payload } => {
-            handle_post_stream_chunks_raw_msg(worker, stream_id, payload)
+            handle_post_stream_chunks_raw_msg(worker, stream_id, payload, use_native_stream_plane)
         }
         DenoMsg::PostStreamControl {
             kind,
             stream_id,
             aux,
-        } => handle_post_stream_control_msg(worker, kind, stream_id, aux),
+        } => handle_post_stream_control_msg(
+            worker,
+            kind,
+            stream_id,
+            aux,
+            use_native_stream_plane,
+        ),
         DenoMsg::SetGlobal {
             key,
             value,
@@ -410,11 +434,12 @@ fn handle_post_stream_chunk_msg(
     worker: &mut MainWorker,
     stream_id: String,
     payload: JsValueBridge,
+    use_native_stream_plane: bool,
 ) -> bool {
-    if native_stream_plane_enabled() && native_stream_debug_enabled() {
+    if use_native_stream_plane && native_stream_debug_enabled() {
         eprintln!("[native-stream] handle chunk id={stream_id}");
     }
-    if native_stream_plane_enabled()
+    if use_native_stream_plane
         && let Ok(id_num) = stream_id.parse::<u32>()
         && let Some(chunk) = payload_to_chunk_bytes(&payload)
         && let Some(plane) = native_stream_plane(worker)
@@ -465,8 +490,9 @@ fn handle_post_stream_chunks_msg(
     worker: &mut MainWorker,
     stream_id: String,
     payloads: Vec<JsValueBridge>,
+    use_native_stream_plane: bool,
 ) -> bool {
-    if native_stream_plane_enabled() && native_stream_debug_enabled() {
+    if use_native_stream_plane && native_stream_debug_enabled() {
         eprintln!(
             "[native-stream] handle chunks id={} count={}",
             stream_id,
@@ -493,7 +519,7 @@ fn handle_post_stream_chunks_msg(
         }
         let id_num = stream_id.parse::<u32>().unwrap_or(0);
         if id_num > 0 {
-            if native_stream_plane_enabled()
+            if use_native_stream_plane
                 && let Some(plane) = native_stream_plane(worker)
             {
                 let (_, wake) = plane.push_vectorized_with_wake(id_num, Bytes::from(merged));
@@ -512,6 +538,7 @@ fn handle_post_stream_chunks_msg(
                     byte_offset: 0,
                     length: merged_len,
                 },
+                use_native_stream_plane,
             );
         }
     }
@@ -546,7 +573,12 @@ fn handle_post_stream_chunks_msg(
 
     if !dispatched {
         for payload in payloads {
-            let _ = handle_post_stream_chunk_msg(worker, stream_id.clone(), payload);
+            let _ = handle_post_stream_chunk_msg(
+                worker,
+                stream_id.clone(),
+                payload,
+                use_native_stream_plane,
+            );
         }
     }
     false
@@ -557,11 +589,12 @@ fn handle_post_stream_chunk_raw_msg(
     stream_id: u32,
     payload: JsValueBridge,
     credit: Option<u32>,
+    use_native_stream_plane: bool,
 ) -> bool {
-    if native_stream_plane_enabled() && native_stream_debug_enabled() {
+    if use_native_stream_plane && native_stream_debug_enabled() {
         eprintln!("[native-stream] handle raw id={stream_id}");
     }
-    if native_stream_plane_enabled()
+    if use_native_stream_plane
         && let Some(chunk) = payload_to_chunk_bytes(&payload)
         && let Some(plane) = native_stream_plane(worker)
     {
@@ -603,7 +636,12 @@ fn handle_post_stream_chunk_raw_msg(
     };
 
     if !dispatched {
-        return handle_post_stream_chunk_msg(worker, stream_id.to_string(), payload);
+        return handle_post_stream_chunk_msg(
+            worker,
+            stream_id.to_string(),
+            payload,
+            use_native_stream_plane,
+        );
     }
     false
 }
@@ -613,15 +651,16 @@ fn handle_post_stream_chunk_raw_bin_msg(
     stream_id: u32,
     payload: Vec<u8>,
     credit: Option<u32>,
+    use_native_stream_plane: bool,
 ) -> bool {
-    if native_stream_plane_enabled() && native_stream_debug_enabled() {
+    if use_native_stream_plane && native_stream_debug_enabled() {
         eprintln!(
             "[native-stream] handle raw-bin id={} bytes={}",
             stream_id,
             payload.len()
         );
     }
-    if native_stream_plane_enabled()
+    if use_native_stream_plane
         && let Some(plane) = native_stream_plane(worker)
     {
         let _ = credit;
@@ -679,11 +718,12 @@ fn handle_post_stream_chunks_raw_msg(
     worker: &mut MainWorker,
     stream_id: u32,
     payload: JsValueBridge,
+    use_native_stream_plane: bool,
 ) -> bool {
-    if native_stream_plane_enabled() && native_stream_debug_enabled() {
+    if use_native_stream_plane && native_stream_debug_enabled() {
         eprintln!("[native-stream] handle raw-vectorized id={stream_id}");
     }
-    if native_stream_plane_enabled()
+    if use_native_stream_plane
         && let Some(chunk) = payload_to_chunk_bytes(&payload)
         && let Some(plane) = native_stream_plane(worker)
     {
@@ -716,7 +756,13 @@ fn handle_post_stream_chunks_raw_msg(
     };
 
     if !dispatched {
-        return handle_post_stream_chunk_raw_msg(worker, stream_id, payload, None);
+        return handle_post_stream_chunk_raw_msg(
+            worker,
+            stream_id,
+            payload,
+            None,
+            use_native_stream_plane,
+        );
     }
     false
 }
@@ -727,8 +773,9 @@ fn handle_post_stream_control_msg(
     kind: String,
     stream_id: String,
     aux: Option<String>,
+    use_native_stream_plane: bool,
 ) -> bool {
-    if native_stream_plane_enabled()
+    if use_native_stream_plane
         && let Some(plane) = native_stream_plane(worker)
     {
         let (handled, wake) = match kind.as_str() {

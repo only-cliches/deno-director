@@ -243,4 +243,19 @@ describe("deno_worker: modules", () => {
     },
     20_000
   );
+
+  it("module.eval exposes $args to module source", async () => {
+    dw = createTestWorker();
+    await expect(
+      dw.module.eval(
+        `
+          export const out = {
+            sum: Number($args[0]) + Number($args[1]),
+            token: String($args[2]?.token ?? ""),
+          };
+        `,
+        { args: [20, 22, { token: "module-token" }] },
+      ),
+    ).resolves.toMatchObject({ out: { sum: 42, token: "module-token" } });
+  });
 });

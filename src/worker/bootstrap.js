@@ -617,6 +617,7 @@ function streamBridgeConfig() {
   const parsedWindow = raw && Number(raw.streamWindowBytes);
   const parsedFlush = raw && Number(raw.streamCreditFlushBytes);
   const parsedHighWater = raw && Number(raw.streamHighWaterMarkBytes);
+  const enableUnsafeStreamMemory = !!(raw && raw.enableUnsafeStreamMemory === true);
   const streamWindowBytes =
     Number.isFinite(parsedWindow) && parsedWindow >= 1
       ? Math.trunc(parsedWindow)
@@ -629,7 +630,7 @@ function streamBridgeConfig() {
     Number.isFinite(parsedHighWater) && parsedHighWater >= 1
       ? Math.trunc(parsedHighWater)
       : streamWindowBytes;
-  return { streamWindowBytes, streamCreditFlushBytes, streamHighWaterMarkBytes };
+  return { streamWindowBytes, streamCreditFlushBytes, streamHighWaterMarkBytes, enableUnsafeStreamMemory };
 }
 const STREAM_BRIDGE_CFG = streamBridgeConfig();
 const STREAM_CREDIT_FLUSH_EFFECTIVE_BYTES = Math.max(
@@ -1005,8 +1006,11 @@ function makeNativeAcceptedStreamReader(idNum) {
   let done = false;
   let pendingRaw = null;
   const canUseAsyncRawRead =
-    CAP_STREAM_READ_ASYNC_RAW &&
-    (CAP_STREAM_READ_ASYNC_RAW.kind === "function" || CAP_STREAM_READ_ASYNC_RAW.kind === "number");
+    !STREAM_BRIDGE_CFG.enableUnsafeStreamMemory &&
+    (
+      !!(CAP_STREAM_READ_ASYNC_RAW && (CAP_STREAM_READ_ASYNC_RAW.kind === "function" || CAP_STREAM_READ_ASYNC_RAW.kind === "number")) ||
+      typeof coreOpAsync === "function"
+    );
   const clearWaiter = () => {
     const waiter = globalThis.__nodeNativeStreamReadWaiters.get(id);
     if (waiter) {
@@ -1451,6 +1455,25 @@ const hostStreams = {
     const streamName = String(key || "").trim();
     if (!streamName) throw new Error("hostStreams.accept(key) requires a non-empty key");
     if (globalThis.__denojs_worker_bridge && globalThis.__denojs_worker_bridge.nativeStreamPlane === true) {
+      const canUseAsyncAccept =
+        !STREAM_BRIDGE_CFG.enableUnsafeStreamMemory &&
+        (
+          !!(CAP_STREAM_ACCEPT_ASYNC && (CAP_STREAM_ACCEPT_ASYNC.kind === "function" || CAP_STREAM_ACCEPT_ASYNC.kind === "number")) ||
+          typeof coreOpAsync === "function"
+        );
+      if (canUseAsyncAccept) {
+        const accepted = await Promise.race([
+          callCapturedAwait(CAP_STREAM_ACCEPT_ASYNC, OP_STREAM_ACCEPT_ASYNC, streamName),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`hostStreams.accept timeout for stream key: ${streamName}`)), 30_000)
+          ),
+        ]);
+        const idNum = Number(accepted && typeof accepted === "object" ? accepted.id : accepted);
+        if (Number.isFinite(idNum) && idNum > 0) {
+          return makeNativeAcceptedStreamReader(Math.trunc(idNum) >>> 0);
+        }
+        throw new Error(`hostStreams.accept failed for stream key: ${streamName}`);
+      }
       await Promise.resolve();
       const start = Date.now();
       while (Date.now() - start < 30_000) {
@@ -1460,7 +1483,7 @@ const hostStreams = {
           return makeNativeAcceptedStreamReader(Math.trunc(idNum) >>> 0);
         }
         if (idNum < 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 1));
       }
       throw new Error(`hostStreams.accept timeout for stream key: ${streamName}`);
     }

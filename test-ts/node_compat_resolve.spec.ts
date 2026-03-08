@@ -496,7 +496,7 @@ exports.Storage = Storage;
       cwd: dir,
       imports: true,
       
-      nodeJs: { modules: true, runtime: true, cjsInterop: "node" as any },
+      nodeJs: { modules: true, runtime: true, cjsInterop: "node" as unknown as true },
     });
 
     try {
@@ -859,6 +859,75 @@ exports.base = path.basename("/tmp/a.txt");
     } finally {
       if (!dw.isClosed()) await dw.close();
     }
+  });
+
+  test("nodeResolve: callback imports allowDisk supports node:* builtins in cjsInterop facade", async () => {
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: () => true,
+      nodeJs: { modules: true, runtime: true, cjsInterop: true },
+    });
+
+    try {
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbuiltin_cb", "package.json"),
+        JSON.stringify({ name: "cjsbuiltin_cb", version: "1.0.0", main: "index.js" }, null, 2)
+      );
+      await writeFile(
+        path.join(dir, "node_modules", "cjsbuiltin_cb", "index.js"),
+        `"use strict";
+const path = require("path");
+exports.base = path.basename("/tmp/b.txt");
+`
+      );
+
+      const code = `
+        import { base } from "cjsbuiltin_cb";
+        export const out = base;
+      `;
+
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "b.txt" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  test("nodeResolve: imports:true and imports:() => true resolve the same graph", async () => {
+    await writeFile(
+      path.join(dir, "node_modules", "uniform_graph", "package.json"),
+      JSON.stringify({ name: "uniform_graph", version: "1.0.0", main: "index.js" }, null, 2)
+    );
+    await writeFile(
+      path.join(dir, "node_modules", "uniform_graph", "index.js"),
+      `"use strict";
+const path = require("path");
+const dep = require("../my_pkg/main.js");
+exports.base = path.basename("/tmp/uniform.txt");
+exports.dep = dep.y;
+`
+    );
+
+    const code = `
+      import { x } from "./local.js";
+      import { base, dep } from "uniform_graph";
+      export const out = { x, base, dep };
+    `;
+
+    const run = async (imports: true | (() => true)) => {
+      const dw = createTestWorker({
+        cwd: dir,
+        imports,
+        nodeJs: { modules: true, runtime: true, cjsInterop: true },
+      });
+      try {
+        return await dw.module.eval(code);
+      } finally {
+        if (!dw.isClosed()) await dw.close();
+      }
+    };
+
+    await expect(run(true)).resolves.toMatchObject({ out: { x: 123, base: "uniform.txt", dep: 456 } });
+    await expect(run(() => true)).resolves.toMatchObject({ out: { x: 123, base: "uniform.txt", dep: 456 } });
   });
 
   test("nodeJs.cjsForcePaths supports glob patterns", async () => {

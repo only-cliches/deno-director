@@ -190,6 +190,7 @@ pub struct BridgeConfig {
     pub stream_window_bytes: Option<u64>,
     pub stream_credit_flush_bytes: Option<u64>,
     pub stream_high_water_mark_bytes: Option<u64>,
+    pub enable_unsafe_stream_memory: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -504,11 +505,25 @@ fn run_permission_enabled(permissions: Option<&serde_json::Value>) -> bool {
     }
 }
 
+// Checks whether `permissions.hrtime` enables high-resolution timing.
+fn hrtime_permission_enabled(permissions: Option<&serde_json::Value>) -> bool {
+    if permissions == Some(&serde_json::Value::Bool(true)) {
+        return true;
+    }
+    let Some(obj) = permissions.and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let Some(hrtime) = obj.get("hrtime") else {
+        return false;
+    };
+    matches!(hrtime, serde_json::Value::Bool(true))
+}
+
 impl WorkerCreateOptions {
     /// Constructs neon from source input for worker configuration/state parsing and runtime limits.
     pub fn from_neon<'a>(cx: &mut FunctionContext<'a>, idx: i32) -> Result<Self, Throw> {
         let mut out = Self {
-            channel_size: 512,
+            channel_size: 2048,
             ..Default::default()
         };
         out.runtime_options.wasm = true;
@@ -584,7 +599,7 @@ impl WorkerCreateOptions {
             }
         }
 
-        // `bridge`: { channelSize?, streamWindowBytes?, streamCreditFlushBytes?, streamHighWaterMarkBytes? }.
+        // `bridge`: { channelSize?, streamWindowBytes?, streamCreditFlushBytes?, streamHighWaterMarkBytes?, enableUnsafeStreamMemory? }.
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "bridge") {
             if let Ok(o) = v.downcast::<JsObject, _>(cx) {
                 let mut cfg = BridgeConfig::default();
@@ -627,6 +642,13 @@ impl WorkerCreateOptions {
                             cfg.stream_high_water_mark_bytes = Some(n as u64);
                             saw_bridge = true;
                         }
+                    }
+                }
+
+                if let Ok(uv) = o.get::<JsValue, _, _>(cx, "enableUnsafeStreamMemory") {
+                    if let Ok(ub) = uv.downcast::<JsBoolean, _>(cx) {
+                        cfg.enable_unsafe_stream_memory = ub.value(cx);
+                        saw_bridge = true;
                     }
                 }
 
@@ -1018,13 +1040,32 @@ impl WorkerCreateOptions {
             );
         }
 
+        if let Some(bridge) = out.runtime_options.bridge.as_mut()
+            && bridge.enable_unsafe_stream_memory
+        {
+            out.runtime_options.startup_warnings.push(
+                "bridge.enableUnsafeStreamMemory is enabled: unsafe shared memory stream mode reduces isolation guarantees and should not be used for untrusted code."
+                    .to_string(),
+            );
+            if hrtime_permission_enabled(out.runtime_options.permissions.as_ref()) {
+                bridge.enable_unsafe_stream_memory = false;
+                out.runtime_options.startup_warnings.push(
+                    "bridge.enableUnsafeStreamMemory was disabled because permissions.hrtime is enabled. Disable hrtime to allow unsafe shared memory stream mode."
+                        .to_string(),
+                );
+            }
+        }
+
         Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_env_permission_enabled, run_permission_enabled, within_base_dir};
+    use super::{
+        ensure_env_permission_enabled, hrtime_permission_enabled, run_permission_enabled,
+        within_base_dir,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1132,6 +1173,23 @@ mod tests {
             &serde_json::json!({ "read": true })
         )));
         assert!(!run_permission_enabled(None));
+    }
+
+    #[test]
+    // Checks whether permissions hrtime enables high-resolution timing.
+    fn hrtime_permission_enabled_detects_supported_forms() {
+        assert!(hrtime_permission_enabled(Some(&serde_json::Value::Bool(true))));
+        assert!(hrtime_permission_enabled(Some(
+            &serde_json::json!({ "hrtime": true })
+        )));
+        assert!(!hrtime_permission_enabled(Some(
+            &serde_json::json!({ "hrtime": false })
+        )));
+        assert!(!hrtime_permission_enabled(Some(
+            &serde_json::json!({ "read": true })
+        )));
+        assert!(!hrtime_permission_enabled(Some(&serde_json::Value::Bool(false))));
+        assert!(!hrtime_permission_enabled(None));
     }
 
     #[test]

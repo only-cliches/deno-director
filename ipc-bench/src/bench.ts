@@ -24,6 +24,7 @@ type BenchConfig = {
     iterations: number;
     warmup: number;
     restarts: number;
+    unsafeStreamMemory: boolean;
     scenarios: ScenarioKey[];
 };
 
@@ -73,6 +74,15 @@ const scenarioCatalog: ScenarioMeta[] = [
     { key: "deno+deno-http", label: "Deno | HTTP | Deno", main: "Deno", ipc: "HTTP", worker: "Deno" },
 ];
 
+let useUnsafeStreamMemory = false;
+
+function createBenchDenoWorker(): DenoWorker {
+    if (useUnsafeStreamMemory) {
+        return new DenoWorker({ bridge: { enableUnsafeStreamMemory: true } });
+    }
+    return new DenoWorker();
+}
+
 function parseArgs(): BenchConfig {
     const args = process.argv.slice(2);
     const out: BenchConfig = {
@@ -81,6 +91,7 @@ function parseArgs(): BenchConfig {
         iterations: 3,
         warmup: 1,
         restarts: 0,
+        unsafeStreamMemory: false,
         scenarios: [...scenarioOrder],
     };
 
@@ -96,6 +107,7 @@ function parseArgs(): BenchConfig {
         else if (arg === "--iterations") out.iterations = Number(args[++i]);
         else if (arg === "--warmup") out.warmup = Number(args[++i]);
         else if (arg === "--restarts") out.restarts = Number(args[++i]);
+        else if (arg === "--unsafe-stream-memory") out.unsafeStreamMemory = true;
         else if (arg === "--scenarios") {
             const wanted = new Set(args[++i].split(",").map((v) => v.trim()));
             out.scenarios = scenarioOrder.filter((k) => wanted.has(k));
@@ -456,7 +468,7 @@ async function teardownNodeHttp(ctx: any): Promise<void> {
 }
 
 async function setupDenoPostMessage(workerCount: number): Promise<any> {
-    const workers = Array.from({ length: workerCount }, () => new DenoWorker());
+    const workers = Array.from({ length: workerCount }, () => createBenchDenoWorker());
     const pending = new Map<number, { resolve: (ack: Ack) => void; reject: (err: unknown) => void }>();
     let nextId = 1;
     await Promise.all(workers.map((w) => w.eval(denoPostMessageScript)));
@@ -494,7 +506,7 @@ async function teardownDenoPostMessage(ctx: any): Promise<void> {
 }
 
 async function setupDenoEval(workerCount: number): Promise<any> {
-    const workers = Array.from({ length: workerCount }, () => new DenoWorker());
+    const workers = Array.from({ length: workerCount }, () => createBenchDenoWorker());
     const src = `
         globalThis.__benchEcho = (p) => {
             if (p instanceof Uint8Array) {
@@ -535,7 +547,7 @@ async function teardownDenoEval(ctx: any): Promise<void> {
 }
 
 async function setupDenoHandle(workerCount: number): Promise<any> {
-    const workers = Array.from({ length: workerCount }, () => new DenoWorker());
+    const workers = Array.from({ length: workerCount }, () => createBenchDenoWorker());
     const handles = await Promise.all(
         workers.map((w) =>
             w.handle.eval(`(p) => {
@@ -573,7 +585,7 @@ async function runDenoHandle(payload: TransferPayload, messages: number, workerC
 }
 
 const denoStreamScript = `
-(key) => {
+(key, batchedAck = true) => {
   (async () => {
   const readU32 = (buf, off) =>
     ((buf[off] >>> 0) | ((buf[off + 1] << 8) >>> 0) | ((buf[off + 2] << 16) >>> 0) | ((buf[off + 3] << 24) >>> 0)) >>> 0;
@@ -584,6 +596,7 @@ const denoStreamScript = `
     next.set(buf, 0);
     next.set(chunk, buf.length);
     buf = next;
+    const acks = [];
     while (buf.length >= 16) {
       const id = readU32(buf, 0);
       const count = readU32(buf, 4);
@@ -619,9 +632,16 @@ const denoStreamScript = `
         }
       }
 
-      hostPostMessage({ id: id >>> 0, size: size >>> 0, checksum: checksum >>> 0 });
+      if (batchedAck) {
+        acks.push({ id: id >>> 0, size: size >>> 0, checksum: checksum >>> 0 });
+      } else {
+        hostPostMessage({ id: id >>> 0, size: size >>> 0, checksum: checksum >>> 0 });
+      }
 
       buf = buf.subarray(total);
+    }
+    if (batchedAck && acks.length > 0) {
+      hostPostMessage({ acks });
     }
   }
   })();
@@ -648,7 +668,7 @@ function endDuplex(duplex: any): Promise<void> {
 }
 
 async function setupDenoStream(workerCount: number): Promise<any> {
-    const workers = Array.from({ length: workerCount }, () => new DenoWorker());
+    const workers = Array.from({ length: workerCount }, () => createBenchDenoWorker());
     const pending = new Map<number, { resolve: (ack: Ack) => void; reject: (err: unknown) => void }>();
     const writers: any[] = [];
     const keys: string[] = [];
@@ -656,12 +676,21 @@ async function setupDenoStream(workerCount: number): Promise<any> {
     for (let i = 0; i < workers.length; i += 1) {
         const key = `bench-stream-persistent-${i}-${Math.random().toString(36).slice(2)}`;
         keys.push(key);
-        writers.push(await workers[i].stream.connect(key));
+        writers.push(await workers[i].stream.connect(key, useUnsafeStreamMemory ? { unsafeSharedMemory: true } : undefined));
     }
-    await Promise.all(workers.map((w, i) => w.eval(denoStreamScript, { args: [keys[i]] })));
+    await Promise.all(workers.map((w, i) => w.eval(denoStreamScript, { args: [keys[i], !useUnsafeStreamMemory] })));
     workers.forEach((w) => {
         w.on("message", (msg: any) => {
-            const entry = pending.get(msg.id);
+            if (Array.isArray(msg?.acks)) {
+                for (const ack of msg.acks) {
+                    const entry = pending.get(ack.id);
+                    if (!entry) continue;
+                    pending.delete(ack.id);
+                    entry.resolve({ size: (ack.size >>> 0) || 0, checksum: (ack.checksum >>> 0) || 0 });
+                }
+                return;
+            }
+            const entry = pending.get(msg?.id);
             if (!entry) return;
             pending.delete(msg.id);
             entry.resolve({ size: (msg.size >>> 0) || 0, checksum: (msg.checksum >>> 0) || 0 });
@@ -674,8 +703,10 @@ async function runDenoStream(payload: TransferPayload, messages: number, workerC
     const { writers, pending, nextId } = ctx;
     const mode = transferModeOf(payload);
     const bytes = mode === "binary" ? payload : Buffer.from(mode === "json" ? JSON.stringify(payload) : payload, "utf8");
-    const promises = Array.from({ length: messages }, async (_, i) => {
-        const writer = writers[i % workerCount];
+    const perWorkerFrames = Array.from({ length: workerCount }, () => [] as Uint8Array[]);
+    const promises: Array<Promise<Ack>> = [];
+    for (let i = 0; i < messages; i += 1) {
+        const wi = i % workerCount;
         const id = nextId();
         const ackPromise = new Promise<Ack>((resolve, reject) => {
             pending.set(id, { resolve, reject });
@@ -701,9 +732,28 @@ async function runDenoStream(payload: TransferPayload, messages: number, workerC
         frame[14] = 0;
         frame[15] = 0;
         frame.set(bytes, 16);
-        await writeDuplexChunk(writer, frame);
-        return await ackPromise;
-    });
+        perWorkerFrames[wi].push(frame);
+        promises.push(ackPromise);
+    }
+    await Promise.all(
+        perWorkerFrames.map(async (frames, wi) => {
+            if (frames.length === 0) return;
+            if (useUnsafeStreamMemory) {
+                for (const frame of frames) {
+                    await writeDuplexChunk(writers[wi], frame);
+                }
+                return;
+            }
+            const total = frames.reduce((n, f) => n + f.byteLength, 0);
+            const merged = Buffer.allocUnsafe(total);
+            let off = 0;
+            for (const frame of frames) {
+                merged.set(frame, off);
+                off += frame.byteLength;
+            }
+            await writeDuplexChunk(writers[wi], merged);
+        }),
+    );
 
     const out = await Promise.all(promises);
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
@@ -817,6 +867,7 @@ async function runBunMain(
     iterations: number,
     transfer: TransferMode,
     restarts: number,
+    unsafeStreamMemory: boolean,
 ): Promise<Record<string, number>> {
     const script = path.resolve(process.cwd(), "src/runtime-bench-bun.ts");
     const output = await runJsonCommand("bun", [
@@ -834,6 +885,7 @@ async function runBunMain(
         "--restarts",
         String(restarts),
         "--json",
+        ...(unsafeStreamMemory ? ["--unsafe-stream-memory"] : []),
     ]);
     return (output && output.results) || {};
 }
@@ -845,6 +897,7 @@ async function runDenoMain(
     iterations: number,
     transfer: TransferMode,
     restarts: number,
+    unsafeStreamMemory: boolean,
 ): Promise<Record<string, number>> {
     const script = path.resolve(process.cwd(), "src/runtime-bench-deno.ts");
     const output = await runJsonCommand("deno", [
@@ -864,6 +917,7 @@ async function runDenoMain(
         "--restarts",
         String(restarts),
         "--json",
+        ...(unsafeStreamMemory ? ["--unsafe-stream-memory"] : []),
     ]);
     return (output && output.results) || {};
 }
@@ -917,6 +971,7 @@ function printTable(title: string, scenarios: ScenarioMeta[], results: Map<strin
 
 async function main(): Promise<void> {
     const config = parseArgs();
+    useUnsafeStreamMemory = config.unsafeStreamMemory;
     const selectedScenarios = scenarioCatalog.filter((s) => config.scenarios.includes(s.key));
     const selectedNodeScenarios = localScenarios.filter((s) => config.scenarios.includes(s.key));
     const wantsBunMain = config.scenarios.some((k) => k.startsWith("bun+bun-"));
@@ -926,7 +981,7 @@ async function main(): Promise<void> {
 
     console.log("# IPC Bandwidth Bench");
     console.log(
-        `config: payloadBytesList=${config.payloadBytesList.join(",")} messages=${config.messages} iterations=${config.iterations} warmup=${config.warmup} restarts=${config.restarts}`,
+        `config: payloadBytesList=${config.payloadBytesList.join(",")} messages=${config.messages} iterations=${config.iterations} warmup=${config.warmup} restarts=${config.restarts} unsafeStreamMemory=${config.unsafeStreamMemory}`,
     );
     if (wantsBunMain && !hasBun) console.log("runtime: bun not found in PATH (Bun main scenarios skipped)");
     if (wantsDenoMain && !hasDeno) console.log("runtime: deno not found in PATH (Deno main scenarios skipped)");
@@ -1056,9 +1111,9 @@ async function main(): Promise<void> {
                     console.log(`skip: ${s.label} (bun not found in PATH)`);
                 }
             } else {
-                const bunOut = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts);
-                const bunOutJson = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts);
-                const bunOutString = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts);
+                const bunOut = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts, config.unsafeStreamMemory);
+                const bunOutJson = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts, config.unsafeStreamMemory);
+                const bunOutString = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts, config.unsafeStreamMemory);
                 for (const s of selectedScenarios.filter((x) => x.main === "Bun")) {
                     const speed = bunOut[s.key];
                     if (speed == null) console.log(`skip: ${s.label} (missing result from bun runtime)`);
@@ -1088,9 +1143,9 @@ async function main(): Promise<void> {
                     console.log(`skip: ${s.label} (deno not found in PATH)`);
                 }
             } else {
-                const denoOut = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts);
-                const denoOutJson = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts);
-                const denoOutString = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts);
+                const denoOut = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts, config.unsafeStreamMemory);
+                const denoOutJson = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts, config.unsafeStreamMemory);
+                const denoOutString = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts, config.unsafeStreamMemory);
                 for (const s of selectedScenarios.filter((x) => x.main === "Deno")) {
                     const speed = denoOut[s.key];
                     if (speed == null) console.log(`skip: ${s.label} (missing result from deno runtime)`);

@@ -18,6 +18,7 @@ export type DenoWorkerRuntimeEventKind =
     | "import.requested"
     | "import.resolved"
     | "import.classified"
+    | "stream.connect"
     | "eval.begin"
     | "eval.end"
     | "module.eval.begin"
@@ -467,6 +468,18 @@ export type DenoWorkerBridgeOption =
              * Default: same value as `streamWindowBytes`.
              */
             streamHighWaterMarkBytes?: number;
+            /**
+             * Enables experimental unsafe shared-memory stream transport.
+             *
+             * Security note:
+             * - Unsafe shared memory is not suitable for untrusted multi-tenant code.
+             * - Shared memory increases race-condition and side-channel risk.
+             * - `stream.connect(..., { unsafeSharedMemory: true })` may still negotiate
+             *   down to safe copy-mode.
+             *
+             * Default: `false`.
+             */
+            enableUnsafeStreamMemory?: boolean;
       };
 
 /**
@@ -1020,6 +1033,16 @@ export type DenoWorkerStreamReader = AsyncIterable<Uint8Array> & {
     cancel(reason?: string): Promise<void>;
 };
 
+export type DenoWorkerStreamConnectOptions = {
+    /**
+     * Requests unsafe shared-memory transport for this connection.
+     *
+     * This is best-effort and may fall back to safe copy-mode.
+     * See runtime event kind `"stream.connect"` for negotiated mode details.
+     */
+    unsafeSharedMemory?: boolean;
+};
+
 export type DenoWorkerStreamApi = {
     /**
      * Connects a bidirectional stream pair under `key` and returns a Node.js `Duplex`.
@@ -1027,7 +1050,7 @@ export type DenoWorkerStreamApi = {
      * Host writes are delivered to `hostStreams.connect(key).readable` inside the worker.
      * Worker writes to `hostStreams.connect(key).writable` are delivered to this duplex readable side.
      */
-    connect(key: string): Promise<Duplex>;
+    connect(key: string, options?: DenoWorkerStreamConnectOptions): Promise<Duplex>;
     /** Low-level writer-only stream endpoint. */
     create(key?: string): DenoWorkerStreamWriter;
     /** Low-level reader-only stream endpoint. */

@@ -846,32 +846,55 @@ impl DynamicModuleLoader {
             .unwrap_or(false)
     }
 
+    // Resolves a specifier using the same logic as `imports: true` (non-callback policy).
+    fn resolve_like_allow_disk(&self, specifier: &str, referrer: &str) -> Result<Url, JsErrorBox> {
+        // Allow internal virtual URLs to pass through unchanged.
+        if let Ok(u) = Url::parse(specifier) {
+            if Self::is_internal_virtual_url(&u) {
+                return Ok(u);
+            }
+        }
+
+        // Allow direct hits for registry specifiers, including user aliases.
+        if let Some(resolved_key) = self.reg.resolve_specifier(specifier) {
+            if let Ok(u) = Url::parse(&resolved_key) {
+                return Ok(u);
+            }
+        }
+
+        // Node-style disk resolution (when enabled).
+        if let Some(u) = self.try_node_resolve_disk(specifier, referrer) {
+            return Ok(u);
+        }
+
+        // Optional Deno-style remote imports.
+        if self.jsr_resolve_enabled() {
+            if let Some(jsr_spec) = Self::map_jsr_specifier(specifier) {
+                return self.try_deno_resolve(&jsr_spec, referrer);
+            }
+        }
+
+        // Fast-fail unsupported bare specifiers so imports do not hang waiting
+        // on fallback resolvers when neither Node nor JSR resolution is enabled.
+        if Self::is_bare_specifier(specifier) && !self.node_disk_resolve_enabled() {
+            return Err(JsErrorBox::generic(format!(
+                "Bare import cannot be resolved without nodeJs.modules (or moduleLoader.jsrResolve): {specifier}"
+            )));
+        }
+
+        if (specifier.starts_with("http://") && self.http_resolve_enabled())
+            || (specifier.starts_with("https://") && self.https_resolve_enabled())
+        {
+            return self.try_deno_resolve(specifier, referrer);
+        }
+
+        // Deno resolver, but normalize virtual referrers into file://<cwd>/ for relative imports.
+        self.try_deno_resolve(specifier, referrer)
+    }
+
     // Checks whether wrap with redirect and returns the boolean result for module resolution, policy, and remote loading.
     fn should_wrap_with_redirect(requested_specifier: &Url) -> bool {
         requested_specifier.scheme() == "denojs-worker"
-    }
-
-    // Resolves allowed disk target according to rules used by module resolution, policy, and remote loading.
-    fn resolve_allowed_disk_target(&self, orig_spec: &str, orig_referrer: &str) -> Option<Url> {
-        self.try_node_resolve_disk(orig_spec, orig_referrer)
-            .or_else(|| {
-                DynamicModuleLoader::map_jsr_specifier(orig_spec)
-                    .and_then(|jsr_spec| self.try_deno_resolve(&jsr_spec, orig_referrer).ok())
-            })
-            .or_else(|| self.try_deno_resolve(orig_spec, orig_referrer).ok())
-    }
-
-    // Resolves rewritten target according to rules used by module resolution, policy, and remote loading.
-    fn resolve_rewritten_target(&self, rewritten_spec: &str, orig_referrer: &str) -> Option<Url> {
-        let ns = rewritten_spec.trim();
-        Url::parse(ns)
-            .ok()
-            .or_else(|| self.try_node_resolve_disk(ns, orig_referrer))
-            .or_else(|| {
-                DynamicModuleLoader::map_jsr_specifier(ns)
-                    .and_then(|jsr_spec| self.try_deno_resolve(&jsr_spec, orig_referrer).ok())
-            })
-            .or_else(|| self.try_deno_resolve(ns, orig_referrer).ok())
     }
 
     // Resolves allow disk or error according to rules used by module resolution, policy, and remote loading.
@@ -880,8 +903,7 @@ impl DynamicModuleLoader {
         orig_spec: &str,
         orig_referrer: &str,
     ) -> Result<Url, JsErrorBox> {
-        self.resolve_allowed_disk_target(orig_spec, orig_referrer)
-            .ok_or_else(|| JsErrorBox::generic(format!("Unable to resolve import: {}", orig_spec)))
+        self.resolve_like_allow_disk(orig_spec, orig_referrer)
     }
 
     // Resolves rewritten or error according to rules used by module resolution, policy, and remote loading.
@@ -890,10 +912,7 @@ impl DynamicModuleLoader {
         new_spec: &str,
         orig_referrer: &str,
     ) -> Result<Url, JsErrorBox> {
-        self.resolve_rewritten_target(new_spec, orig_referrer)
-            .ok_or_else(|| {
-                JsErrorBox::generic(format!("Unable to resolve rewritten import: {}", new_spec))
-            })
+        self.resolve_like_allow_disk(new_spec.trim(), orig_referrer)
     }
 
     // Checks whether load remote non callback and returns the boolean result for module resolution, policy, and remote loading.
@@ -910,11 +929,53 @@ impl DynamicModuleLoader {
         maybe_referrer_owned: Option<deno_core::ModuleLoadReferrer>,
         options: deno_core::ModuleLoadOptions,
     ) -> Result<ModuleSource, JsErrorBox> {
+        // Callback/import-rewrite paths can resolve to registry-backed modules
+        // (for example `node:` builtins provided by node runtime shims).
+        // Serve these directly and preserve redirect metadata for virtual requests.
+        if let Some((code, module_type)) = self.reg.get_for_load(resolved.as_str()) {
+            let source_code = deno_core::ModuleSourceCode::String(code.into());
+            if Self::should_wrap_with_redirect(&requested_specifier) {
+                return Ok(ModuleSource::new_with_redirect(
+                    module_type,
+                    source_code,
+                    &requested_specifier,
+                    &resolved,
+                    None,
+                ));
+            }
+            return Ok(ModuleSource::new(module_type, source_code, &resolved, None));
+        }
+
         self.ensure_wasm_allowed(&resolved)?;
         self.ensure_remote_load_allowed(&resolved)?;
 
         if resolved.scheme() == "file" && !self.within_sandbox(&resolved) {
             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
+        }
+
+        if resolved.scheme() == "http" || resolved.scheme() == "https" {
+            let ext = DynamicModuleLoader::module_ext(&resolved).unwrap_or_default();
+            let code = self.read_or_fetch_remote_source(&resolved).await?;
+            let module_type = DynamicModuleLoader::module_type_for_url(&resolved);
+            let final_code = self.maybe_transpile_ts_like(&resolved, &ext, code)?;
+            let final_module_type = Self::final_module_type_for_remote(&ext, module_type);
+
+            if Self::should_wrap_with_redirect(&requested_specifier) {
+                return Ok(ModuleSource::new_with_redirect(
+                    final_module_type,
+                    deno_core::ModuleSourceCode::String(final_code.into()),
+                    &requested_specifier,
+                    &resolved,
+                    None,
+                ));
+            }
+
+            return Ok(ModuleSource::new(
+                final_module_type,
+                deno_core::ModuleSourceCode::String(final_code.into()),
+                &resolved,
+                None,
+            ));
         }
 
         // Optional CJS interop path: synthesize an ESM facade that executes source with
@@ -2289,6 +2350,13 @@ impl ModuleLoader for DynamicModuleLoader {
             }
         }
 
+        // Preserve native handling for Node builtin modules even when using
+        // callback imports policy. Wrapping `node:*` in synthetic resolve URLs
+        // forces them down file-loader code paths.
+        if specifier.starts_with("node:") {
+            return Url::parse(specifier).map_err(|e| JsErrorBox::generic(e.to_string()));
+        }
+
         // Callback path: always route via synthetic resolve URL.
         if matches!(
             self.imports_policy,
@@ -2296,35 +2364,7 @@ impl ModuleLoader for DynamicModuleLoader {
         ) {
             return Ok(self.encode_resolve_url(specifier, referrer));
         }
-
-        // Node-style disk resolution (when enabled).
-        if let Some(u) = self.try_node_resolve_disk(specifier, referrer) {
-            return Ok(u);
-        }
-
-        // Optional Deno-style remote imports.
-        if self.jsr_resolve_enabled() {
-            if let Some(jsr_spec) = Self::map_jsr_specifier(specifier) {
-                return self.try_deno_resolve(&jsr_spec, referrer);
-            }
-        }
-
-        // Fast-fail unsupported bare specifiers so imports do not hang waiting
-        // on fallback resolvers when neither Node nor JSR resolution is enabled.
-        if Self::is_bare_specifier(specifier) && !self.node_disk_resolve_enabled() {
-            return Err(JsErrorBox::generic(format!(
-                "Bare import cannot be resolved without nodeJs.modules (or moduleLoader.jsrResolve): {specifier}"
-            )));
-        }
-
-        if (specifier.starts_with("http://") && self.http_resolve_enabled())
-            || (specifier.starts_with("https://") && self.https_resolve_enabled())
-        {
-            return self.try_deno_resolve(specifier, referrer);
-        }
-
-        // Deno resolver, but normalize virtual referrers into file://<cwd>/ for relative imports.
-        self.try_deno_resolve(specifier, referrer)
+        self.resolve_like_allow_disk(specifier, referrer)
     }
 
     // Loads load during module resolution, policy, and remote loading.
@@ -2851,7 +2891,7 @@ mod tests {
     fn resolve_allowed_disk_target_resolves_direct_remote_urls() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         let out = loader
-            .resolve_allowed_disk_target("https://example.com/mod.ts", "file:///tmp/main.ts")
+            .resolve_allow_disk_or_error("https://example.com/mod.ts", "file:///tmp/main.ts")
             .expect("resolved");
         assert_eq!(out.as_str(), "https://example.com/mod.ts");
     }
@@ -2861,7 +2901,7 @@ mod tests {
     fn resolve_rewritten_target_supports_absolute_url_and_trim() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         let out = loader
-            .resolve_rewritten_target("  https://example.com/rewrite.ts  ", "file:///tmp/main.ts")
+            .resolve_rewritten_or_error("  https://example.com/rewrite.ts  ", "file:///tmp/main.ts")
             .expect("resolved");
         assert_eq!(out.as_str(), "https://example.com/rewrite.ts");
     }
@@ -3039,10 +3079,7 @@ mod tests {
         let err = loader
             .resolve_allow_disk_or_error("@bad/bare", "file:///tmp/main.ts")
             .expect_err("unresolved");
-        assert!(
-            err.to_string()
-                .contains("Unable to resolve import: @bad/bare")
-        );
+        assert!(err.to_string().contains("@bad/bare"));
     }
 
     #[test]
@@ -3058,10 +3095,7 @@ mod tests {
         let err = loader
             .resolve_rewritten_or_error("@bad/rewrite", "file:///tmp/main.ts")
             .expect_err("unresolved");
-        assert!(
-            err.to_string()
-                .contains("Unable to resolve rewritten import: @bad/rewrite")
-        );
+        assert!(err.to_string().contains("@bad/rewrite"));
     }
 
     #[test]
