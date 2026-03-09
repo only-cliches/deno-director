@@ -180,6 +180,32 @@ describe("DenoWorker runtime events", () => {
     }
   });
 
+  test("attributes host* to originating caller and preserves immediate wrapper callsite", async () => {
+    const dw = createTestWorker();
+    const events: any[] = [];
+    dw.on("runtime", (e) => events.push(e));
+
+    const wrapper = async () => {
+      await dw.eval(`throw new Error("wrapper-boom")`);
+    };
+    const invokeThroughWrapper = async () => {
+      await wrapper();
+    };
+
+    try {
+      await expect(invokeThroughWrapper()).rejects.toBeTruthy();
+      const thrown = events.find((e) => e.kind === "error.thrown" && e.surface === "eval");
+      expect(thrown).toBeTruthy();
+      expect(typeof thrown.hostCallSite).toBe("string");
+      expect(typeof thrown.hostImmediateCallSite).toBe("string");
+      expect(String(thrown.hostCallSite)).toContain("runtime.events.spec.ts");
+      expect(String(thrown.hostImmediateCallSite)).toContain("runtime.events.spec.ts");
+      expect(String(thrown.hostCallSite)).not.toBe(String(thrown.hostImmediateCallSite));
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("emits module.eval begin/end and error.thrown for module eval errors", async () => {
     const dw = createTestWorker();
     const events: any[] = [];

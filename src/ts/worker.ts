@@ -1438,6 +1438,8 @@ export class DenoWorker {
             .map((s) => s.trim())
             .filter(Boolean);
 
+        const candidates: Array<{ file: string; line: number; column: number }> = [];
+
         for (const line of lines) {
             let loc = "";
             const paren = line.match(/\((.*)\)\s*$/);
@@ -1478,15 +1480,26 @@ export class DenoWorker {
                 continue;
             }
 
-            return {
-                hostFile: filePart,
-                hostLine,
-                hostColumn,
-                hostCallSite: `${filePart}:${hostLine}:${hostColumn}`,
-            };
+            candidates.push({ file: filePart, line: hostLine, column: hostColumn });
         }
 
-        return {};
+        if (candidates.length === 0) return {};
+
+        const immediate = candidates[0];
+        const origin = candidates[candidates.length - 1];
+        const out: Partial<DenoWorkerRuntimeEvent> = {
+            // `host*` points at the originating host frame for the eval/module/handle op.
+            hostFile: origin.file,
+            hostLine: origin.line,
+            hostColumn: origin.column,
+            hostCallSite: `${origin.file}:${origin.line}:${origin.column}`,
+            // Keep nearest caller metadata for debugging wrapper chains.
+            hostImmediateFile: immediate.file,
+            hostImmediateLine: immediate.line,
+            hostImmediateColumn: immediate.column,
+            hostImmediateCallSite: `${immediate.file}:${immediate.line}:${immediate.column}`,
+        };
+        return out;
     }
 
     /** Stores host callsite metadata for an operation id and returns inline metadata for begin events. */
