@@ -1,10 +1,31 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
 ## TODO:
 - add worker.module.query api to get a list of loaded modules in memory
 
-All notable changes to this project will be documented in this file.
-## [0.9.30] Future
+
+## [0.9.40] Future
+
+### Fixed
+- Expanded Node-style subpath resolution under `nodeJs`:
+  - bare package subpaths now consult `package.json.exports` before falling back to filesystem paths.
+  - exact export keys and simple `*` pattern mappings are supported for subpath imports.
+- Hardened CommonJS interop for legacy packages:
+  - parse failures that do not look like ESM now fall back to CJS wrapping instead of surfacing parser strictness as a load error.
+  - reserved export names are now emitted through alias bindings, avoiding invalid ESM export syntax.
+- Relaxed sandbox false positives for `node_modules`-backed imports:
+  - lexical paths under the worker `cwd` are now accepted even when canonical paths resolve through symlinks or hoists.
+
+### Tests
+- Added node-compat coverage for `package.json.exports` subpath resolution.
+- Added regression coverage for symlinked `node_modules` paths staying inside the sandbox.
+- Added regression coverage for CJS parse-failure fallback and reserved export name handling.
+
+
+
+## [0.9.30] Mar 10, 2026
 
 ### Fixed
 - Hardened unsafe stream memory configuration with security guardrails:

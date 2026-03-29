@@ -74,6 +74,7 @@ pub async fn handle_deno_msg(
     match msg {
         DenoMsg::Close { deferred } => handle_close_msg(worker_id, deferred),
         DenoMsg::Memory { deferred } => handle_memory_msg(worker, worker_id, deferred).await,
+        DenoMsg::Gc { deferred } => handle_gc_msg(worker, deferred),
         DenoMsg::PostMessage { value } => handle_post_message_msg(worker, value),
         DenoMsg::PostMessageTyped {
             message_type,
@@ -296,6 +297,20 @@ async fn handle_memory_msg(
         deferred.reject_with_error("Node thread is unavailable");
     }
 
+    false
+}
+
+// Handle gc msg.
+fn handle_gc_msg(
+    worker: &mut MainWorker,
+    deferred: crate::bridge::promise::PromiseSettler,
+) -> bool {
+    {
+        let isolate = worker.js_runtime.v8_isolate();
+        isolate.low_memory_notification();
+    }
+
+    deferred.resolve_with_value_via_channel(JsValueBridge::Undefined);
     false
 }
 

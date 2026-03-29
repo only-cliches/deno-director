@@ -163,6 +163,7 @@ function normalizeModuleLoaderOption(x: unknown): unknown {
     if (typeof o.httpsResolve === "boolean") out.httpsResolve = o.httpsResolve;
     if (typeof o.httpResolve === "boolean") out.httpResolve = o.httpResolve;
     if (typeof o.jsrResolve === "boolean") out.jsrResolve = o.jsrResolve;
+    if (typeof o.allowOutsideCwd === "boolean") out.allowOutsideCwd = o.allowOutsideCwd;
     if (typeof o.reload === "boolean") out.reload = o.reload;
     const maxPayloadBytes = finiteInt(o.maxPayloadBytes, Number.NEGATIVE_INFINITY);
     if (maxPayloadBytes !== undefined) out.maxPayloadBytes = maxPayloadBytes;

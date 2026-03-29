@@ -43,6 +43,7 @@
   "author": "me@scottlott.com",
   "license": "MIT",
   "dependencies": {
+    "cardinal": "^2.1.1",
     "cargo-cp-artifact": "^0.1.9",
     "quickjs-vm": "^0.3.0"
   },

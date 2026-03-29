@@ -139,6 +139,74 @@ describe("DenoWorker nodeJs modules/runtime interop", () => {
     }
   });
 
+  it("nodeJs:true resolves package exports subpaths", async () => {
+    await writeFile(
+      path.join(dir, "node_modules", "pkg_exports", "package.json"),
+      JSON.stringify(
+        {
+          name: "pkg_exports",
+          version: "1.0.0",
+          exports: {
+            "./feature": "./dist/feature.js",
+          },
+        },
+        null,
+        2
+      )
+    );
+    await writeFile(
+      path.join(dir, "node_modules", "pkg_exports", "dist", "feature.js"),
+      `export const feature = "exported-subpath";\n`
+    );
+
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: true,
+    });
+
+    try {
+      const code = `
+        import { feature } from "pkg_exports/feature";
+        export const out = feature;
+      `;
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ out: "exported-subpath" });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
+  it("nodeJs:true transpiles TypeScript package entries from node_modules", async () => {
+    await writeFile(
+      path.join(dir, "node_modules", "pkg_ts_types", "package.json"),
+      JSON.stringify({ name: "pkg_ts_types", version: "1.0.0", main: "index.ts" }, null, 2)
+    );
+    await writeFile(
+      path.join(dir, "node_modules", "pkg_ts_types", "types.ts"),
+      `export type Thing = { value: number };\n`
+    );
+    await writeFile(
+      path.join(dir, "node_modules", "pkg_ts_types", "index.ts"),
+      `import type { Thing } from "./types.ts";\nexport const out: Thing = { value: 321 };\n`
+    );
+
+    const dw = createTestWorker({
+      cwd: dir,
+      imports: true,
+      nodeJs: true,
+    });
+
+    try {
+      const code = `
+        import { out } from "pkg_ts_types";
+        export const value = out.value;
+      `;
+      await expect(dw.module.eval(code)).resolves.toMatchObject({ value: 321 });
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
   it("resolves relative specifier from cwd when nodeResolve enabled", async () => {
     const dw = createTestWorker({
       cwd: dir,

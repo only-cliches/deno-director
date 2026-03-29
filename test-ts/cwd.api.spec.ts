@@ -50,6 +50,16 @@ describe("deno_worker: cwd api", () => {
     }
   });
 
+  test("omitted cwd defaults to host process cwd when nodeJs.modules is enabled", async () => {
+    const dw = createTestWorker({ imports: true, nodeJs: { modules: true } });
+    try {
+      const got = await dw.cwd.get();
+      expect(path.resolve(got)).toBe(path.resolve(process.cwd()));
+    } finally {
+      if (!dw.isClosed()) await dw.close();
+    }
+  });
+
   test("cwd.set updates cwd and restarts runtime for new module base", async () => {
     const dw = createTestWorker({ cwd: dirA, imports: true });
     try {

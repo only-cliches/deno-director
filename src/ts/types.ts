@@ -269,6 +269,7 @@ export type DenoWorkerEnvOption = undefined | boolean | string | Record<string, 
  * `httpsResolve`: allow `https://` module specifiers.
  * `httpResolve`: allow `http://` module specifiers (warned at startup).
  * `jsrResolve`: resolve `jsr:` and `@std/*` via `https://jsr.io/...`.
+ * `allowOutsideCwd`: allow file-based imports that resolve outside the worker cwd sandbox.
  * `tsCompiler`: optional TS/JSX transpile settings.
  */
 export type DenoWorkerModuleLoaderOption =
@@ -280,6 +281,8 @@ export type DenoWorkerModuleLoaderOption =
             httpResolve?: boolean;
             /** Enable `jsr:` / `@std/*` resolution through jsr.io HTTPS URLs. */
             jsrResolve?: boolean;
+            /** Allow local file imports to resolve outside the worker cwd sandbox. */
+            allowOutsideCwd?: boolean;
             /** Directory used to cache remotely loaded modules. */
             cacheDir?: string;
             /** Bypass remote cache and always re-fetch. */
@@ -585,7 +588,10 @@ export type DenoWorkerOptions = {
     /**
      * Runtime working directory used for relative path resolution.
      *
-     * - When omitted, worker uses a unique internal sandbox cwd (`<tmp>/deno-director/sandbox/w-<id>`).
+     * - When omitted:
+     *   - if `nodeJs` module resolution is enabled (`nodeJs: true` or `nodeJs.modules: true`),
+     *     worker defaults to host `process.cwd()`.
+     *   - otherwise, worker uses a unique internal sandbox cwd (`<tmp>/deno-director/sandbox/w-<id>`).
      * - When provided, path must exist and be a directory.
      * - Relative paths are resolved from host process cwd.
      */
@@ -676,7 +682,8 @@ export type DenoWorkerOptions = {
     /**
      * Extended module loading behavior.
      *
-     * Use for remote imports and remote source cache tuning.
+     * Use for remote imports, remote source cache tuning, and optional file-import
+     * sandbox relaxation.
      */
     moduleLoader?: DenoWorkerModuleLoaderOption;
     /**
@@ -1386,6 +1393,9 @@ export type NativeWorker = {
     evalModule?: <T = any>(src: string, options?: EvalOptions) => Promise<T>;
     registerModule?: (moduleName: string, source: string, options?: Pick<EvalOptions, "srcLoader">) => Promise<void>;
     clearModule?: (moduleName: string) => Promise<boolean>;
+
+    /** Ask V8 to perform a best-effort garbage collection cycle. */
+    gc(): Promise<void>;
 
     /** Last recorded execution stats snapshot. */
     lastExecutionStats: ExecStats;

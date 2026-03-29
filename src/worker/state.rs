@@ -104,6 +104,7 @@ pub struct ModuleLoaderConfig {
     pub node_resolve: bool,
     pub cjs_interop: CjsInteropMode,
     pub jsr_resolve: bool,
+    pub allow_outside_cwd: bool,
     pub transpile_ts: bool,
     pub ts_compiler: Option<TsCompilerConfig>,
     pub cache_dir: Option<String>,
@@ -121,6 +122,7 @@ impl Default for ModuleLoaderConfig {
             node_resolve: false,
             cjs_interop: CjsInteropMode::Disabled,
             jsr_resolve: false,
+            allow_outside_cwd: false,
             transpile_ts: true,
             ts_compiler: None,
             cache_dir: None,
@@ -833,6 +835,7 @@ impl WorkerCreateOptions {
         //   httpsResolve?: boolean;
         //   httpResolve?: boolean;
         //   jsrResolve?: boolean;
+        //   allowOutsideCwd?: boolean;
         //   cacheDir?: string;
         //   reload?: boolean;
         //   maxPayloadBytes?: number;
@@ -856,6 +859,12 @@ impl WorkerCreateOptions {
                 if let Ok(jv) = o.get::<JsValue, _, _>(cx, "jsrResolve") {
                     if let Ok(jb) = jv.downcast::<JsBoolean, _>(cx) {
                         cfg.jsr_resolve = jb.value(cx);
+                    }
+                }
+
+                if let Ok(av) = o.get::<JsValue, _, _>(cx, "allowOutsideCwd") {
+                    if let Ok(ab) = av.downcast::<JsBoolean, _>(cx) {
+                        cfg.allow_outside_cwd = ab.value(cx);
                     }
                 }
 

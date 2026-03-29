@@ -116,4 +116,8 @@ describe("DenoWorker stats.memory()", () => {
     expect(afterUsed).toBeGreaterThanOrEqual(beforeUsed);
   });
 
+  test("gc() resolves", async () => {
+    await expect(dw.gc()).resolves.toBeUndefined();
+  });
+
 });

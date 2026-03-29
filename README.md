@@ -12,1194 +12,419 @@
 
 </div>
 
-`deno-director` is a native Rust/Neon bridge for teams that want Deno's sandboxing and module model without giving up a Node host. It gives you one process, explicit runtime policy, and a bridge that supports real application code rather than toy examples.
+**Securely orchestrate, sandbox, and bridge Deno runtimes directly within Node.js.**
 
-The package is built around three main exports:
+Deno Director is a high-performance orchestration layer that allows you to spawn, manage, and communicate with embedded Deno V8 isolates from your Node.js applications. Whether you are building a multi-tenant edge compute platform, a plugin system, or just need to execute untrusted third-party code securely, Deno Director provides a seamless, type-safe, and highly tunable bridge between runtimes.
 
-- `DenoWorker` for a single isolated runtime
-- `DenoWorkerTemplate` for reusable worker startup configuration
-- `DenoDirector` for managing pools of runtimes
+---
 
-It also exports the full public TypeScript surface from [`src/ts/types.ts`](/home/slott/Developer/deno-director/src/ts/types.ts).
+## 🚀 Why Deno Director?
 
-## Quick Start
+* **Ironclad Sandboxing:** Execute untrusted code with confidence. Control exactly what the runtime can access with fine-grained limits on memory, CPU time, file system (`read`/`write`), and network (`net`).
+* **Zero-Config TypeScript & JSX:** Evaluate `.ts`, `.tsx`, and `.jsx` seamlessly. Deno Director handles the AST parsing, transpilation, and caching automatically.
+* **High-Fidelity Bridging:** Stop fighting with `JSON.stringify`. Naturally pass complex JavaScript types across the runtime boundary, including `Map`, `Set`, `Date`, `RegExp`, `Error`, `ArrayBuffer`, and `Uint8Array`.
+* **Blazing Fast Streams:** Built-in support for bi-directional, flow-controlled binary streaming between Node and Deno using native Node `Duplex` streams.
+* **Node.js & CJS Interop:** Enable `nodeJs` compatibility to let your sandboxed code resolve `node_modules` and execute CommonJS code inside an ESM facade.
+* **Live Telemetry & Observability:** Built-in APIs to monitor CPU usage, event loop lag, operation latency, and V8 heap statistics per worker.
+* **Dynamic Import Control:** Intercept and rewrite dynamic imports on the fly using custom `imports` callback policies.
 
-Install:
+---
+
+## 📦 Installation
 
 ```bash
 npm install deno-director
 ```
 
-Start with `eval` when you want to run code directly inside an embedded runtime:
+---
 
-```ts
+## ⚡ Quick Start
+
+Create a director, spin up a secure worker, and execute some TypeScript in milliseconds.
+
+```typescript
 import { DenoWorker } from "deno-director";
 
+// 1. Initialize a worker
 const worker = new DenoWorker({
-  permissions: {
-    net: false,
-    read: false,
-    write: false,
-    env: false,
-  },
+    permissions: { 
+        net: ["api.github.com"], // Only allow requests to GitHub
+        read: false,             // Block file system reads
+        write: false             // Block file system writes
+    },
+    limits: { 
+        maxEvalMs: 500,          // Timeout execution after 500ms
+        maxMemoryBytes: 64 * 1024 * 1024 // Cap memory at 64MB
+    }
 });
 
-const value = await worker.eval<number>("40 + 2");
-console.log(value); // 42
+// 3. Evaluate TypeScript directly
+const result = await worker.eval(`
+    const fetchRepo = async (user: string): Promise<string> => {
+        return \`Fetching data for \${user}...\`;
+    };
+    fetchRepo("denoland");
+`, { srcLoader: "ts" });
 
-await worker.close();
+console.log(result); // "Fetching data for denoland..."
+
+// 4. Clean up
+await director.close();
 ```
 
-Use `module.eval` when you want ES module semantics and callable exports:
+---
 
-```ts
-import { DenoWorker } from "deno-director";
+## 🧠 Core Concepts
 
-const worker = new DenoWorker({
-  permissions: { net: false, read: false },
+### 1. The Director (`DenoDirector`)
+The central orchestrator. It manages the lifecycle of multiple runtimes, assigns unique IDs, and allows you to query active workers via custom labels and tags. 
+
+### 2. The Worker (`DenoWorker`)
+A single, isolated Deno V8 instance. It exposes APIs for evaluation (`eval`, `evalSync`, `module.eval`), messaging (`postMessage`), streaming, and environment variable injection.
+
+### 3. Templates (`DenoWorkerTemplate`)
+If you need to spin up dozens of identical isolates, create a template. Templates define baseline configurations, globals, and bootstrap scripts that are automatically applied to every worker spawned from them.
+
+---
+
+## 🛡️ Dynamic Import Control
+
+When running third-party or untrusted code, you often need strict control over what dependencies that code can pull in. The `imports` property on the worker configuration object allows you to define exactly how module resolution behaves inside the sandbox.
+
+It accepts three types of values: a **boolean** (`true` or `false`) or a highly flexible **callback function**.
+
+### 1. The Simple Switch (Boolean)
+
+If you want to outright ban or permit all module loading, you can use a simple boolean:
+
+* **`imports: false`** (Default): Completely disables all imports (`import ...` or `await import(...)`). Any attempt to load a module will immediately throw an error.
+* **`imports: true`**: Allows standard disk and remote module resolution, governed by your `permissions` (like `net` and `read`).
+
+### 2. The Callback (Dynamic Interception)
+
+Passing a callback function to `imports` unlocks the ability to intercept, rewrite, or mock *every single import* requested by the Deno runtime, right from your Node.js host. 
+
+The callback receives the requested `specifier`, the `referrer` (the file asking for the import), and a boolean flag indicating if it was a dynamic `import()`.
+
+You can return (or resolve a Promise to) several different shapes depending on what you want to do:
+
+#### A. Blocking Specific Domains
+Return `true` to allow the import or `false` to block it.
+
+```typescript
+const worker = await director.start({
+    imports: (specifier, referrer, isDynamic) => {
+        // Block any imports from untrusted-cdn.com
+        if (specifier.startsWith("https://untrusted-cdn.com")) {
+            console.warn(`Blocked import from ${referrer}`);
+            return false; 
+        }
+        return true; // Let Deno handle the rest normally
+    }
+});
+```
+
+#### B. Rewriting/Redirecting Imports
+You can seamlessly swap out dependencies on the fly by returning `{ resolve: string }`. This is incredibly useful for mapping bare specifiers to specific URLs or injecting secure versions of libraries.
+
+```typescript
+const worker = await director.start({
+    imports: (specifier) => {
+        // Transparently reroute 'lodash' to a specific ESM CDN URL
+        if (specifier === "lodash") {
+            return { resolve: "https://esm.sh/lodash@4.17.21" };
+        }
+        return true;
+    }
+});
+```
+
+#### C. Injecting Virtual Modules
+You don't even need the file to exist on disk or the web. You can return raw source code directly from Node.js into the Deno isolate using the `{ src: string, srcLoader?: string }` shape (or just a raw string, which defaults to `"js"`).
+
+```typescript
+const worker = await director.start({
+    imports: async (specifier) => {
+        // Provide a synthetic config module on demand
+        if (specifier === "app://config.ts") {
+            // Fetch live config from a Node.js database
+            const dbConfig = await fetchTenantConfigFromMongo();
+            
+            return {
+                src: `export const config = ${JSON.stringify(dbConfig)};`,
+                srcLoader: "ts" // Tell Deno Director to transpile this as TypeScript
+            };
+        }
+        return true;
+    }
 });
 
-const math = await worker.module.eval(`
-  export function add(a, b) {
-    return a + b;
-  }
+// Inside Deno:
+await worker.eval(`
+    import { config } from "app://config.ts";
+    console.log("Loaded dynamic config:", config);
+`);
+```
+
+#### Why this is a Game-Changer
+
+By combining the imports callback with sourceLoaders, you can create a completely synthetic, database-backed file system for your Deno isolates. You can serve code dynamically based on the current user, enforce strict dependency pinning, or inject host-provided mocks without writing a single file to disk.
+
+
+## High-Performance Binary Streams
+Need to pipe large amounts of data between Node and Deno? Deno Director creates native Node `Duplex` streams backed by shared memory or high-speed IPC, complete with backpressure and credit-based flow control.
+
+```typescript
+// Node.js side
+const duplexStream = await worker.stream.connect("my-data-lane");
+fs.createReadStream("large-video.mp4").pipe(duplexStream);
+
+// Deno side (inside the worker)
+await worker.eval(`
+    const reader = await hostStreams.accept("my-data-lane");
+    for await (const chunk of reader) {
+        // Process Uint8Array chunk
+    }
+`);
+```
+
+## Runtime Handles (Pointers)
+Keep state inside the Deno isolate and manipulate it from Node without copying large objects back and forth. Handles act as remote pointers to V8 objects.
+
+```typescript
+// Create a complex object in Deno and get a handle to it
+const myHandle = await worker.handle.eval(`
+    new Map([["status", "active"], ["retries", 0]])
 `);
 
-console.log(await math.add(2, 3)); // 5
+// Manipulate the Deno object directly from Node
+await myHandle.call("set", ["retries", 1]);
+const status = await myHandle.get("status"); 
 
-await worker.close();
+// Cleanup memory to avoid leaks in the isolate
+await myHandle.dispose();
 ```
 
-The rest of this README documents the complete package API in detail.
-
-## Table of Contents
-
-- [Installation](#installation)
-- [Package Exports](#package-exports)
-- [DenoWorkerTemplate](#denoworkertemplate)
-- [DenoDirector](#denodirector)
-- [Configuration and Type Reference](#configuration-and-type-reference)
-- [DenoWorker](#denoworker)
-- [DenoWorker Events](#denoworker-events)
-- [DenoWorker Sub-APIs](#denoworker-sub-apis)
-- [Examples](#examples)
-- [Development](#development)
-
-## Installation
-
-```bash
-npm install deno-director
-```
-
-Notes:
-
-- This package contains a native addon built with Rust/Neon.
-- The repo `install` script runs `cargo build`.
-- If you are building from source, you need a working Rust toolchain.
-
-## Package Exports
-
-Top-level exports from the package:
-
-```ts
-export * from "./ts";
-export { default } from "./ts";
-```
-
-And from [`src/ts/index.ts`](/home/slott/Developer/deno-director/src/ts/index.ts):
-
-```ts
-export * from "./types";
-export { DenoWorker } from "./worker";
-export { DenoWorkerTemplate } from "./template";
-export { DenoDirector } from "./director";
-export { DenoWorker as default } from "./worker";
-```
-
-In practice, most users work with:
-
-- `DenoWorker`
-- `DenoWorkerTemplate`
-- `DenoDirector`
-- `DenoWorkerOptions`
-- `EvalOptions`
-- `DenoWorkerModuleEvalOptions`
-- `DenoWorkerHandle*` types
-- `DenoWorkerStats*` types
-
-## DenoWorkerTemplate
-
-`DenoWorkerTemplate` is a reusable factory for workers that share common startup configuration.
-
-Source: [`src/ts/template.ts`](/home/slott/Developer/deno-director/src/ts/template.ts)
-
-### Constructor
-
-```ts
-new DenoWorkerTemplate(options?: DenoWorkerTemplateOptions)
-```
-
-### Methods
-
-#### `create`
-
-```ts
-create(createOptions?: DenoWorkerTemplateCreateOptions): Promise<DenoWorker>
-```
-
-Merge behavior:
-
-- `workerOptions`: create options override template options
-- `globals`: shallow merge, create options override by key
-- `bootstrapScripts`: concatenated template-first, then per-create
-- `bootstrapModules`: concatenated template-first, then per-create
-- `setup`: template hook runs before per-create hook
-
-If setup fails, the worker is closed before the error is re-thrown.
-
-### Template Types
-
-```ts
-type DenoWorkerTemplateOptions = {
-  workerOptions?: DenoWorkerOptions;
-  globals?: Record<string, any>;
-  bootstrapScripts?: string | string[];
-  bootstrapModules?: string | string[];
-  setup?: (worker: DenoWorker) => void | Promise<void>;
-};
-```
-
-```ts
-type DenoWorkerTemplateCreateOptions = {
-  workerOptions?: DenoWorkerOptions;
-  globals?: Record<string, any>;
-  bootstrapScripts?: string | string[];
-  bootstrapModules?: string | string[];
-  setup?: (worker: DenoWorker) => void | Promise<void>;
-};
-```
-
-## DenoDirector
-
-`DenoDirector` is the orchestration layer built on top of `DenoWorkerTemplate`.
-
-Source: [`src/ts/director.ts`](/home/slott/Developer/deno-director/src/ts/director.ts)
-
-Responsibilities:
-
-- create managed runtimes
-- assign unique ids
-- maintain label indexes
-- query runtimes by id, label, and tag
-- stop individual runtimes or whole groups
-
-### Constructor
-
-```ts
-new DenoDirector(options?: DenoDirectorOptions)
-```
-
-```ts
-type DenoDirectorOptions = {
-  template?: DenoWorkerTemplateOptions;
-};
-```
-
-### Methods
-
-#### `start`
-
-```ts
-start(options?: DenoDirectorStartOptions): Promise<DenoDirectedRuntime>
-```
-
-Starts a managed runtime and attaches immutable `runtime.meta`.
-
-#### `get`
-
-```ts
-get(id: string): DenoDirectedRuntime | undefined
-```
-
-#### `getByLabel`
-
-```ts
-getByLabel(label: string): DenoDirectedRuntime[]
-```
-
-#### `list`
-
-```ts
-list(filter?: DenoDirectorListOptions): DenoDirectedRuntime[]
-```
-
-Filters are AND-combined when both `label` and `tag` are present.
-
-#### `setLabel`
-
-```ts
-setLabel(runtimeOrId: DenoDirectedRuntime | string, label?: string): boolean
-```
-
-#### `setTags`
-
-```ts
-setTags(runtimeOrId: DenoDirectedRuntime | string, tags: string[]): boolean
-```
-
-#### `addTag`
-
-```ts
-addTag(runtimeOrId: DenoDirectedRuntime | string, tag: string): boolean
-```
-
-#### `removeTag`
-
-```ts
-removeTag(runtimeOrId: DenoDirectedRuntime | string, tag: string): boolean
-```
-
-#### `stop`
-
-```ts
-stop(runtimeOrId: DenoDirectedRuntime | string): Promise<boolean>
-```
-
-#### `stopByLabel`
-
-```ts
-stopByLabel(label: string): Promise<number>
-```
-
-#### `stopAll`
-
-```ts
-stopAll(): Promise<void>
-```
-
-### Director Metadata Types
-
-```ts
-type DenoRuntimeMeta = {
-  id: string;
-  label?: string;
-  tags: string[];
-  createdAt: number;
-};
-```
-
-```ts
-type DenoDirectedRuntime = DenoWorker & {
-  readonly meta: DenoRuntimeMeta;
-};
-```
-
-```ts
-type DenoRuntimeRecord = {
-  meta: DenoRuntimeMeta;
-  runtime: DenoDirectedRuntime;
-};
-```
-
-```ts
-type DenoDirectorStartOptions = DenoWorkerTemplateCreateOptions & {
-  id?: string;
-  label?: string;
-  tags?: string[];
-};
-```
-
-```ts
-type DenoDirectorListOptions = {
-  label?: string;
-  tag?: string;
-};
-```
-
-## Configuration and Type Reference
-
-### `DenoWorkerOptions`
-
-The main worker configuration type.
-
-```ts
-type DenoWorkerOptions = {
-  limits?: DenoWorkerLimits;
-  bridge?: DenoWorkerBridgeOption;
-  imports?: boolean | ImportsCallback;
-  cwd?: string;
-  startup?: string;
-  permissions?: DenoPermissionsConfig;
-  nodeJs?: DenoWorkerNodeJsOption;
-  console?: DenoWorkerConsoleOption;
-  env?: DenoWorkerEnvOption;
-  envFile?: boolean | string;
-  inspect?: DenoWorkerInspectOption;
-  sourceLoaders?: DenoWorkerLoadersDisabled | DenoWorkerLoadersOption;
-  tsCompiler?: DenoWorkerTsCompilerOption;
-  moduleLoader?: DenoWorkerModuleLoaderOption;
-  globals?: Record<string, any>;
-  modules?: Record<string, DenoWorkerStartupModuleSource> | Map<string, DenoWorkerStartupModuleSource>;
-  lifecycle?: DenoWorkerLifecycleHooks;
-};
-```
-
-### Eval and Loader Types
-
-```ts
-type EvalOptions = {
-  filename?: string;
-  type?: "script" | "module";
-  srcLoader?: string;
-  args?: any[];
-  maxEvalMs?: number;
-  maxCpuMs?: number;
-};
-```
-
-```ts
-type DenoSourceLoader = "js" | "ts" | "tsx" | "jsx";
-```
-
-```ts
-type ImportsCallbackSource = {
-  src: string;
-  srcLoader?: string;
-};
-```
-
-```ts
-type ImportsCallbackResult =
-  | boolean
-  | string
-  | ImportsCallbackSource
-  | { resolve: string };
-```
-
-```ts
-type ImportsCallback = (
-  specifier: string,
-  referrer?: string,
-  isDynamicImport?: boolean,
-) => ImportsCallbackResult | Promise<ImportsCallbackResult>;
-```
-
-```ts
-type DenoLoaderTransformContext = {
-  src: string;
-  srcLoader: string;
-  kind: "eval" | "module-eval" | "import";
-  specifier?: string;
-  referrer?: string;
-  isDynamicImport?: boolean;
-};
-```
-
-```ts
-type DenoLoaderTransformResult =
-  | string
-  | void
-  | { src: string; srcLoader?: string };
-```
-
-```ts
-type DenoLoaderTransform = (
-  ctx: DenoLoaderTransformContext,
-) => DenoLoaderTransformResult | Promise<DenoLoaderTransformResult>;
-```
-
-```ts
-type DenoWorkerLoadersOption = DenoLoaderTransform[];
-type DenoWorkerLoadersDisabled = false;
-```
-
-### Permissions
-
-```ts
-type DenoPermissionValue = boolean | string[];
-```
-
-```ts
-type DenoPermissions = {
-  read?: DenoPermissionValue;
-  write?: DenoPermissionValue;
-  net?: DenoPermissionValue;
-  env?: DenoPermissionValue;
-  run?: DenoPermissionValue;
-  ffi?: DenoPermissionValue;
-  sys?: DenoPermissionValue;
-  import?: DenoPermissionValue;
-  hrtime?: boolean;
-  wasm?: boolean;
-};
-```
-
-```ts
-type DenoPermissionsConfig = DenoPermissions | boolean;
-```
-
-### Console, Inspect, Env
-
-```ts
-type DenoConsoleMethod = "log" | "info" | "warn" | "error" | "debug" | "trace";
-```
-
-```ts
-type DenoConsoleHandler =
-  | false
-  | undefined
-  | ((...args: any[]) => any)
-  | Promise<((...args: any[]) => any)>;
-```
-
-```ts
-type DenoWorkerConsoleOption =
-  | undefined
-  | false
-  | Console
-  | Partial<Record<DenoConsoleMethod, DenoConsoleHandler>>;
-```
-
-```ts
-type DenoWorkerInspectOption =
-  | undefined
-  | boolean
-  | {
-      host?: string;
-      port?: number;
-      break?: boolean;
-    };
-```
-
-```ts
-type DenoWorkerEnvOption =
-  | undefined
-  | boolean
-  | string
-  | Record<string, string>;
-```
-
-### Module Loading and Node Compatibility
-
-```ts
-type DenoWorkerModuleLoaderOption =
-  | undefined
-  | {
-      httpsResolve?: boolean;
-      httpResolve?: boolean;
-      jsrResolve?: boolean;
-      cacheDir?: string;
-      reload?: boolean;
-      maxPayloadBytes?: number;
-    };
-```
-
-```ts
-type DenoWorkerNodeJsOption =
-  | undefined
-  | boolean
-  | {
-      modules?: boolean;
-      runtime?: boolean;
-      cjsInterop?: boolean;
-      cjsForcePaths?: Array<string | RegExp>;
-    };
-```
-
-```ts
-type DenoWorkerTsCompilerOption =
-  | undefined
-  | {
-      jsx?: "react" | "react-jsx" | "react-jsxdev" | "preserve";
-      jsxFactory?: string;
-      jsxFragmentFactory?: string;
-      cacheDir?: string;
-    };
-```
-
-```ts
-type DenoWorkerStartupModuleSource =
-  | string
-  | {
-      src: string;
-      srcLoader?: string;
-    };
-```
-
-### Bridge Tuning and Limits
-
-```ts
-type DenoWorkerBridgeOption =
-  | undefined
-  | {
-      channelSize?: number;
-      streamWindowBytes?: number;
-      streamCreditFlushBytes?: number;
-      streamBacklogLimit?: number;
-      streamHighWaterMarkBytes?: number;
-      enableUnsafeStreamMemory?: boolean;
-    };
-```
-
-```ts
-type DenoWorkerLimits = {
-  maxHandle?: number;
-  maxEvalMs?: number;
-  maxCpuMs?: number;
-  maxMemoryBytes?: number;
-};
-```
-
-### Lifecycle Types
-
-```ts
-type DenoWorkerLifecyclePhase =
-  | "beforeStart"
-  | "afterStart"
-  | "beforeStop"
-  | "afterStop"
-  | "onCrash";
-```
-
-```ts
-type DenoWorkerLifecycleContext = {
-  phase: DenoWorkerLifecyclePhase;
-  worker?: DenoWorker;
-  options?: DenoWorkerOptions;
-  reason?: unknown;
-  requested?: boolean;
-};
-```
-
-```ts
-type DenoWorkerLifecycleHooks = Partial<
-  Record<DenoWorkerLifecyclePhase, (ctx: DenoWorkerLifecycleContext) => void>
->;
-```
-
-```ts
-type DenoWorkerLifecycleHandler = (ctx: DenoWorkerLifecycleContext) => void;
-```
-
-### Advanced/Internal Export
-
-The package also exports `NativeWorker` for typing convenience. It represents the internal addon surface used by the TypeScript wrapper.
-
-Unless you are extending the wrapper internals, you should not depend on it directly.
-
-## DenoWorker
-
-`DenoWorker` is the primary runtime abstraction. Each instance owns one isolated embedded Deno runtime.
-
-Source: [`src/ts/worker.ts`](/home/slott/Developer/deno-director/src/ts/worker.ts)
-
-### Constructor
-
-```ts
-new DenoWorker(options?: DenoWorkerOptions)
-```
-
-The constructor:
-
-- normalizes worker options
-- creates the native runtime
-- binds message/lifecycle/runtime event handlers
-- applies startup globals and startup modules
-- runs lifecycle hooks
-
-### Core Methods
-
-#### `eval`
-
-```ts
-eval<T = any>(src: string, options?: EvalOptions): Promise<T>
-```
-
-Evaluate script source asynchronously inside the runtime.
-
-Behavior:
-
-- supports `options.args`
-- supports source loaders via `options.srcLoader`
-- waits for promise results
-- emits runtime events such as `eval.begin` and `eval.end`
-
-Example:
-
-```ts
-const out = await worker.eval<number>("(a, b) => a + b", {
-  args: [20, 22],
+## Node.js & CommonJS Interop
+Legacy code doesn't have to be a blocker. Deno Director can synthesize ESM facades for CommonJS code and allow module resolution of local `node_modules`.
+
+```typescript
+const worker = await director.start({
+    nodeJs: { 
+        modules: true,     // use NodeJS style module resultion for ESM imports.
+        cjsInterop: true,  // enable CJS modules
+        runtime: true      // enable Node runtime behavior
+    },
+    // a shorthand if you want all nodeJS compat to be enabled
+    nodeJs: true
 });
 ```
 
-#### `evalSync`
+### Real-Time Telemetry & Observability
+Monitor the health of your isolates to detect rogue code before it crashes your host process.
 
-```ts
-evalSync<T = any>(src: string, options?: EvalOptions): T
+```typescript
+// Measure CPU usage over the last 1000ms
+const cpuStats = await worker.stats.cpu({ measureMs: 1000 });
+console.log(`CPU Usage: ${cpuStats.usagePercentage}%`);
+
+// Check V8 Heap statistics
+const memory = await worker.stats.memory();
+console.log(`Heap Used: ${memory.heapStatistics.usedHeapSize} bytes`);
+
+// Measure Event Loop Lag
+const lag = await worker.stats.eventLoopLag({ measureMs: 100 });
+console.log(`Event Loop Lag: ${lag.lagMs}ms`);
 ```
 
-Synchronously evaluate source in the runtime.
-
-Notes:
-
-- blocks the Node thread while waiting
-- cannot run while constructor globals are still initializing
-- cannot use async source-loader callbacks
-
-#### `postMessage`
-
-```ts
-postMessage(msg: any): void
-```
-
-Send a message into the runtime event channel. Inside the runtime this is delivered to `globalThis.onmessage`.
-
-Throws if the runtime is closed.
-
-#### `close`
-
-```ts
-close(options?: DenoWorkerCloseOptions): Promise<void>
-```
-
-Gracefully close the runtime.
-
-`DenoWorkerCloseOptions`:
-
-```ts
-type DenoWorkerCloseOptions = {
-  force?: boolean;
-};
-```
-
-Behavior:
-
-- normal close waits for runtime shutdown
-- `force: true` rejects in-flight wrapper operations and performs best-effort immediate teardown
-
-#### `restart`
-
-```ts
-restart(options?: DenoWorkerRestartOptions): Promise<void>
-```
-
-Restart the runtime in place using the original creation options.
-
-`DenoWorkerRestartOptions`:
-
-```ts
-type DenoWorkerRestartOptions = {
-  force?: boolean;
-};
-```
-
-Existing wrapper listeners stay attached across restart.
-
-#### `isClosed`
-
-```ts
-isClosed(): boolean
-```
-
-Returns whether the current wrapper/runtime instance is closed.
-
-### Properties
-
-`DenoWorker` exposes these main namespaces:
-
-- `worker.module`
-- `worker.handle`
-- `worker.global`
-- `worker.stream`
-- `worker.cwd`
-- `worker.env`
-- `worker.stats`
-
-## DenoWorker Events
-
-`DenoWorker` supports:
-
-```ts
-type DenoWorkerEvent = "message" | "close" | "lifecycle" | "runtime" | "error";
-```
-
-### `on`
-
-```ts
-on(event: "message", cb: DenoWorkerMessageHandler): void;
-on(event: "close", cb: DenoWorkerCloseHandler): void;
-on(event: "lifecycle", cb: DenoWorkerLifecycleHandler): void;
-on(event: "runtime", cb: DenoWorkerRuntimeHandler): void;
-on(event: "error", cb: DenoWorkerErrorHandler): void;
-```
-
-Event meanings:
-
-- `message`: payloads posted from inside the runtime via `postMessage(...)`
-- `close`: emitted when the runtime closes
-- `lifecycle`: emits lifecycle transitions such as `beforeStart` and `afterStop`
-- `runtime`: emits execution/import/handle/stream telemetry
-- `error`: convenience channel for runtime `error.thrown` events
-
-### `off`
-
-```ts
-off(event: "message", cb?: DenoWorkerMessageHandler): void;
-off(event: "close", cb?: DenoWorkerCloseHandler): void;
-off(event: "lifecycle", cb?: DenoWorkerLifecycleHandler): void;
-off(event: "runtime", cb?: DenoWorkerRuntimeHandler): void;
-off(event: "error", cb?: DenoWorkerErrorHandler): void;
-```
-
-If `cb` is omitted, all listeners for that event are removed.
-
-### Runtime Event Types
-
-```ts
-type DenoWorkerRuntimeEventKind =
-  | "import.requested"
-  | "import.resolved"
-  | "import.classified"
-  | "stream.connect"
-  | "eval.begin"
-  | "eval.end"
-  | "module.eval.begin"
-  | "module.eval.end"
-  | "evalSync.begin"
-  | "evalSync.end"
-  | "error.thrown"
-  | "handle.create"
-  | "handle.dispose"
-  | "handle.call.begin"
-  | "handle.call.end";
-```
-
-```ts
-type DenoWorkerRuntimeEvent = {
-  kind: DenoWorkerRuntimeEventKind;
-  ts: number;
-  opId?: string;
-  [k: string]: any;
-};
-```
-
-## DenoWorker Sub-APIs
-
-### `worker.module`
-
-Type: `DenoWorkerModuleApi`
-
-```ts
-type DenoWorkerModuleApi = {
-  import<T extends Record<string, any> = Record<string, any>>(specifier: string): Promise<T>;
-  eval<T extends Record<string, any> = Record<string, any>>(
-    source: string,
-    options?: DenoWorkerModuleEvalOptions,
-  ): Promise<T>;
-  register(moduleName: string, source: string, options?: Pick<EvalOptions, "srcLoader">): Promise<void>;
-  clear(moduleName: string): Promise<boolean>;
-};
-```
-
-#### `module.import`
-
-Import a specifier through the runtime import pipeline.
-
-#### `module.eval`
-
-Evaluate ES module source and return a callable namespace object.
-
-`DenoWorkerModuleEvalOptions`:
-
-```ts
-type DenoWorkerModuleEvalOptions = Omit<EvalOptions, "type"> & {
-  moduleName?: string;
-  cjs?: boolean;
-};
-```
-
-Option behavior:
-
-- `moduleName`: register under a stable name before import/evaluation
-- `cjs: true`: treat source as CommonJS and expose an ESM facade
-
-#### `module.register`
-
-Register module source under a stable name for later import.
-
-#### `module.clear`
-
-Remove a registered module by name.
-
-### `worker.handle`
-
-Types: `DenoWorkerHandleApi`, `DenoWorkerHandle`
-
-#### Handle Creation API
-
-```ts
-type DenoWorkerHandleApi = {
-  get(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle>;
-  tryGet(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle | undefined>;
-  eval(source: string, options?: Omit<EvalOptions, "args" | "type" | "srcLoader">): Promise<DenoWorkerHandle>;
-};
-```
-
-Use handles when you want to keep a runtime object alive and operate on it repeatedly.
-
-#### Handle Type
-
-```ts
-type DenoWorkerHandle = {
-  readonly id: string;
-  readonly rootType: DenoWorkerHandleTypeInfo;
-  readonly disposed: boolean;
-  get<T = any>(path?: string, options?: DenoWorkerHandleExecOptions): Promise<T>;
-  has(path: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  set(path: string, value: any, options?: DenoWorkerHandleExecOptions): Promise<void>;
-  delete(path: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  keys(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any[]>;
-  entries(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any[]>;
-  getOwnPropertyDescriptor(path: string, options?: DenoWorkerHandleExecOptions): Promise<PropertyDescriptor | undefined>;
-  define(path: string, descriptor: PropertyDescriptor, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  instanceOf(constructorPath: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  isCallable(path?: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  isPromise(path?: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  call<T = any>(args?: any[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  call<T = any>(path: string, args?: any[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  construct<T = any>(args?: any[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  await<T = any>(options?: DenoWorkerHandleAwaitOptions & DenoWorkerHandleExecOptions): Promise<T>;
-  clone(options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle>;
-  toJSON<T = any>(path?: string, options?: DenoWorkerHandleExecOptions): Promise<T>;
-  apply<T = any[]>(ops: DenoWorkerHandleApplyOp[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  getType(path?: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandleTypeInfo>;
-  dispose(options?: DenoWorkerHandleExecOptions): Promise<void>;
-};
-```
-
-Supporting types:
-
-```ts
-type DenoWorkerHandleExecOptions = {
-  maxEvalMs?: number;
-  maxCpuMs?: number;
-};
-```
-
-```ts
-type DenoWorkerHandleAwaitOptions = {
-  returnValue?: boolean;
-  untilNonPromise?: boolean;
-};
-```
-
-```ts
-type DenoWorkerHandleApplyOp =
-  | { op: "get"; path?: string }
-  | { op: "set"; path: string; value: any }
-  | { op: "call"; path?: string; args?: any[] }
-  | { op: "has"; path: string }
-  | { op: "delete"; path: string }
-  | { op: "getType"; path?: string }
-  | { op: "toJSON"; path?: string }
-  | { op: "isCallable"; path?: string }
-  | { op: "isPromise"; path?: string };
-```
-
-```ts
-type DenoWorkerHandleType =
-  | "undefined"
-  | "null"
-  | "boolean"
-  | "number"
-  | "string"
-  | "bigint"
-  | "symbol"
-  | "function"
-  | "array"
-  | "object"
-  | "date"
-  | "regexp"
-  | "map"
-  | "set"
-  | "arraybuffer"
-  | "typedarray"
-  | "error"
-  | "promise";
-
-type DenoWorkerHandleTypeInfo = {
-  type: DenoWorkerHandleType;
-  callable: boolean;
-  constructorName?: string;
-};
-```
-
-### `worker.global`
-
-Type: `DenoWorkerGlobalApi`
-
-This mirrors the handle API but is rooted at `globalThis`.
-
-```ts
-type DenoWorkerGlobalApi = {
-  set(path: string, value: any, options?: DenoWorkerHandleExecOptions): Promise<void>;
-  get<T = any>(path: string, options?: DenoWorkerHandleExecOptions): Promise<T>;
-  has(path: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  delete(path: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  keys(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any[]>;
-  entries(path?: string, options?: DenoWorkerHandleExecOptions): Promise<any[]>;
-  getOwnPropertyDescriptor(path: string, options?: DenoWorkerHandleExecOptions): Promise<PropertyDescriptor | undefined>;
-  define(path: string, descriptor: PropertyDescriptor, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  isCallable(path?: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  isPromise(path?: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-  call<T = any>(path: string, args?: any[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  construct<T = any>(path: string, args?: any[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  await<T = any>(path: string, options?: DenoWorkerHandleAwaitOptions & DenoWorkerHandleExecOptions): Promise<T>;
-  clone(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle>;
-  toJSON<T = any>(path?: string, options?: DenoWorkerHandleExecOptions): Promise<T>;
-  apply<T = any[]>(path: string, ops: DenoWorkerHandleApplyOp[], options?: DenoWorkerHandleExecOptions): Promise<T>;
-  getType(path?: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandleTypeInfo>;
-  instanceOf(path: string, constructorPath: string, options?: DenoWorkerHandleExecOptions): Promise<boolean>;
-};
-```
-
-### `worker.stream`
-
-Type: `DenoWorkerStreamApi`
-
-```ts
-type DenoWorkerStreamApi = {
-  connect(key: string, options?: DenoWorkerStreamConnectOptions): Promise<Duplex>;
-  create(key?: string): DenoWorkerStreamWriter;
-  accept(key: string): Promise<DenoWorkerStreamReader>;
-};
-```
-
-Supporting types:
-
-```ts
-type DenoWorkerStreamConnectOptions = {
-  unsafeSharedMemory?: boolean;
-};
-```
-
-```ts
-type DenoWorkerStreamWriter = {
-  getKey(): string;
-  ready(minBytes?: number): Promise<void>;
-  write(chunk: Uint8Array | ArrayBuffer): Promise<void>;
-  writeMany(chunks: Array<Uint8Array | ArrayBuffer>): Promise<number>;
-  close(): Promise<void>;
-  error(message: string): Promise<void>;
-  cancel(reason?: string): Promise<void>;
-};
-```
-
-```ts
-type DenoWorkerStreamReader = AsyncIterable<Uint8Array> & {
-  read(): Promise<IteratorResult<Uint8Array>>;
-  cancel(reason?: string): Promise<void>;
-};
-```
-
-### `worker.cwd`
-
-Type: `DenoWorkerCwdApi`
-
-```ts
-type DenoWorkerCwdApi = {
-  get(): Promise<string>;
-  set(path: string): Promise<string>;
-};
-```
-
-Behavior:
-
-- when running, `get()` reflects runtime `Deno.cwd()`
-- when closed, `get()` reflects the configured cwd to use on next start
-- `set(path)` updates options and restarts the runtime when needed
-
-### `worker.env`
-
-Type: `DenoWorkerEnvApi`
-
-```ts
-type DenoWorkerEnvApi = {
-  get(key: string): Promise<string | undefined>;
-  set(key: string, value: string): Promise<void>;
-};
-```
-
-Behavior:
-
-- reads live runtime env when running
-- persists env changes for restart
-- throws if env permissions are explicitly disabled
-
-### `worker.stats`
-
-Type: `DenoWorkerStatsApi`
-
-```ts
-type DenoWorkerStatsApi = {
-  readonly activeOps: number;
-  readonly lastExecution: ExecStats;
-  cpu(options?: DenoWorkerCpuOptions): Promise<DenoWorkerCpuStats>;
-  rates(options?: DenoWorkerRatesOptions): Promise<DenoWorkerRatesStats>;
-  latency(options?: DenoWorkerRatesOptions): Promise<DenoWorkerLatencyStats>;
-  eventLoopLag(options?: DenoWorkerEventLoopLagOptions): Promise<DenoWorkerEventLoopLagStats>;
-  readonly stream: DenoWorkerStreamStats;
-  readonly totals: DenoWorkerTotalsStats;
-  reset(options?: DenoWorkerStatsResetOptions): void;
-  memory(): Promise<DenoWorkerMemory>;
-};
-```
-
-Supporting stats types:
-
-```ts
-type ExecStats = {
-  cpuTimeMs?: number;
-  evalTimeMs?: number;
-};
-```
-
-```ts
-type DenoWorkerCpuOptions = { measureMs?: number };
-type DenoWorkerCpuStats = {
-  usagePercentage: number;
-  measureMs: number;
-  cpuTimeMs: number;
-};
-```
-
-```ts
-type DenoWorkerRatesOptions = { windowMs?: number };
-type DenoWorkerRatesStats = {
-  windowMs: number;
-  evalPerSec: number;
-  handlePerSec: number;
-  globalPerSec: number;
-  messagesPerSec: number;
-};
-```
-
-```ts
-type DenoWorkerLatencyStats = {
-  windowMs: number;
-  count: number;
-  avgMs: number;
-  p50Ms: number;
-  p95Ms: number;
-  p99Ms: number;
-  maxMs: number;
-};
-```
-
-```ts
-type DenoWorkerEventLoopLagOptions = { measureMs?: number };
-type DenoWorkerEventLoopLagStats = {
-  measureMs: number;
-  lagMs: number;
-};
-```
-
-```ts
-type DenoWorkerStreamStats = {
-  activeStreams: number;
-  queuedChunks: number;
-  queuedBytes: number;
-  creditDebtBytes: number;
-  backlogSize: number;
-};
-```
-
-```ts
-type DenoWorkerTotalsStats = {
-  ops: number;
-  errors: number;
-  restarts: number;
-  messagesOut: number;
-  messagesIn: number;
-  bytesOut: number;
-  bytesIn: number;
-};
-```
-
-```ts
-type DenoWorkerStatsResetOptions = {
-  keepTotals?: boolean;
-};
-```
-
-Memory types:
-
-```ts
-type DenoWorkerMemory = {
-  heapStatistics: V8HeapStatistics;
-  heapSpaceStatistics: V8HeapSpaceStatistics[];
-};
-```
-
-```ts
-type V8HeapStatistics = {
-  totalHeapSize: number;
-  totalHeapSizeExecutable: number;
-  totalPhysicalSize: number;
-  totalAvailableSize: number;
-  usedHeapSize: number;
-  heapSizeLimit: number;
-  mallocedMemory: number;
-  externalMemory: number;
-  peakMallocedMemory: number;
-  numberOfNativeContexts: number;
-  numberOfDetachedContexts: number;
-  doesZapGarbage: boolean;
-};
-```
-
-```ts
-type V8HeapSpaceStatistics = {
-  spaceName: string;
-  physicalSpaceSize: number;
-  spaceSize: number;
-  spaceUsedSize: number;
-  spaceAvailableSize: number;
-};
-```
-
-## Examples
-
-See:
-
-- [examples/README.md](/home/slott/Developer/deno-director/examples/README.md)
-- [examples/01-basic-eval.ts](/home/slott/Developer/deno-director/examples/01-basic-eval.ts)
-- [examples/02-eval-module.ts](/home/slott/Developer/deno-director/examples/02-eval-module.ts)
-- [examples/03-globals.ts](/home/slott/Developer/deno-director/examples/03-globals.ts)
-- [examples/04-messages.ts](/home/slott/Developer/deno-director/examples/04-messages.ts)
-- [examples/05-imports-callback.ts](/home/slott/Developer/deno-director/examples/05-imports-callback.ts)
-- [examples/08-limits.ts](/home/slott/Developer/deno-director/examples/08-limits.ts)
-- [examples/10-director.ts](/home/slott/Developer/deno-director/examples/10-director.ts)
-- [examples/11-streams.ts](/home/slott/Developer/deno-director/examples/11-streams.ts)
-- [examples/12-handles.ts](/home/slott/Developer/deno-director/examples/12-handles.ts)
-- [examples/13-serverless-style.ts](/home/slott/Developer/deno-director/examples/13-serverless-style.ts)
-
-Run one from the repo root with:
-
-```bash
-node --import tsx examples/01-basic-eval.ts
-```
-
-## Development
-
-Build:
-
-```bash
-npm run build
-```
-
-Test:
-
-```bash
-npm test
-```
+---
+
+## 📚 API Reference
+
+### Orchestration: `DenoDirector`
+The `DenoDirector` class is the central orchestrator for spawning and tracking multiple isolated runtimes.
+
+* **`new DenoDirector(options?: DenoDirectorOptions)`**: Initializes the director, optionally with a default template.
+* **`start(options?: DenoDirectorStartOptions): Promise<DenoDirectedRuntime>`**: Spawns a new worker with an auto-generated or explicitly provided `id`, `label`, and `tags`.
+* **`get(id: string): DenoDirectedRuntime | undefined`**: Looks up a runtime by its exact identifier.
+* **`getByLabel(label: string): DenoDirectedRuntime[]`**: Returns an array of runtimes matching the provided label.
+* **`list(filter?: DenoDirectorListOptions): DenoDirectedRuntime[]`**: Lists managed runtimes, optionally filtering by `label` and/or `tag`.
+* **`setLabel(runtimeOrId: DenoDirectedRuntime | string, label?: string): boolean`**: Updates a runtime's label.
+* **`setTags(runtimeOrId: DenoDirectedRuntime | string, tags: string[]): boolean`**: Replaces all tags for a specific runtime.
+* **`addTag(runtimeOrId: DenoDirectedRuntime | string, tag: string): boolean`**: Adds a tag to a runtime if it is not already present.
+* **`removeTag(runtimeOrId: DenoDirectedRuntime | string, tag: string): boolean`**: Removes a tag from a runtime.
+* **`stop(runtimeOrId: DenoDirectedRuntime | string): Promise<boolean>`**: Gracefully closes a specific runtime and unregisters it.
+* **`stopByLabel(label: string): Promise<number>`**: Stops all runtimes matching a specific label, returning the count of stopped runtimes.
+* **`stopAll(): Promise<number>`**: Stops all runtimes managed by the director.
+
+---
+
+### Templating: `DenoWorkerTemplate`
+Reusable templates capture shared runtime defaults to be applied to multiple instances.
+
+* **`new DenoWorkerTemplate(options?: DenoWorkerTemplateOptions)`**: Initializes a template with baseline `workerOptions`, `globals`, `bootstrapScripts`, `bootstrapModules`, and a `setup` hook.
+* **`create(createOptions?: DenoWorkerTemplateCreateOptions): Promise<DenoWorker>`**: Creates a new runtime instance, shallow-merging the template's options with any per-create overrides.
+
+---
+
+### The Runtime: `DenoWorker`
+The core runtime instance.
+
+#### Base Properties & Methods
+* **`readonly id: string`**: The stable host-side worker ID.
+* **`readonly inspectPort?: number`**: The actual bound inspector port (if debugging is enabled).
+* **`isClosed(): boolean`**: Returns `true` if the runtime is closed or closing.
+* **`close(options?: DenoWorkerCloseOptions): Promise<void>`**: Gracefully shuts down the runtime. Passing `{ force: true }` issues an immediate, best-effort native close.
+* **`restart(options?: DenoWorkerRestartOptions): Promise<void>`**: Restarts the runtime in-place using original creation options, keeping event listeners attached.
+* **`gc(): Promise<void>`**: Asks the native V8 isolate to perform a best-effort garbage collection cycle.
+
+#### Evaluation
+* **`eval<T = any>(src: string, options?: EvalOptions): Promise<T>`**: Evaluates script source asynchronously.
+* **`evalSync<T = any>(src: string, options?: EvalOptions): T`**: Evaluates script source synchronously, blocking the Node event loop.
+
+#### Messaging & Events
+* **`postMessage(msg: any): void`**: Posts a payload to the runtime's `onmessage` listeners.
+* **`postMessages(msgs: any[]): number`**: Batches multiple messages, returning the number accepted.
+* **`tryPostMessage(msg: any): boolean`**: Best-effort enqueue; returns `false` instead of throwing if closed.
+* **`tryPostMessages(msgs: any[]): number`**: Best-effort batch enqueue.
+* **`on(event: DenoWorkerEvent, cb: Function): void`**: Subscribe to `"message"`, `"close"`, `"lifecycle"`, `"runtime"`, or `"error"` events.
+* **`off(event: DenoWorkerEvent, cb?: Function): void`**: Unsubscribe from events. Omit the callback to clear all listeners for the event.
+
+---
+
+### Namespace: `worker.stream`
+High-performance byte streaming APIs.
+
+* **`connect(key: string, options?: DenoWorkerStreamConnectOptions): Promise<Duplex>`**: Connects a bidirectional stream pair under a key and returns a Node.js `Duplex` stream.
+* **`create(key?: string): DenoWorkerStreamWriter`**: Creates a low-level writer. Returns an object with:
+    * `getKey(): string`
+    * `ready(minBytes?: number): Promise<void>`
+    * `write(chunk: Uint8Array | ArrayBuffer): Promise<void>`
+    * `writeMany(chunks: Array<Uint8Array | ArrayBuffer>): Promise<number>`
+    * `close(): Promise<void>`
+    * `error(message: string): Promise<void>`
+    * `cancel(reason?: string): Promise<void>`
+* **`accept(key: string): Promise<DenoWorkerStreamReader>`**: Accepts an incoming reader. Returns an async iterable object with:
+    * `read(): Promise<IteratorResult<Uint8Array>>`
+    * `cancel(reason?: string): Promise<void>`
+
+---
+
+### Namespace: `worker.handle`
+Manage explicit lifetime pointers to V8 objects.
+
+* **`get(path: string, options?: DenoWorkerHandleExecOptions): Promise<DenoWorkerHandle>`**: Creates a handle rooted at `globalThis[path]`.
+* **`tryGet(path: string, options?): Promise<DenoWorkerHandle | undefined>`**: Best-effort variant that returns `undefined` if the path doesn't exist.
+* **`eval(source: string, options?): Promise<DenoWorkerHandle>`**: Evaluates code and returns a handle to the result.
+
+#### Interface: `DenoWorkerHandle`
+Once you have a handle, you can call these methods to manipulate it:
+* **`readonly id: string`** / **`readonly rootType: DenoWorkerHandleTypeInfo`** / **`readonly disposed: boolean`**.
+* **`get<T>(path?: string, options?): Promise<T>`**
+* **`has(path: string, options?): Promise<boolean>`**
+* **`set(path: string, value: any, options?): Promise<void>`**
+* **`delete(path: string, options?): Promise<boolean>`**
+* **`keys(path?: string, options?): Promise<any[]>`**
+* **`entries(path?: string, options?): Promise<any[]>`**
+* **`getOwnPropertyDescriptor(path: string, options?): Promise<PropertyDescriptor | undefined>`**
+* **`define(path: string, descriptor: PropertyDescriptor, options?): Promise<boolean>`**
+* **`instanceOf(constructorPath: string, options?): Promise<boolean>`**
+* **`isCallable(path?: string, options?): Promise<boolean>`**
+* **`isPromise(path?: string, options?): Promise<boolean>`**
+* **`call<T>(argsOrPath?: any[] | string, args?: any[], options?): Promise<T>`**: Calls the handle itself or a nested path.
+* **`construct<T>(args?: any[], options?): Promise<T>`**
+* **`await<T>(options?: DenoWorkerHandleAwaitOptions): Promise<T>`**: Awaits a promise-like root value.
+* **`clone(options?): Promise<DenoWorkerHandle>`**: Clones the handle to a new reference ID.
+* **`toJSON<T>(path?: string, options?): Promise<T>`**
+* **`apply<T>(ops: DenoWorkerHandleApplyOp[], options?): Promise<T>`**: Applies a sequence of operations in a single runtime roundtrip.
+* **`getType(path?: string, options?): Promise<DenoWorkerHandleTypeInfo>`**
+* **`dispose(options?): Promise<void>`**: Releases the handle to prevent memory leaks.
+
+---
+
+### Namespace: `worker.global`
+Directly manipulates properties on `globalThis`. *It mirrors the methods found on `DenoWorkerHandle` exactly, but operates on the global scope context.*
+
+* **`set(path: string, value: any, options?): Promise<void>`**
+* **`get<T>(path: string, options?): Promise<T>`**
+* **`has(path: string, options?): Promise<boolean>`**
+* **`delete(path: string, options?): Promise<boolean>`**
+* **`keys(path?: string, options?): Promise<any[]>`**
+* **`entries(path?: string, options?): Promise<any[]>`**
+* **`getOwnPropertyDescriptor(path: string, options?): Promise<PropertyDescriptor | undefined>`**
+* **`define(path: string, descriptor: PropertyDescriptor, options?): Promise<boolean>`**
+* **`isCallable(path?: string, options?): Promise<boolean>`**
+* **`isPromise(path?: string, options?): Promise<boolean>`**
+* **`call<T>(path: string, args?: any[], options?): Promise<T>`**
+* **`construct<T>(path: string, args?: any[], options?): Promise<T>`**
+* **`await<T>(path: string, options?): Promise<T>`**
+* **`clone(path: string, options?): Promise<DenoWorkerHandle>`**
+* **`toJSON<T>(path?: string, options?): Promise<T>`**
+* **`apply<T>(path: string, ops: DenoWorkerHandleApplyOp[], options?): Promise<T>`**
+* **`getType(path?: string, options?): Promise<DenoWorkerHandleTypeInfo>`**
+* **`instanceOf(path: string, constructorPath: string, options?): Promise<boolean>`**
+
+---
+
+### Namespace: `worker.module`
+Interact with Deno's ESM module loader.
+
+* **`import<T>(specifier: string): Promise<T>`**: Imports a module via the runtime pipeline.
+* **`eval<T>(source: string, options?: DenoWorkerModuleEvalOptions): Promise<T>`**: Evaluates source as an ESM module, optionally synthesizing CJS interop, returning namespace exports.
+* **`register(moduleName: string, source: string, options?): Promise<void>`**: Caches source code under a stable module name.
+* **`clear(moduleName: string): Promise<boolean>`**: Evicts a registered module.
+
+---
+
+### Namespaces: `worker.cwd` & `worker.env`
+* **`cwd.get(): Promise<string>`**: Returns current worker sandbox directory.
+* **`cwd.set(path: string): Promise<string>`**: Updates the sandbox root and restarts the worker.
+* **`env.get(key: string): Promise<string | undefined>`**: Reads an environment variable.
+* **`env.set(key: string, value: string): Promise<void>`**: Sets an environment variable.
+
+---
+
+### Namespace: `worker.stats`
+Lightweight observability telemetry.
+
+* **`readonly activeOps: number`**: Tracked in-flight wrapper promises.
+* **`readonly lastExecution: ExecStats`**: Snapshot from the native runtime containing `cpuTimeMs` and `evalTimeMs`.
+* **`readonly stream: DenoWorkerStreamStats`**: Returns metrics like `activeStreams`, `queuedChunks`, and `creditDebtBytes`.
+* **`readonly totals: DenoWorkerTotalsStats`**: Cumulative counts for `ops`, `errors`, `restarts`, `messagesOut/In`, and `bytesOut/In`.
+* **`cpu(options?: DenoWorkerCpuOptions): Promise<DenoWorkerCpuStats>`**: Computes `usagePercentage` over a given `measureMs` window.
+* **`rates(options?: DenoWorkerRatesOptions): Promise<DenoWorkerRatesStats>`**: Computes operations per second for evals, handles, globals, and messages.
+* **`latency(options?: DenoWorkerRatesOptions): Promise<DenoWorkerLatencyStats>`**: Computes `avgMs`, `p50Ms`, `p95Ms`, `p99Ms`, and `maxMs` latency.
+* **`eventLoopLag(options?: DenoWorkerEventLoopLagOptions): Promise<DenoWorkerEventLoopLagStats>`**: Measures host event loop lag.
+* **`memory(): Promise<DenoWorkerMemory>`**: Fetches V8 `heapStatistics` and `heapSpaceStatistics`.
+* **`reset(options?: DenoWorkerStatsResetOptions): void`**: Clears rolling samples.
+
+---
+
+### Configuration: `DenoWorkerOptions`
+
+Passed during worker creation.
+
+* **`limits`**:
+    * `maxHandle`: Maximum allowed active handles (default: 128).
+    * `maxEvalMs` / `maxCpuMs`: Execution and CPU-budget timeouts.
+    * `maxMemoryBytes`: V8 heap size limit.
+* **`bridge`**:
+    * `channelSize`: Queue capacity for IPC channels (default: 512).
+    * `streamWindowBytes`: Flow-control window size (default: 16MiB).
+    * `streamCreditFlushBytes`: Consumed bytes before triggering a credit replenishment (default: 256KiB).
+    * `streamBacklogLimit`: Unaccepted stream queue limit (default: 256).
+    * `streamHighWaterMarkBytes`: Reader high-water mark limit.
+    * `enableUnsafeStreamMemory`: Enable experimental shared-memory streaming (default: false).
+* **`permissions`**: Sandboxing rules. Accepts a boolean or an object with boolean/string-array constraints for `read`, `write`, `net`, `env`, `run`, `ffi`, `sys`, `import`, `hrtime`, and `wasm`.
+* **`imports`**: Boolean or `ImportsCallback` to govern dynamic import behavior.
+* **`moduleLoader`**: Remote resolution configuration: `httpsResolve`, `httpResolve`, `jsrResolve`, `allowOutsideCwd`, `cacheDir`, `reload`, `maxPayloadBytes`.
+* **`nodeJs`**: Node interoperability configuration: `modules` (resolution), `runtime` (globals), `cjsInterop` (CommonJS execution), and `cjsForcePaths` (overrides).
+* **`sourceLoaders`**: Array of `DenoLoaderTransform` callbacks to transform source files before they reach the V8 parser.
+* **`tsCompiler`**: Controls JSX parsing (`"react"`, `"react-jsx"`, `"react-jsxdev"`, `"preserve"`) and factory flags.
+* **`console`**: Configures console routing (`false`, host `Console`, or per-method function hooks).
+* **`cwd`**: Explicit sandbox directory path.
+* **`env`** / **`envFile`**: Map of environment variables, or path to a `.env` file to seed.
+* **`globals`**: Initial host values mapped directly to `globalThis` on startup.
+* **`modules`**: Pre-registered source modules mapped to specifiers.
+* **`lifecycle`**: Event hooks for `beforeStart`, `afterStart`, `beforeStop`, `afterStop`, and `onCrash`.
+* **`inspect`**: Enable V8 inspector with `host`, `port`, and `break_on_first_statement`.

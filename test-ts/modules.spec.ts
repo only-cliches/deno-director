@@ -74,11 +74,28 @@ describe("deno_worker: modules", () => {
           export const out = 1;
         `;
 
-        await expect(dw.module.eval(code)).rejects.toBeDefined();
+        await expect(dw.module.eval(code)).rejects.toThrow(
+          /File import not found on disk|nodeJs\.modules/i
+        );
       });
     },
     20_000
   );
+
+  it("bare imports report package-resolution guidance when nodeJs.modules is off", async () => {
+    await withTempDir(async (dir) => {
+      dw = createTestWorker({ cwd: dir, imports: true });
+
+      const code = `
+        import "no-such-package";
+        export const out = 1;
+      `;
+
+      await expect(dw.module.eval(code)).rejects.toThrow(
+        /Package import not found on disk|nodeJs\.modules|node_modules/i
+      );
+    });
+  }, 20_000);
 
   it("module.import loads through imports callback and returns callable namespace", async () => {
     const seen: string[] = [];
@@ -111,6 +128,32 @@ describe("deno_worker: modules", () => {
   it("module.import propagates import rejection", async () => {
     dw = createTestWorker({ imports: false });
     await expect(dw.module.import("virtual:nope")).rejects.toBeDefined();
+  });
+
+  it("moduleLoader.allowOutsideCwd allows imports from outside the worker cwd", async () => {
+    await withTempDir(async (root) => {
+      const cwd = path.join(root, "cwd");
+      const outside = path.join(root, "outside");
+      await fs.mkdir(cwd, { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+
+      const outsideFile = path.join(outside, "dep.js");
+      await fs.writeFile(outsideFile, "export const value = 9;\n", "utf8");
+
+      const spec = pathToFileURL(outsideFile).href;
+
+      dw = createTestWorker({ cwd, imports: true });
+      await expect(dw.module.import(spec)).rejects.toThrow(/outside sandbox/i);
+      await dw.close();
+
+      dw = createTestWorker({
+        cwd,
+        imports: true,
+        moduleLoader: { allowOutsideCwd: true },
+      });
+
+      await expect(dw.module.import(spec)).resolves.toMatchObject({ value: 9 });
+    });
   });
 
   it("worker.module.register and worker.module.clear manage named modules", async () => {

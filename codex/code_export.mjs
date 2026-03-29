@@ -55,7 +55,7 @@ async function main() {
   // lines.push("- If you believe there is a better approach/solution than the one I suggest, let me know. ");
   // lines.push("- Do not explain why something works unless I ask.");
   // lines.push("");
-  lines.push(`Generated from \`src\` under \`${cwd}\``);
+  // lines.push(`Generated from \`src\` under \`${cwd}\``);
   lines.push("");
 
   if (rsFiles.length === 0) {
@@ -73,7 +73,7 @@ async function main() {
 
       lines.push(`## ${rel}`);
       lines.push("");
-      lines.push("```rs");
+      lines.push("```" + filePath.split(".").pop());
       lines.push(content);
       if (!content.endsWith("\n")) lines.push("");
       lines.push("```");

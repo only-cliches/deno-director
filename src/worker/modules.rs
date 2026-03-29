@@ -537,7 +537,8 @@ impl DynamicModuleLoader {
 
         let cand_abs = std::fs::canonicalize(&path)
             .unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(&path));
-        cand_abs.starts_with(&root_abs)
+        let cand_lex = crate::worker::filesystem::normalize_lexical_path(&path);
+        cand_abs.starts_with(&root_abs) || cand_lex.starts_with(&root_abs)
     }
 
     // Resolves Node-style file candidates with extension fallback and directory entry resolution.
@@ -616,6 +617,106 @@ impl DynamicModuleLoader {
         None
     }
 
+    // Resolves package.json exports targets for a bare package subpath.
+    fn resolve_node_package_exports(pkg_dir: &Path, subpath: &str, exts: &[&str]) -> Option<PathBuf> {
+        let pkg_json = pkg_dir.join("package.json");
+        if !pkg_json.exists() {
+            return None;
+        }
+
+        let text = std::fs::read_to_string(&pkg_json).ok()?;
+        let pkg = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+        let exports = pkg.get("exports")?;
+        let request = format!("./{}", subpath.trim_start_matches("./"));
+
+        fn pick_target(value: &serde_json::Value) -> Option<String> {
+            match value {
+                serde_json::Value::String(s) => Some(s.trim().to_string()),
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        if let Some(s) = pick_target(item) {
+                            if !s.is_empty() {
+                                return Some(s);
+                            }
+                        }
+                    }
+                    None
+                }
+                serde_json::Value::Object(map) => {
+                    for key in ["import", "module", "default", "require"] {
+                        if let Some(v) = map.get(key)
+                            && let Some(s) = pick_target(v)
+                        {
+                            if !s.is_empty() {
+                                return Some(s);
+                            }
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        fn candidate_from_target(pkg_dir: &Path, target: &str, exts: &[&str]) -> Option<PathBuf> {
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            let cand = pkg_dir.join(target.trim_start_matches("./"));
+            if let Some(resolved) = DynamicModuleLoader::resolve_node_candidate(&cand, exts) {
+                return Some(resolved);
+            }
+            None
+        }
+
+        match exports {
+            serde_json::Value::String(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                if let Some(map) = exports.as_object() {
+                    if let Some(target) = map.get(&request).and_then(pick_target)
+                        && let Some(resolved) = candidate_from_target(pkg_dir, &target, exts)
+                    {
+                        return Some(resolved);
+                    }
+
+                    for (pattern, target) in map {
+                        let pat = pattern.as_str();
+                        if pat.is_empty() {
+                            continue;
+                        }
+                        if !pat.contains('*') {
+                            continue;
+                        }
+                        let Some(star_idx) = pat.find('*') else {
+                            continue;
+                        };
+                        let prefix = &pat[..star_idx];
+                        let suffix = &pat[star_idx + 1..];
+                        if !request.starts_with(prefix) || !request.ends_with(suffix) {
+                            continue;
+                        }
+                        let middle = &request[prefix.len()..request.len().saturating_sub(suffix.len())];
+                        let target = pick_target(target)?;
+                        let mapped = target.replace('*', middle);
+                        if let Some(resolved) = candidate_from_target(pkg_dir, &mapped, exts) {
+                            return Some(resolved);
+                        }
+                    }
+                    return None;
+                }
+
+                if let Some(target) = pick_target(exports)
+                    && let Some(resolved) = candidate_from_target(pkg_dir, &target, exts)
+                {
+                    return Some(resolved);
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
     /// Attempts Node-style disk resolution for a specifier/referrer pair.
     pub fn try_node_resolve_disk(&self, specifier: &str, referrer: &str) -> Option<Url> {
         if !self.node_disk_resolve_enabled() {
@@ -674,9 +775,12 @@ impl DynamicModuleLoader {
             }
 
             if let Some(sp) = subpath {
-                let candidate = pkg_dir.join(sp);
+                let candidate = pkg_dir.join(&sp);
                 let exts = ["js", "mjs", "cjs", "ts", "mts"];
                 if let Some(resolved) = Self::resolve_node_candidate(&candidate, &exts) {
+                    return Url::from_file_path(resolved).ok();
+                }
+                if let Some(resolved) = Self::resolve_node_package_exports(&pkg_dir, &sp, &exts) {
                     return Url::from_file_path(resolved).ok();
                 }
                 return None;
@@ -880,9 +984,7 @@ impl DynamicModuleLoader {
         // Fast-fail unsupported bare specifiers so imports do not hang waiting
         // on fallback resolvers when neither Node nor JSR resolution is enabled.
         if Self::is_bare_specifier(specifier) && !self.node_disk_resolve_enabled() {
-            return Err(JsErrorBox::generic(format!(
-                "Bare import cannot be resolved without nodeJs.modules (or moduleLoader.jsrResolve): {specifier}"
-            )));
+            return Err(self.module_not_found_error(specifier, referrer, None));
         }
 
         if (specifier.starts_with("http://") && self.http_resolve_enabled())
@@ -932,6 +1034,9 @@ impl DynamicModuleLoader {
         maybe_referrer_owned: Option<deno_core::ModuleLoadReferrer>,
         options: deno_core::ModuleLoadOptions,
     ) -> Result<ModuleSource, JsErrorBox> {
+        let (orig_specifier, orig_referrer) =
+            Self::original_spec_and_referrer(&requested_specifier, maybe_referrer_owned.as_ref());
+
         // Callback/import-rewrite paths can resolve to registry-backed modules
         // (for example `node:` builtins provided by node runtime shims).
         // Serve these directly and preserve redirect metadata for virtual requests.
@@ -952,8 +1057,22 @@ impl DynamicModuleLoader {
         self.ensure_wasm_allowed(&resolved)?;
         self.ensure_remote_load_allowed(&resolved)?;
 
-        if resolved.scheme() == "file" && !self.within_sandbox(&resolved) {
+        if resolved.scheme() == "file"
+            && !self.within_sandbox(&resolved)
+            && !self.allow_outside_cwd_enabled()
+        {
             return Err(JsErrorBox::generic("Import blocked: outside sandbox"));
+        }
+
+        if resolved.scheme() == "file"
+            && let Ok(path) = resolved.to_file_path()
+            && !path.is_file()
+        {
+            return Err(self.module_not_found_error(
+                &orig_specifier,
+                &orig_referrer,
+                Some(&resolved),
+            ));
         }
 
         if resolved.scheme() == "http" || resolved.scheme() == "https" {
@@ -995,7 +1114,10 @@ impl DynamicModuleLoader {
                 .unwrap_or_else(|| "js".to_string());
             let classification = self.classify_module_source(&path, &ext, &source);
             let force_match = self.match_forced_cjs_rule(&path);
+            let looks_like_cjs = !Self::looks_like_esm_source(&source)
+                && Self::looks_like_cjs_source(&source);
             let should_wrap = force_match.is_some()
+                || looks_like_cjs
                 || self.should_wrap_file_as_cjs(&path, &ext, &classification);
             let (orig_specifier, orig_referrer) =
                 Self::original_spec_and_referrer(&requested_specifier, maybe_referrer_owned.as_ref());
@@ -1017,6 +1139,34 @@ impl DynamicModuleLoader {
                     return Ok(proxy);
                 }
             }
+        }
+
+        if resolved.scheme() == "file"
+            && let Some(ext) = Self::module_ext(&resolved)
+            && Self::is_ts_like_ext(&ext)
+            && let Ok(path) = resolved.to_file_path()
+        {
+            let source = std::fs::read_to_string(&path).map_err(|e| {
+                JsErrorBox::generic(format!("Failed to read module source: {} ({e})", resolved))
+            })?;
+            let final_code = self.maybe_transpile_ts_like(&resolved, &ext, source)?;
+            let module = if Self::should_wrap_with_redirect(&requested_specifier) {
+                ModuleSource::new_with_redirect(
+                    ModuleType::JavaScript,
+                    deno_core::ModuleSourceCode::String(final_code.into()),
+                    &requested_specifier,
+                    &resolved,
+                    None,
+                )
+            } else {
+                ModuleSource::new(
+                    ModuleType::JavaScript,
+                    deno_core::ModuleSourceCode::String(final_code.into()),
+                    &resolved,
+                    None,
+                )
+            };
+            return Ok(module);
         }
 
         let loaded = match self
@@ -1381,9 +1531,77 @@ impl DynamicModuleLoader {
         self.module_loader_cfg().http_resolve
     }
 
+    // Internal helper for module loading and import policy flow; it handles file imports outside the worker cwd sandbox.
+    fn allow_outside_cwd_enabled(&self) -> bool {
+        self.module_loader_cfg().allow_outside_cwd
+    }
+
     // Returns configured remote payload byte limit.
     fn max_payload_bytes(&self) -> i64 {
         self.module_loader_cfg().max_payload_bytes
+    }
+
+    // Formats a not-found error with disk lookup hints and resolution suggestions.
+    fn module_not_found_error(
+        &self,
+        requested_specifier: &str,
+        referrer: &str,
+        resolved: Option<&Url>,
+    ) -> JsErrorBox {
+        let is_bare = Self::is_bare_specifier(requested_specifier);
+        let is_file_like = requested_specifier.starts_with("./")
+            || requested_specifier.starts_with("../")
+            || requested_specifier.starts_with('/')
+            || requested_specifier.starts_with("file:");
+
+        let title = if is_bare {
+            "Package import not found on disk"
+        } else if is_file_like {
+            "File import not found on disk"
+        } else {
+            "Module not found on disk"
+        };
+
+        let mut msg = format!("{title}: {requested_specifier}");
+
+        if let Some(resolved) = resolved {
+            let resolved_path = resolved
+                .to_file_path()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| resolved.as_str().to_string());
+            msg.push_str(&format!("\nResolved path: {resolved_path}"));
+        }
+
+        if !referrer.is_empty() {
+            msg.push_str(&format!("\nReferrer: {referrer}"));
+        }
+
+        if is_bare {
+            if self.node_disk_resolve_enabled() {
+                msg.push_str(
+                    "\nNode-style resolution was enabled, so the worker already searched node_modules and package.json exports before giving up.",
+                );
+            } else {
+                msg.push_str(
+                    "\nNo package lookup was attempted because nodeJs.modules is disabled. Enable nodeJs.modules (or nodeJs: true) to search node_modules and package.json exports.",
+                );
+            }
+        } else if self.node_disk_resolve_enabled() {
+            msg.push_str(
+                "\nNode-style resolution was enabled, so the worker also tried extension/index fallbacks and package.json-based directory lookups before giving up.",
+            );
+        } else {
+            msg.push_str(
+                "\nOnly the exact file path was searched. Enable nodeJs.modules (or nodeJs: true) to also try extension/index fallbacks and package.json-based directory lookups.",
+            );
+        }
+
+        if !self.jsr_resolve_enabled() {
+            msg.push_str("\nIf this was a jsr: or @std/* import, enable moduleLoader.jsrResolve.");
+        }
+
+        JsErrorBox::generic(msg)
     }
 
     // Checks whether CJS interop wrapping is enabled.
@@ -1541,6 +1759,7 @@ impl DynamicModuleLoader {
         }
         chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
     }
+
 
     // Returns nearest package root and parsed package.json if found.
     fn nearest_package_json(path: &Path) -> Option<(PathBuf, serde_json::Value)> {
@@ -1775,7 +1994,9 @@ impl DynamicModuleLoader {
             Err(err) => {
                 // Fallback when parser cannot process source; preserve old behavior.
                 let esm = Self::looks_like_esm_source(source);
-                let cjs = !esm && Self::looks_like_cjs_source(source);
+                // If parsing fails and the source doesn't look like ESM, prefer CJS
+                // so legacy scripts can still load via the CJS interop wrapper.
+                let cjs = !esm;
                 ModuleSyntaxClassification {
                     cjs,
                     esm,
@@ -1815,13 +2036,16 @@ impl DynamicModuleLoader {
         match ext {
             "mjs" | "mts" => false,
             "js" => {
+                if classification.cjs {
+                    return true;
+                }
                 if Self::js_file_is_package_module(path) {
                     return false;
                 }
                 if Self::js_file_is_package_module_entry(path) {
                     return false;
                 }
-                classification.cjs
+                false
             }
             _ => classification.cjs,
         }
@@ -2047,10 +2271,11 @@ impl DynamicModuleLoader {
             } else {
                 segment
             };
-            let normalized = if (key.starts_with('"') && key.ends_with('"'))
-                || (key.starts_with('\'') && key.ends_with('\''))
+            let normalized = if key.len() >= 2
+                && ((key.starts_with('"') && key.ends_with('"'))
+                    || (key.starts_with('\'') && key.ends_with('\'')))
             {
-                &key[1..key.len().saturating_sub(1)]
+                &key[1..key.len() - 1]
             } else {
                 key
             };
@@ -2131,9 +2356,13 @@ impl DynamicModuleLoader {
         esm.push_str("const __ddFinal = __ddModule.exports;\n");
         esm.push_str("const __ddNamed = (__ddFinal && (typeof __ddFinal === \"object\" || typeof __ddFinal === \"function\")) ? __ddFinal : Object.create(null);\n");
         esm.push_str("export default __ddFinal;\n");
+        let mut alias_idx = 0usize;
         for name in named {
             let key_json = serde_json::to_string(&name).ok()?;
-            esm.push_str(&format!("export const {name} = __ddNamed[{key_json}];\n"));
+            let alias = format!("__ddExport_{alias_idx}");
+            alias_idx += 1;
+            esm.push_str(&format!("const {alias} = __ddNamed[{key_json}];\n"));
+            esm.push_str(&format!("export {{ {alias} as {name} }};\n"));
         }
         Some(esm)
     }
@@ -2572,7 +2801,10 @@ impl ModuleLoader for DynamicModuleLoader {
             }));
         }
 
-        if module_specifier.scheme() == "file" && !self.within_sandbox(module_specifier) {
+        if module_specifier.scheme() == "file"
+            && !self.within_sandbox(module_specifier)
+            && !self.allow_outside_cwd_enabled()
+        {
             self.emit_import_resolved(
                 &orig_spec,
                 &orig_referrer,
@@ -3257,6 +3489,16 @@ exports.default = 9;
     }
 
     #[test]
+    // CJS named export scan ignores malformed quoted keys without panicking.
+    fn cjs_named_export_scan_skips_empty_quoted_keys() {
+        let source = r#"
+module.exports = { '': 1, "": 2, "ok": 3 };
+"#;
+        let names = DynamicModuleLoader::collect_cjs_named_exports(source);
+        assert_eq!(names, vec!["ok".to_string()]);
+    }
+
+    #[test]
     // CJS interop facade executes source through wrapper and exposes default + named aliases.
     fn cjs_node_interop_facade_contains_wrapper_and_named_exports() {
         let resolved = Url::parse("file:///tmp/pkg/index.js").expect("url");
@@ -3269,6 +3511,28 @@ exports.value = 42;
         assert!(text.contains("const __ddRequire = (spec) => {"));
         assert!(text.contains("export default __ddFinal;"));
         assert!(text.contains("export const value = __ddNamed[\"value\"];"));
+    }
+
+    #[test]
+    // Reserved keywords should be exported via alias instead of invalid binding identifiers.
+    fn cjs_interop_escapes_reserved_export_names() {
+        let resolved = Url::parse("file:///tmp/pkg/kw.js").expect("url");
+        let source = r#"module.exports = { case: 1, ok: 3 };"#;
+        let text = DynamicModuleLoader::build_node_cjs_interop_source(&resolved, source).expect("facade");
+        assert!(text.contains(" as case }"));
+        assert!(text.contains(" as ok }"));
+    }
+
+    #[test]
+    // Parse failures without ESM markers should still classify as CJS for interop wrapping.
+    fn parse_failure_defaults_to_cjs_when_no_esm_markers() {
+        let loader = test_loader(false, serde_json::json!({}));
+        let path = PathBuf::from("/tmp/invalid-cjs.js");
+        let source = "var = 1;"; // invalid JS to force parse error
+        let cls = loader.classify_module_source(&path, "js", source);
+        assert!(!cls.parse_ok);
+        assert!(!cls.esm);
+        assert!(cls.cjs);
     }
 
     #[test]
@@ -3308,6 +3572,128 @@ exports.value = 42;
         assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.js"), "js", &cjs_js));
         assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.cjs"), "cjs", &cjs_cjs));
         assert!(!loader.should_wrap_file_as_cjs(&root.join("cjs/mod.mjs"), "mjs", &esm_mjs));
+    }
+
+    #[test]
+    // Parse failures in "type: module" packages still fall back to CJS when interop is enabled.
+    fn cjs_wrap_allows_parse_failure_in_module_pkg() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-wrap-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(
+            root.join("pkg/package.json"),
+            r#"{ "name": "pkg", "type": "module" }"#,
+        )
+        .expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+        }
+
+        let path = root.join("pkg/bad.js");
+        let cls = loader.classify_module_source(&path, "js", "var = 1;");
+        assert!(!cls.parse_ok);
+        assert!(loader.should_wrap_file_as_cjs(&path, "js", &cls));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    // Symlinked node_modules packages should still count as inside the sandbox by lexical path.
+    fn within_sandbox_accepts_symlinked_node_modules_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-sandbox-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "deno-director-sandbox-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(outside.join("pkg")).expect("mkdir outside");
+        std::fs::write(
+            outside.join("pkg/package.json"),
+            r#"{ "name": "pkg", "main": "index.js" }"#,
+        )
+        .expect("write outside pkg json");
+        std::fs::write(outside.join("pkg/index.js"), "module.exports = { ok: true };").expect("write outside index");
+        std::fs::create_dir_all(root.join("node_modules")).expect("mkdir root");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("pkg"), root.join("node_modules/pkg"))
+            .expect("symlink pkg");
+
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.join("pkg"), root.join("node_modules/pkg"))
+            .expect("symlink pkg");
+
+        let (node_tx, _node_rx) = mpsc::channel(1);
+        let loader = DynamicModuleLoader {
+            reg: ModuleRegistry::new(Url::parse("file:///tmp/").expect("url")),
+            node_tx,
+            imports_policy: ImportsPolicy::AllowDisk,
+            wasm: true,
+            node_resolve: true,
+            node_compat: true,
+            sandbox_root: root.clone(),
+            fs_loader: Arc::new(deno_core::FsModuleLoader),
+            module_loader: Some(ModuleLoaderConfig::default()),
+            permissions: Some(serde_json::json!({})),
+            eval_sync_active: None,
+        };
+
+        let resolved = Url::from_file_path(root.join("node_modules/pkg/index.js")).expect("url");
+        assert!(loader.within_sandbox(&resolved));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    // CJS patterns should override package type when detected in source.
+    fn cjs_wrap_overrides_module_type_on_cjs_source() {
+        let root = std::env::temp_dir().join(format!(
+            "deno-director-cjs-wrap-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(
+            root.join("pkg/package.json"),
+            r#"{ "name": "pkg", "type": "module" }"#,
+        )
+        .expect("write");
+
+        let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
+        if let Some(cfg) = loader.module_loader.as_mut() {
+            cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
+        }
+
+        let path = root.join("pkg/cjs.js");
+        let cls = loader.classify_module_source(&path, "js", "module.exports = { x: 1 };");
+        assert!(cls.cjs);
+        assert!(loader.should_wrap_file_as_cjs(&path, "js", &cls));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

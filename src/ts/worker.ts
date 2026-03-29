@@ -896,6 +896,12 @@ export class DenoWorker {
         return this.statsApi;
     }
 
+    /** Ask the native runtime to perform a best-effort garbage collection cycle. */
+    async gc(): Promise<void> {
+        await this.startupPromise;
+        await this.trackInFlight(this.native.gc());
+    }
+
     /** Allocates the next unique handle id scoped to the current native epoch. */
     private nextHandleId(): string {
         this.handleCounter += 1;
@@ -1942,6 +1948,14 @@ export class DenoWorker {
         return joinPath(tmpdir(), "deno-director", "sandbox", workerId);
     }
 
+    private static nodeModulesResolutionEnabled(options: DenoWorkerOptions | undefined): boolean {
+        if (!options) return false;
+        const nodeJs = options.nodeJs;
+        if (nodeJs === true) return true;
+        if (!nodeJs || typeof nodeJs !== "object") return false;
+        return nodeJs.modules === true;
+    }
+
     private static resolveCwdOnce(pathLike: string): string {
         const raw = String(pathLike ?? "").trim();
         if (!raw) return raw;
@@ -1960,11 +1974,13 @@ export class DenoWorker {
         const out: DenoWorkerOptions = { ...options };
         const raw = typeof out.cwd === "string" ? out.cwd.trim() : "";
         if (!raw) {
-            const generated = DenoWorker.defaultInternalCwd(workerId);
+            const generated = DenoWorker.nodeModulesResolutionEnabled(out)
+                ? process.cwd()
+                : DenoWorker.defaultInternalCwd(workerId);
             try {
                 mkdirSync(generated, { recursive: true });
             } catch (e) {
-                throw new Error(`Failed to create internal default cwd: ${generated} (${String((e as any)?.message ?? e)})`);
+                throw new Error(`Failed to create default cwd: ${generated} (${String((e as any)?.message ?? e)})`);
             }
             out.cwd = generated;
             return out;

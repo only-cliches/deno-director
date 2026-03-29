@@ -1185,6 +1185,19 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         api.set(&mut cx, "memory", f)?;
     }
 
+    // gc(): Promise<void>
+    {
+        let id2 = id;
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let (deferred, promise) = cx.promise();
+            let settler = PromiseSettler::new(deferred, cx.channel());
+            queue_deno_msg_or_reject(id2, settler, |deferred| DenoMsg::Gc { deferred });
+
+            Ok(promise)
+        })?;
+        api.set(&mut cx, "gc", f)?;
+    }
+
     // setGlobal(key, value): Promise<void>
     {
         let id2 = id;

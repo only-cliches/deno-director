@@ -89,6 +89,9 @@ pub enum DenoMsg {
     Memory {
         deferred: PromiseSettler,
     },
+    Gc {
+        deferred: PromiseSettler,
+    },
     Close {
         deferred: PromiseSettler,
     },
