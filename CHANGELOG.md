@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 - add worker.module.query api to get a list of loaded modules in memory
 
 
-## [0.9.40] Future
+## [0.9.40] Mar 31, 2026
 
 ### Fixed
 - Expanded Node-style subpath resolution under `nodeJs`:
