@@ -2,7 +2,6 @@
 
 import type { EvalOptions } from "./types";
 import { buildModuleInvokeSource } from "./module-source";
-import { hydrateFromWire } from "./wire";
 
 type ModuleWrapperHost = {
     evalSync(src: string, options?: EvalOptions): any;
@@ -64,7 +63,7 @@ export function wrapModuleNamespace<T extends Record<string, any>>(dw: ModuleWra
             const name = modFn?.name ?? k;
             const isAsync = modFn?.isAsync ?? moduleAsyncFnKeys.has(k);
             if (typeof spec !== "string") {
-                out[k] = hydrateFromWire(v);
+                out[k] = v;
                 continue;
             }
 
@@ -74,7 +73,7 @@ export function wrapModuleNamespace<T extends Record<string, any>>(dw: ModuleWra
                 return dw.evalSync(src, { args });
             };
         } else {
-            out[k] = hydrateFromWire(v);
+            out[k] = v;
         }
     }
 

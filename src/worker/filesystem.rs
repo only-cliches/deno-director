@@ -12,7 +12,7 @@ pub struct SandboxFs {
 }
 
 impl SandboxFs {
-    /// Creates a new instance initialized for filesystem sandbox enforcement.
+    /// Wraps Deno's real filesystem with cwd-aware sandbox checks.
     pub fn new(cwd: PathBuf) -> Self {
         Self {
             inner: RealFs::default(),
@@ -21,7 +21,7 @@ impl SandboxFs {
     }
 }
 
-/// Normalizes startup url into a canonical form before it is used by sandboxed filesystem access and path normalization.
+/// Resolves a startup module path or file URL and rejects entries outside the sandbox cwd.
 pub fn normalize_startup_url(cwd: &Path, raw: Option<&str>) -> Option<Url> {
     let raw = raw.map(|s| s.trim()).filter(|s| !s.is_empty())?;
 
@@ -55,17 +55,14 @@ pub fn normalize_startup_url(cwd: &Path, raw: Option<&str>) -> Option<Url> {
 }
 
 impl FileSystem for SandboxFs {
-    // Cwd.
     fn cwd(&self) -> FsResult<PathBuf> {
         Ok((*self.cwd).clone())
     }
 
-    // Tmp dir.
     fn tmp_dir(&self) -> FsResult<PathBuf> {
         self.inner.tmp_dir()
     }
 
-    // Chdir.
     fn chdir(&self, _path: &CheckedPath<'_>) -> FsResult<()> {
         // Keep runtime cwd fixed to sandbox root for deterministic path policy.
         Err(std::io::Error::new(
@@ -75,12 +72,10 @@ impl FileSystem for SandboxFs {
         .into())
     }
 
-    // Umask.
     fn umask(&self, mask: Option<u32>) -> FsResult<u32> {
         self.inner.umask(mask)
     }
 
-    // Open sync.
     fn open_sync(
         &self,
         path: &CheckedPath<'_>,
@@ -216,12 +211,13 @@ impl FileSystem for SandboxFs {
         self.inner.lchown_async(path, uid, gid)
     }
 
-    // Removes sync from tracked state used by sandboxed filesystem access and path normalization.
+    // Removal delegates to Deno's checked path type; sandbox validation has
+    // already happened before this FileSystem method is called.
     fn remove_sync(&self, path: &CheckedPath<'_>, recursive: bool) -> FsResult<()> {
         self.inner.remove_sync(path, recursive)
     }
 
-    // Removes async from tracked state used by sandboxed filesystem access and path normalization.
+    // Async removal has the same checked-path guarantee as the sync variant.
     fn remove_async<'life0, 'async_trait>(
         &'life0 self,
         path: CheckedPathBuf,
@@ -543,7 +539,7 @@ impl FileSystem for SandboxFs {
         self.inner.write_file_sync(path, options, data)
     }
 
-    // Writes file async for sandboxed filesystem access and path normalization.
+    // Delegate async writes after Deno has produced a permission-checked path.
     fn write_file_async<'life0, 'async_trait>(
         &'life0 self,
         path: CheckedPathBuf,
@@ -558,7 +554,7 @@ impl FileSystem for SandboxFs {
     }
 }
 
-/// Normalizes cwd into a canonical form before it is used by sandboxed filesystem access and path normalization.
+/// Resolves the worker cwd option, accepting file URLs and host-relative paths.
 pub fn normalize_cwd(raw: Option<&str>) -> PathBuf {
     let fallback = std::env::temp_dir().join("deno-director").join("sandbox");
 
@@ -584,12 +580,12 @@ pub fn normalize_cwd(raw: Option<&str>) -> PathBuf {
     }
 }
 
-/// Dir url from path.
+/// Converts a filesystem path to a directory file URL, falling back to the root file URL.
 pub fn dir_url_from_path(p: &Path) -> Url {
     Url::from_directory_path(p).unwrap_or_else(|_| Url::parse("file:///").expect("file url"))
 }
 
-/// Normalizes lexical path into a canonical form before it is used by sandboxed filesystem access and path normalization.
+/// Collapses `.` and `..` path components without touching the filesystem.
 pub fn normalize_lexical_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     let mut parts: Vec<std::ffi::OsString> = Vec::new();
@@ -673,7 +669,7 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
-    // Unique temp dir.
+    // Creates an isolated directory for filesystem policy tests.
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("create temp dir");
@@ -681,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes cwd handles file urls and relative paths into a canonical form before it is used by sandboxed filesystem access and path normalization.
+    // Cwd normalization accepts file URLs, relative paths, and blank fallback input.
     fn normalize_cwd_handles_file_urls_and_relative_paths() {
         let fallback = std::env::temp_dir().join("deno-director").join("sandbox");
         assert_eq!(normalize_cwd(None), fallback);
@@ -701,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes startup url allows in sandbox and blocks outside into a canonical form before it is used by sandboxed filesystem access and path normalization.
+    // Startup modules must be files inside the sandbox root.
     fn normalize_startup_url_allows_in_sandbox_and_blocks_outside() {
         let root = unique_temp_dir("startup-root");
         let inside = root.join("main.js");
@@ -766,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes startup url rejects directory and accepts file url inside into a canonical form before it is used by sandboxed filesystem access and path normalization.
+    // File URLs are accepted only when they point to files inside the sandbox.
     fn normalize_startup_url_rejects_directory_and_accepts_file_url_inside() {
         let root = unique_temp_dir("startup-file-url");
         let file = root.join("entry.ts");
@@ -817,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes lexical path collapses parent segments into a canonical form before it is used by sandboxed filesystem access and path normalization.
+    // Lexical normalization should collapse parent segments without requiring the path to exist.
     fn normalize_lexical_path_collapses_parent_segments() {
         let p = PathBuf::from("/tmp/a/../b/./c");
         let out = normalize_lexical_path(&p);

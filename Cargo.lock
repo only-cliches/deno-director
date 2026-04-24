@@ -1220,6 +1220,7 @@ dependencies = [
 name = "deno-director"
 version = "0.8.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "cpu-time",
  "deno_ast",

@@ -7,12 +7,12 @@ use crate::bridge::tags::{TYPE_FUNCTION, TYPE_KEY};
 use crate::bridge::types::JsValueBridge;
 use crate::bridge::wire;
 
-// Mk err.
+// Keeps error creation terse in fallible V8 conversion helpers.
 fn mk_err(msg: impl Into<String>) -> String {
     msg.into()
 }
 
-// Attempts to json stringify and returns a fallible result for bridge encoding/decoding between Rust, V8, and Neon.
+// Last-resort JSON.stringify fallback for host objects that structured clone cannot handle.
 fn try_json_stringify<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     value: v8::Local<'s, v8::Value>,
@@ -38,7 +38,7 @@ fn try_json_stringify<'s, 'p>(
     serde_json::from_str::<serde_json::Value>(&s).ok()
 }
 
-// Attempts to global dehydrate and returns a fallible result for bridge encoding/decoding between Rust, V8, and Neon.
+// Uses the worker bootstrap's canonical dehydration hook when it is available.
 fn try_global_dehydrate<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     value: v8::Local<'s, v8::Value>,
@@ -56,7 +56,7 @@ fn try_global_dehydrate<'s, 'p>(
     serde_v8::from_v8::<serde_json::Value>(ps, out).ok()
 }
 
-// Returns string prop from state used by bridge encoding/decoding between Rust, V8, and Neon.
+// Reads a string-ish property without surfacing JS exceptions to Rust callers.
 fn get_string_prop<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     obj: v8::Local<'s, v8::Object>,
@@ -73,7 +73,7 @@ fn get_string_prop<'s, 'p>(
     }
 }
 
-// Hydrate via global.
+// Rehydrates wire markers through the worker realm so constructed values use that realm's prototypes.
 fn hydrate_via_global<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     wire_value: v8::Local<'s, v8::Value>,
@@ -99,11 +99,123 @@ fn hydrate_via_global<'s, 'p>(
         .unwrap_or(wire_value)
 }
 
-// Checks whether wire marker key and returns the boolean result for bridge encoding/decoding between Rust, V8, and Neon.
+fn get_global_function<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    name: &str,
+) -> Result<v8::Local<'s, v8::Function>, String> {
+    let ctx = ps.get_current_context();
+    let global = ctx.global(ps);
+    let key =
+        v8::String::new(ps, name).ok_or_else(|| mk_err(format!("alloc {name} key failed")))?;
+    let any = global
+        .get(ps, key.into())
+        .ok_or_else(|| mk_err(format!("{name} global missing")))?;
+    v8::Local::<v8::Function>::try_from(any).map_err(|_| mk_err(format!("{name} is not function")))
+}
+
+fn to_v8_bigint<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    value: &str,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    // Prefer native constructors for smaller values and fall back to BigInt() parsing.
+    if let Ok(n) = value.parse::<i64>() {
+        return Ok(v8::BigInt::new_from_i64(ps, n).into());
+    }
+    if let Ok(n) = value.parse::<u64>() {
+        return Ok(v8::BigInt::new_from_u64(ps, n).into());
+    }
+    let ctor = get_global_function(ps, "BigInt")?;
+    let arg = v8::String::new(ps, value).ok_or_else(|| mk_err("alloc bigint arg failed"))?;
+    let recv: v8::Local<v8::Value> = ps.get_current_context().global(ps).into();
+    ctor.call(ps, recv, &[arg.into()])
+        .ok_or_else(|| mk_err("BigInt() call failed"))
+}
+
+fn to_v8_regexp<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    source: &str,
+    flags: &str,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let ctor = get_global_function(ps, "RegExp")?;
+    let src = v8::String::new(ps, source).ok_or_else(|| mk_err("alloc regexp source failed"))?;
+    let flg = v8::String::new(ps, flags).ok_or_else(|| mk_err("alloc regexp flags failed"))?;
+    ctor.new_instance(ps, &[src.into(), flg.into()])
+        .map(|v| v.into())
+        .ok_or_else(|| mk_err("RegExp construct failed"))
+}
+
+fn to_v8_url<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    href: &str,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let ctor = get_global_function(ps, "URL")?;
+    let arg = v8::String::new(ps, href).ok_or_else(|| mk_err("alloc URL href failed"))?;
+    ctor.new_instance(ps, &[arg.into()])
+        .map(|v| v.into())
+        .ok_or_else(|| mk_err("URL construct failed"))
+}
+
+fn to_v8_url_search_params<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    query: &str,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let ctor = get_global_function(ps, "URLSearchParams")?;
+    let arg =
+        v8::String::new(ps, query).ok_or_else(|| mk_err("alloc URLSearchParams query failed"))?;
+    ctor.new_instance(ps, &[arg.into()])
+        .map(|v| v.into())
+        .ok_or_else(|| mk_err("URLSearchParams construct failed"))
+}
+
+fn to_v8_map<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    entries: &[(JsValueBridge, JsValueBridge)],
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let ctor = get_global_function(ps, "Map")?;
+    let map_obj = ctor
+        .new_instance(ps, &[])
+        .ok_or_else(|| mk_err("Map construct failed"))?;
+    let set_key = v8::String::new(ps, "set").ok_or_else(|| mk_err("alloc map.set key failed"))?;
+    let set_any = map_obj
+        .get(ps, set_key.into())
+        .ok_or_else(|| mk_err("Map#set missing"))?;
+    let set_fn =
+        v8::Local::<v8::Function>::try_from(set_any).map_err(|_| mk_err("Map#set invalid"))?;
+    for (k, v) in entries {
+        let key_val = to_v8(ps, k)?;
+        let value_val = to_v8(ps, v)?;
+        let _ = set_fn.call(ps, map_obj.into(), &[key_val, value_val]);
+    }
+    Ok(map_obj.into())
+}
+
+fn to_v8_set<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    items: &[JsValueBridge],
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let ctor = get_global_function(ps, "Set")?;
+    let set_obj = ctor
+        .new_instance(ps, &[])
+        .ok_or_else(|| mk_err("Set construct failed"))?;
+    let add_key = v8::String::new(ps, "add").ok_or_else(|| mk_err("alloc set.add key failed"))?;
+    let add_any = set_obj
+        .get(ps, add_key.into())
+        .ok_or_else(|| mk_err("Set#add missing"))?;
+    let add_fn =
+        v8::Local::<v8::Function>::try_from(add_any).map_err(|_| mk_err("Set#add invalid"))?;
+    for item in items {
+        let value = to_v8(ps, item)?;
+        let _ = add_fn.call(ps, set_obj.into(), &[value]);
+    }
+    Ok(set_obj.into())
+}
+
+// Identifies keys that require the JS hydration path instead of direct object construction.
 fn is_wire_marker_key(k: &str) -> bool {
     matches!(
         k,
-        "__undef"
+        "__proto__"
+            | "__undef"
             | "__num"
             | "__denojs_worker_num"
             | "__denojs_worker_graph_id"
@@ -122,7 +234,7 @@ fn is_wire_marker_key(k: &str) -> bool {
     )
 }
 
-// Json contains wire markers.
+// Recursively checks whether JSON contains bridge markers or prototype-sensitive keys.
 fn json_contains_wire_markers(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::Array(arr) => arr.iter().any(json_contains_wire_markers),
@@ -136,7 +248,99 @@ fn json_contains_wire_markers(v: &serde_json::Value) -> bool {
     }
 }
 
-// Json to v8 plain.
+// Converts plain JSON-compatible V8 values without calling the worker-side
+// __dehydrate hook. The fast path is limited to tree-shaped data; repeated
+// objects must fall back so the graph-aware encoder can preserve identity.
+fn try_fast_json_from_v8<'s, 'p>(
+    ps: &mut v8::PinScope<'s, 'p>,
+    value: v8::Local<'s, v8::Value>,
+    depth: usize,
+    visited_hashes: &mut Vec<i32>,
+) -> Option<serde_json::Value> {
+    if depth > 64 || visited_hashes.len() > 4096 {
+        return None;
+    }
+
+    if value.is_null() {
+        return Some(serde_json::Value::Null);
+    }
+    if value.is_boolean() {
+        return Some(serde_json::Value::Bool(value.is_true()));
+    }
+    if value.is_number() {
+        let n = value.to_number(ps)?.value();
+        let num = serde_json::Number::from_f64(n)?;
+        return Some(serde_json::Value::Number(num));
+    }
+    if value.is_string() {
+        return Some(serde_json::Value::String(
+            value.to_string(ps)?.to_rust_string_lossy(ps),
+        ));
+    }
+
+    if value.is_undefined()
+        || value.is_function()
+        || value.is_symbol()
+        || value.is_date()
+        || value.is_reg_exp()
+        || value.is_array_buffer()
+        || value.is_data_view()
+        || value.is_typed_array()
+        || value.is_map()
+        || value.is_set()
+        || value.is_native_error()
+        || value.is_promise()
+    {
+        return None;
+    }
+
+    if value.is_array() {
+        let arr = value.cast::<v8::Array>();
+        let hash = arr.get_identity_hash().get();
+        if visited_hashes.contains(&hash) {
+            return None;
+        }
+        visited_hashes.push(hash);
+
+        let len = arr.length();
+        let mut out = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let item = arr.get_index(ps, i)?;
+            let item_json = try_fast_json_from_v8(ps, item, depth + 1, visited_hashes)?;
+            out.push(item_json);
+        }
+
+        return Some(serde_json::Value::Array(out));
+    }
+
+    if value.is_object() {
+        let obj = value.to_object(ps)?;
+        let hash = obj.get_identity_hash().get();
+        if visited_hashes.contains(&hash) {
+            return None;
+        }
+        visited_hashes.push(hash);
+
+        let names = obj.get_own_property_names(ps, v8::GetPropertyNamesArgs::default())?;
+        let mut out = serde_json::Map::with_capacity(names.length() as usize);
+        for i in 0..names.length() {
+            let key_val = names.get_index(ps, i)?;
+            let key = key_val.to_string(ps)?.to_rust_string_lossy(ps);
+            if is_wire_marker_key(&key) {
+                return None;
+            }
+            let item = obj.get(ps, key_val)?;
+            let item_json = try_fast_json_from_v8(ps, item, depth + 1, visited_hashes)?;
+            out.insert(key, item_json);
+        }
+
+        return Some(serde_json::Value::Object(out));
+    }
+
+    None
+}
+
+// Converts plain JSON without calling into JS, keeping the common path cheap and predictable.
 fn json_to_v8_plain<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     v: &serde_json::Value,
@@ -177,7 +381,45 @@ fn json_to_v8_plain<'s, 'p>(
     }
 }
 
-// Attempts to buffer view to v8 and returns a fallible result for bridge encoding/decoding between Rust, V8, and Neon.
+fn buffer_view_bytes_per_element(kind: &str) -> usize {
+    match kind {
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "DataView" => 1,
+        "Int16Array" | "Uint16Array" => 2,
+        "Int32Array" | "Uint32Array" | "Float32Array" => 4,
+        "Float64Array" | "BigInt64Array" | "BigUint64Array" => 8,
+        _ => 1,
+    }
+}
+
+fn buffer_view_window(
+    kind: &str,
+    raw_byte_len: usize,
+    byte_offset: usize,
+    length: usize,
+) -> Option<(usize, usize)> {
+    let bytes_per_element = buffer_view_bytes_per_element(kind);
+    let span_bytes = length.checked_mul(bytes_per_element)?;
+
+    if byte_offset <= raw_byte_len {
+        if let Some(end) = byte_offset.checked_add(span_bytes) {
+            if end <= raw_byte_len {
+                return Some((byte_offset, length));
+            }
+        }
+    }
+
+    // Most bridge paths copy only the view bytes. If an older producer also
+    // carried the source buffer byteOffset, rebase the copied payload to zero.
+    if span_bytes <= raw_byte_len {
+        return Some((0, length));
+    }
+
+    let safe_offset = byte_offset.min(raw_byte_len);
+    let available = raw_byte_len.saturating_sub(safe_offset);
+    Some((safe_offset, available / bytes_per_element))
+}
+
+// Fast direct construction for ArrayBuffer views; falls back to JS hydration on unsupported kinds.
 fn try_buffer_view_to_v8<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     kind: &str,
@@ -201,26 +443,29 @@ fn try_buffer_view_to_v8<'s, 'p>(
         return Some(ab.into());
     }
 
-    if byte_offset > raw.len() {
-        return None;
-    }
-    let end = byte_offset.checked_add(length)?;
-    if end > raw.len() {
-        return None;
-    }
+    let (effective_offset, effective_length) =
+        buffer_view_window(kind, raw.len(), byte_offset, length)?;
 
     if kind == "Uint8Array" {
-        return v8::Uint8Array::new(ps, ab, byte_offset, length).map(|v| v.into());
+        return v8::Uint8Array::new(ps, ab, effective_offset, effective_length).map(|v| v.into());
     }
 
     if kind == "DataView" {
-        return Some(v8::DataView::new(ps, ab, byte_offset, length).into());
+        return Some(v8::DataView::new(ps, ab, effective_offset, effective_length).into());
+    }
+
+    if let Ok(ctor) = get_global_function(ps, kind) {
+        let bo = v8::Number::new(ps, effective_offset as f64);
+        let len = v8::Number::new(ps, effective_length as f64);
+        if let Some(view) = ctor.new_instance(ps, &[ab.into(), bo.into(), len.into()]) {
+            return Some(view.into());
+        }
     }
 
     None
 }
 
-// Converts v8 via wire into output representation for bridge encoding/decoding between Rust, V8, and Neon.
+// Converts through the canonical JSON wire format and lets bootstrap rehydrate special values.
 fn to_v8_via_wire<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     value: &JsValueBridge,
@@ -250,7 +495,7 @@ fn to_v8_via_wire<'s, 'p>(
     Ok(hydrate_via_global(ps, wire_val))
 }
 
-/// Converts v8 into output representation for bridge encoding/decoding between Rust, V8, and Neon.
+/// Converts an internal bridge value into a V8 value in the worker isolate.
 pub fn to_v8<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     value: &JsValueBridge,
@@ -260,13 +505,8 @@ pub fn to_v8<'s, 'p>(
         JsValueBridge::Null => Ok(v8::null(ps).into()),
         JsValueBridge::Bool(b) => Ok(v8::Boolean::new(ps, *b).into()),
 
-        JsValueBridge::Number(n) => {
-            if n.is_finite() && !(*n == 0.0 && n.is_sign_negative()) {
-                Ok(v8::Number::new(ps, *n).into())
-            } else {
-                to_v8_via_wire(ps, value)
-            }
-        }
+        // V8 numbers preserve NaN/Infinity/-0 directly, so avoid wire fallback.
+        JsValueBridge::Number(n) => Ok(v8::Number::new(ps, *n).into()),
 
         JsValueBridge::String(s) => Ok(v8::String::new(ps, s)
             .ok_or_else(|| mk_err("alloc string failed"))?
@@ -276,11 +516,14 @@ pub fn to_v8<'s, 'p>(
             .ok_or_else(|| mk_err("date create failed"))?
             .into()),
 
-        // Prefer direct V8 construction for hot paths; fallback to wire hydration when needed.
-        JsValueBridge::BigInt(_)
-        | JsValueBridge::RegExp { .. }
-        | JsValueBridge::Url { .. }
-        | JsValueBridge::UrlSearchParams { .. } => to_v8_via_wire(ps, value),
+        JsValueBridge::BigInt(s) => to_v8_bigint(ps, s).or_else(|_| to_v8_via_wire(ps, value)),
+        JsValueBridge::RegExp { source, flags } => {
+            to_v8_regexp(ps, source, flags).or_else(|_| to_v8_via_wire(ps, value))
+        }
+        JsValueBridge::Url { href } => to_v8_url(ps, href).or_else(|_| to_v8_via_wire(ps, value)),
+        JsValueBridge::UrlSearchParams { query } => {
+            to_v8_url_search_params(ps, query).or_else(|_| to_v8_via_wire(ps, value))
+        }
 
         JsValueBridge::BufferView {
             kind,
@@ -291,7 +534,10 @@ pub fn to_v8<'s, 'p>(
             .ok_or_else(|| mk_err("buffer view direct conversion failed"))
             .or_else(|_| to_v8_via_wire(ps, value)),
 
-        JsValueBridge::Map(_) | JsValueBridge::Set(_) => to_v8_via_wire(ps, value),
+        JsValueBridge::Map(entries) => {
+            to_v8_map(ps, entries).or_else(|_| to_v8_via_wire(ps, value))
+        }
+        JsValueBridge::Set(items) => to_v8_set(ps, items).or_else(|_| to_v8_via_wire(ps, value)),
 
         JsValueBridge::Json(j) => {
             if json_contains_wire_markers(j) {
@@ -349,38 +595,44 @@ pub fn to_v8<'s, 'p>(
         }
 
         JsValueBridge::HostFunction { id, is_async } => {
-            let j = serde_json::json!({
-                TYPE_KEY: TYPE_FUNCTION,
-                "id": *id,
-                "async": *is_async,
-            });
-            let wire_val = serde_v8::to_v8(ps, j).map_err(|e| e.to_string())?;
-            Ok(hydrate_via_global(ps, wire_val))
+            let obj = v8::Object::new(ps);
+            let type_key =
+                v8::String::new(ps, TYPE_KEY).ok_or_else(|| mk_err("alloc type key failed"))?;
+            let type_val = v8::String::new(ps, TYPE_FUNCTION)
+                .ok_or_else(|| mk_err("alloc type value failed"))?;
+            let id_key = v8::String::new(ps, "id").ok_or_else(|| mk_err("alloc id key failed"))?;
+            let async_key =
+                v8::String::new(ps, "async").ok_or_else(|| mk_err("alloc async key failed"))?;
+            let id_val = v8::Number::new(ps, *id as f64);
+            let async_val = v8::Boolean::new(ps, *is_async);
+            let _ = obj.set(ps, type_key.into(), type_val.into());
+            let _ = obj.set(ps, id_key.into(), id_val.into());
+            let _ = obj.set(ps, async_key.into(), async_val.into());
+            Ok(hydrate_via_global(ps, obj.into()))
         }
     }
 }
 
-// Big int to string checked.
+// Converts BigInt to decimal while keeping pathological payloads bounded.
 fn big_int_to_string_checked<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     bi: v8::Local<'s, v8::BigInt>,
 ) -> Result<String, String> {
-    // Convert to decimal string and apply a conservative size limit.
-    // This is used to intentionally reject extremely large BigInts (test expects rejection).
+    // Converting arbitrary-size BigInts to decimal allocates in both V8 and Rust.
+    // Keep the bridge payload bounded while still allowing values well beyond
+    // JavaScript's safe integer range.
     let s = bi
         .to_string(ps)
         .map(|ss| ss.to_rust_string_lossy(ps))
         .unwrap_or_else(|| "0".into());
 
-    // Allow reasonably sized BigInts (covers >2^53 cases) but reject very large ones.
-    // 2^200 is 61 digits, so this threshold passes typical use while failing the test.
     if s.len() > 40 {
         return Err("BigInt too large to serialize".to_string());
     }
     Ok(s)
 }
 
-/// Constructs v8 from source input for bridge encoding/decoding between Rust, V8, and Neon.
+/// Converts a V8 value from the worker isolate into the internal bridge representation.
 pub fn from_v8<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     value: v8::Local<'s, v8::Value>,
@@ -661,6 +913,10 @@ pub fn from_v8<'s, 'p>(
     // 3) V8 structured clone serializer for high-fidelity, fast binary transfer.
     // 4) JSON.stringify: permissive last-resort for odd host objects.
     if value.is_object() || value.is_array() {
+        if let Some(j) = try_fast_json_from_v8(ps, value, 0, &mut Vec::new()) {
+            return Ok(JsValueBridge::Json(j));
+        }
+
         if let Some(j) = try_global_dehydrate(ps, value) {
             return Ok(wire::from_wire_json(j));
         }
@@ -703,4 +959,27 @@ pub fn from_v8<'s, 'p>(
     }
 
     Ok(JsValueBridge::Undefined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_contains_wire_markers;
+
+    #[test]
+    fn json_marker_detection_rejects_prototype_keys() {
+        let value = serde_json::json!({
+            "safe": {
+                "__proto__": { "polluted": true }
+            }
+        });
+
+        assert!(json_contains_wire_markers(&value));
+    }
+
+    #[test]
+    fn json_marker_detection_recurses_into_arrays() {
+        let value = serde_json::json!([{ "ok": 1 }, { "__buffer": { "bytes": [] } }]);
+
+        assert!(json_contains_wire_markers(&value));
+    }
 }

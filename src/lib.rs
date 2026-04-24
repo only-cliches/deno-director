@@ -19,23 +19,31 @@ lazy_static! {
     pub(crate) static ref NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 }
 
-/// Parses eval options from input data and validates it for runtime bridge internals.
+/// Parses optional eval options, falling back to script-eval defaults on invalid input.
 pub(crate) fn parse_eval_options<'a>(cx: &mut FunctionContext<'a>, idx: i32) -> EvalOptions {
     EvalOptions::from_neon(cx, idx).unwrap_or_default()
 }
 
-/// Mk err.
+/// Builds a generic JavaScript `Error` bridge value.
 pub(crate) fn mk_err(message: impl Into<String>) -> JsValueBridge {
     crate::bridge::errors::error("Error", message)
 }
 
-/// Queue deno msg or reject with backpressure.
+/// Queues a runtime message and rejects attached promises when delivery is impossible.
+///
+/// Control-plane messages may block to preserve request completion semantics.
+/// Data-plane messages are best-effort so high-volume streams cannot stall
+/// Node producer threads when the bounded runtime channel is saturated.
 pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
     tx: tokio::sync::mpsc::Sender<DenoMsg>,
     msg: DenoMsg,
 ) {
+    let is_data_plane = msg.is_data_plane();
     let send_result = match tx.try_send(msg) {
         Ok(()) => Ok(()),
+        // Data-plane calls are best-effort and should not block producer threads.
+        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) if is_data_plane => Err(msg),
+        // Control-plane calls keep blocking semantics to preserve completion guarantees.
         Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
             tx.blocking_send(msg).map_err(|e| e.0)
         }
@@ -68,7 +76,7 @@ pub(crate) fn queue_deno_msg_or_reject_with_backpressure(
     }
 }
 
-/// Deno control tx for worker.
+/// Returns the control-plane sender for a live worker.
 pub(crate) fn deno_control_tx_for_worker(
     worker_id: usize,
 ) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
@@ -78,7 +86,7 @@ pub(crate) fn deno_control_tx_for_worker(
         .and_then(|map| map.get(&worker_id).map(|w| w.deno_tx.clone()))
 }
 
-/// Deno data tx for worker.
+/// Returns the data-plane sender for a live worker.
 pub(crate) fn deno_data_tx_for_worker(
     worker_id: usize,
 ) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
@@ -88,7 +96,7 @@ pub(crate) fn deno_data_tx_for_worker(
         .and_then(|map| map.get(&worker_id).map(|w| w.deno_data_tx.clone()))
 }
 
-/// Native stream plane for worker.
+/// Returns the native stream plane registered for a live worker, if enabled.
 pub(crate) fn native_stream_plane_for_worker(
     worker_id: usize,
 ) -> Option<std::sync::Arc<NativeIncomingPlane>> {
@@ -98,7 +106,7 @@ pub(crate) fn native_stream_plane_for_worker(
     guard.clone()
 }
 
-/// Queue deno msg or reject.
+/// Routes a message to the correct runtime queue and rejects when the worker is closed.
 pub(crate) fn queue_deno_msg_or_reject<F>(worker_id: usize, settler: PromiseSettler, mk_msg: F)
 where
     F: FnOnce(PromiseSettler) -> DenoMsg,
@@ -139,7 +147,6 @@ where
 }
 
 #[neon::main]
-// Main.
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("DenoWorker", native_api::create_worker)?;
     Ok(())

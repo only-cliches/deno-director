@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use deno_runtime::deno_core::{JsBuffer, OpState, op2};
+use deno_runtime::deno_core::{JsBuffer, OpState, op2, serde_v8, v8};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -46,6 +46,35 @@ fn bytes_to_u8_bridge(bytes: &[u8]) -> JsValueBridge {
         byte_offset: 0,
         length: bytes.len(),
     }
+}
+
+fn bridge_from_v8_value<'s, 'p>(
+    scope: &mut v8::PinScope<'s, 'p>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<JsValueBridge, serde_json::Value> {
+    crate::bridge::v8_codec::from_v8(scope, value).map_err(|e| err_reply("BridgeError", e))
+}
+
+fn bridge_args_from_v8_array<'s, 'p>(
+    scope: &mut v8::PinScope<'s, 'p>,
+    args_value: v8::Local<'s, v8::Value>,
+) -> Result<Vec<JsValueBridge>, serde_json::Value> {
+    if !args_value.is_array() {
+        return Err(err_reply(
+            "TypeError",
+            "Host function arguments must be passed as an array",
+        ));
+    }
+
+    let arr = args_value.cast::<v8::Array>();
+    let mut out = Vec::with_capacity(arr.length() as usize);
+    for i in 0..arr.length() {
+        let item = arr
+            .get_index(scope, i)
+            .unwrap_or_else(|| v8::undefined(scope).into());
+        out.push(bridge_from_v8_value(scope, item)?);
+    }
+    Ok(out)
 }
 
 // Returns a wire error reply when host callbacks are attempted during `evalSync`.
@@ -102,6 +131,23 @@ pub fn op_denojs_worker_post_message(state: &mut OpState, #[serde] msg: serde_js
 
     // Input is wire-JSON from bootstrap hostPostMessage wrapper.
     let value: JsValueBridge = crate::bridge::wire::from_wire_json(msg);
+    send_node_msg_wait(&ctx, NodeMsg::EmitMessage { value }, Duration::from_secs(2)).is_ok()
+}
+
+// Worker -> Node: hostPostMessage() raw V8 path
+#[op2(fast)]
+pub fn op_denojs_worker_post_message_raw<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    state: &mut OpState,
+    msg: v8::Local<'a, v8::Value>,
+) -> bool {
+    let Some(ctx) = ctx_from_state(state) else {
+        return false;
+    };
+
+    let Ok(value) = bridge_from_v8_value(scope, msg) else {
+        return false;
+    };
     send_node_msg_wait(&ctx, NodeMsg::EmitMessage { value }, Duration::from_secs(2)).is_ok()
 }
 
@@ -385,6 +431,71 @@ pub fn op_denojs_worker_host_call_sync(
     }
 
     // Bounded wait prevents deadlock if Node callback path stalls.
+    let reply = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(v) => v,
+        Err(_) => {
+            return serde_json::json!({
+                "ok": false,
+                "error": err_wire("HostFunctionError", "Sync host call timed out")
+            });
+        }
+    };
+
+    match reply {
+        Ok(v) => serde_json::json!({ "ok": true, "value": ok_wire(v) }),
+        Err(e) => serde_json::json!({ "ok": false, "error": ok_wire(e) }),
+    }
+}
+
+// Worker -> Node: host function call (sync, raw V8 args)
+#[op2]
+#[serde]
+pub fn op_denojs_worker_host_call_sync_raw<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    state: &mut OpState,
+    #[smi] func_id: i32,
+    #[serde] args: serde_v8::GlobalValue,
+) -> serde_json::Value {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let Some(ctx) = ctx_from_state(state) else {
+        return serde_json::json!({
+            "ok": false,
+            "error": err_wire("OpStateError", "WorkerOpContext missing in OpState")
+        });
+    };
+    if let Some(v) = host_call_blocked_during_evalsync(&ctx) {
+        return v;
+    }
+
+    let args_local = v8::Local::new(scope, &args.v8_value);
+    let bridged_args = match bridge_args_from_v8_array(scope, args_local) {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+
+    let (tx, rx) = mpsc::channel::<Result<JsValueBridge, JsValueBridge>>();
+
+    if let Err(e) = send_node_msg_wait(
+        &ctx,
+        NodeMsg::InvokeHostFunctionSync {
+            func_id: func_id as usize,
+            args: bridged_args,
+            reply: tx,
+        },
+        Duration::from_secs(5),
+    ) {
+        let msg = match e {
+            NodeSendWaitError::Closed => "Node channel closed",
+            NodeSendWaitError::TimedOut => "Node channel saturated",
+        };
+        return serde_json::json!({
+            "ok": false,
+            "error": err_wire("HostFunctionError", msg)
+        });
+    }
+
     let reply = match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(v) => v,
         Err(_) => {

@@ -19,7 +19,37 @@ use crate::{
 use neon::result::Throw;
 use neon::types::JsDate;
 
-// Returns string prop from state used by Neon worker API glue between Node and runtime.
+mod channel_send;
+use channel_send::{SendOutcome, send_with_backpressure};
+
+fn send_bool_with_optional_blocking(
+    tx: &tokio::sync::mpsc::Sender<DenoMsg>,
+    msg: DenoMsg,
+    strict_message: &str,
+) -> Result<bool, String> {
+    match tx.try_send(msg) {
+        Ok(()) => Ok(true),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => match tx.blocking_send(msg) {
+            Ok(()) => Ok(true),
+            Err(_e) => {
+                if strict_channel() {
+                    Err(strict_message.to_string())
+                } else {
+                    Ok(false)
+                }
+            }
+        },
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_msg)) => {
+            if strict_channel() {
+                Err(strict_message.to_string())
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+// Reads an optional string property from a JS object.
 fn get_string_prop<'a, C: Context<'a>>(
     cx: &mut C,
     obj: Handle<'a, JsObject>,
@@ -30,7 +60,7 @@ fn get_string_prop<'a, C: Context<'a>>(
     Some(s.value(cx))
 }
 
-// Internal helper for Neon API bridge setup; it handles host fn tag.
+// Wire marker consumed by bootstrap hydration to create worker-callable host functions.
 fn host_fn_tag(id: usize, is_async: bool) -> serde_json::Value {
     json!({
         TYPE_KEY: TYPE_FUNCTION,
@@ -51,7 +81,7 @@ fn register_host_fn<'a>(
     Some(w.register_global_fn(rooted))
 }
 
-// Builds node console bridge fn required by Neon worker API glue between Node and runtime.
+// Builds a sync Node console callback used by console:"node" routing.
 fn build_node_console_bridge_fn<'a>(
     cx: &mut FunctionContext<'a>,
     method: &'static str,
@@ -138,7 +168,7 @@ fn is_async_like<'a>(cx: &mut FunctionContext<'a>, func: Handle<'a, JsFunction>)
     .unwrap_or(false)
 }
 
-// Builds console config from neon required by Neon worker API glue between Node and runtime.
+// Converts the public `console` option into the worker-side console routing map.
 fn build_console_config_from_neon<'a>(
     cx: &mut FunctionContext<'a>,
     worker_id: usize,
@@ -230,7 +260,7 @@ fn build_console_config_from_neon<'a>(
     }
 }
 
-// Internal helper for Neon API bridge setup; it handles strict channel.
+// Opt-in mode for callers that prefer exceptions over best-effort false/zero returns.
 fn strict_channel() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -244,7 +274,12 @@ fn strict_channel() -> bool {
     })
 }
 
-// Returns `Object.prototype.toString` tag for a JS value.
+// Looks up the current data-plane sender; absence means the worker is already closed.
+fn data_tx(worker_id: usize) -> Option<tokio::sync::mpsc::Sender<DenoMsg>> {
+    deno_data_tx_for_worker(worker_id)
+}
+
+// Gets Object.prototype.toString.call(value), which is reliable across JS realms.
 fn object_to_string_tag<'a>(
     cx: &mut FunctionContext<'a>,
     value: Handle<'a, JsValue>,
@@ -262,7 +297,7 @@ fn object_to_string_tag<'a>(
     Some(s.value(cx))
 }
 
-// Checks whether arraybuffer view and returns the boolean result for Neon worker API glue between Node and runtime.
+// Detects ArrayBuffer views without relying on every typed-array class being imported into Rust.
 fn is_arraybuffer_view<'a>(cx: &mut FunctionContext<'a>, value: Handle<'a, JsValue>) -> bool {
     cx.try_catch(|cx| {
         let ab_ctor: Handle<JsFunction> = cx.global("ArrayBuffer")?;
@@ -278,7 +313,30 @@ fn is_arraybuffer_view<'a>(cx: &mut FunctionContext<'a>, value: Handle<'a, JsVal
     .unwrap_or(false)
 }
 
-// Checks whether expand object and returns the boolean result for Neon worker API glue between Node and runtime.
+fn is_binary_js_value<'a>(cx: &mut FunctionContext<'a>, value: Handle<'a, JsValue>) -> bool {
+    value.is_a::<JsBuffer, _>(cx)
+        || value.is_a::<JsUint8Array, _>(cx)
+        || value.is_a::<JsArrayBuffer, _>(cx)
+}
+
+// Copies Node binary values into Bytes so they can be moved across the runtime channel safely.
+fn js_value_to_bytes<'a>(
+    cx: &mut FunctionContext<'a>,
+    value: Handle<'a, JsValue>,
+) -> Option<Bytes> {
+    if let Ok(buf) = value.downcast::<JsBuffer, _>(cx) {
+        return Some(Bytes::copy_from_slice(buf.as_slice(cx)));
+    }
+    if let Ok(u8) = value.downcast::<JsUint8Array, _>(cx) {
+        return Some(Bytes::copy_from_slice(u8.as_slice(cx)));
+    }
+    if let Ok(ab) = value.downcast::<JsArrayBuffer, _>(cx) {
+        return Some(Bytes::copy_from_slice(ab.as_slice(cx)));
+    }
+    None
+}
+
+// Returns true for plain objects that should be walked to preserve nested host functions.
 fn should_expand_object<'a>(
     cx: &mut FunctionContext<'a>,
     value: Handle<'a, JsValue>,
@@ -318,7 +376,7 @@ fn should_expand_object<'a>(
     !own_enumerable_string_keys(cx, obj).is_empty()
 }
 
-// Checks whether special wire json object and returns the boolean result for Neon worker API glue between Node and runtime.
+// Detects already-encoded wire markers so recursive object expansion does not corrupt them.
 fn is_special_wire_json_object(v: &serde_json::Value) -> bool {
     let Some(obj) = v.as_object() else {
         return false;
@@ -378,7 +436,9 @@ fn own_enumerable_string_keys<'a>(
     .unwrap_or_default()
 }
 
-// Encodes set global value into transport-safe form for Neon worker API glue between Node and runtime.
+// Encodes setGlobal values while preserving nested functions as callable host bridges.
+// The general Neon codec handles rich data types first; plain containers are
+// walked only so nested functions survive as host callback markers.
 fn encode_set_global_value<'a>(
     cx: &mut FunctionContext<'a>,
     worker: &mut WorkerHandle,
@@ -412,7 +472,10 @@ fn encode_set_global_value<'a>(
     }
 
     if let Ok(obj) = value.downcast::<JsObject, _>(cx) {
-        // Baseline codec already handles rich JS types (Date/Map/Set/Error/TypedArray).
+        // Keep literal wire-marker objects untouched, but avoid V8 serialized
+        // blobs for structured globals. setGlobal installs values via worker
+        // bootstrap hydration, so canonical wire JSON is the safe boundary for
+        // realm-sensitive constructors like Map/Set/URL/typed arrays.
         let baseline = crate::bridge::neon_codec::from_neon_value(cx, value)?;
         if let JsValueBridge::Json(j) = &baseline {
             if is_special_wire_json_object(j) {
@@ -433,15 +496,17 @@ fn encode_set_global_value<'a>(
             return Ok(JsValueBridge::Json(serde_json::Value::Object(out)));
         }
 
-        return Ok(baseline);
+        return crate::bridge::neon_codec::dehydrate_neon_to_wire(cx, value)
+            .map(JsValueBridge::Json);
     }
 
     crate::bridge::neon_codec::from_neon_value(cx, value)
 }
 
-/// Creates worker used by Neon worker API glue between Node and runtime.
+/// Creates a native worker and returns the JavaScript-facing addon API object.
 pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
     let mut opts = worker::state::WorkerCreateOptions::from_neon(&mut cx, 0)?;
+    let inspect_cfg = opts.runtime_options.inspect.clone();
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let channel = cx.channel();
@@ -456,7 +521,8 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         map.insert(id, handle.clone());
     }
 
-    // imports option: if provided as a function, store it in callbacks.imports
+    // Store the imports callback before startup so module resolution can call
+    // back into Node during the worker's first import graph load.
     {
         let raw_opts = cx.argument_opt(0);
         if let Some(raw) = raw_opts {
@@ -476,7 +542,8 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
         }
     }
 
-    // console option: if provided, build wire JSON config and apply before startup
+    // Console routing is part of runtime bootstrap state, so build the wire
+    // config before the worker thread starts.
     {
         let raw_opts = cx.argument_opt(0);
         if let Some(raw) = raw_opts {
@@ -490,6 +557,26 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
     worker::runtime::spawn_worker_thread(id, opts.runtime_options, deno_rx, deno_data_rx, node_rx);
 
+    // When inspect is enabled, wait briefly for the inspector listener to bind so
+    // immediate host probes (e.g. /json/version in tests) do not race startup.
+    if inspect_cfg.is_some() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+        loop {
+            let bound_port = WORKERS
+                .read()
+                .ok()
+                .and_then(|map| {
+                    map.get(&id)
+                        .map(|w| w.inspect_bound_port.load(Ordering::SeqCst))
+                })
+                .unwrap_or(0);
+            if bound_port > 0 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     let api = cx.empty_object();
 
     // postMessage(msg) -> boolean
@@ -499,9 +586,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             let value = cx.argument::<JsValue>(0)?;
             let msg = crate::bridge::neon_codec::from_neon_value(&mut cx, value)?;
 
-            let tx = deno_data_tx_for_worker(id2);
-
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postMessage)");
                 }
@@ -509,27 +594,9 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             };
 
             let msg = DenoMsg::PostMessage { value: msg };
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postMessage)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    if strict_channel() {
-                        cx.throw_error("Runtime is closed (postMessage)")
-                    } else {
-                        Ok(cx.boolean(false))
-                    }
-                }
+            match send_bool_with_optional_blocking(&tx, msg, "Runtime is closed (postMessage)") {
+                Ok(sent) => Ok(cx.boolean(sent)),
+                Err(message) => cx.throw_error(message),
             }
         })?;
         api.set(&mut cx, "postMessage", f)?;
@@ -545,8 +612,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 Err(_) => return Ok(cx.number(0.0)),
             };
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postMessages)");
                 }
@@ -554,53 +620,38 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             };
 
             let mut sent: usize = 0;
-            let mut binary_payloads: Vec<Vec<u8>> = Vec::with_capacity(arr.len(&mut cx) as usize);
             let mut all_binary = true;
             for i in 0..arr.len(&mut cx) {
                 let v = arr.get_value(&mut cx, i)?;
-                let payload = if let Ok(buf) = v.downcast::<JsBuffer, _>(&mut cx) {
-                    buf.as_slice(&cx).to_vec()
-                } else if let Ok(u8) = v.downcast::<JsUint8Array, _>(&mut cx) {
-                    u8.as_slice(&cx).to_vec()
-                } else if let Ok(ab) = v.downcast::<JsArrayBuffer, _>(&mut cx) {
-                    ab.as_slice(&cx).to_vec()
-                } else {
+                if !is_binary_js_value(&mut cx, v) {
                     all_binary = false;
                     break;
-                };
-                binary_payloads.push(payload);
+                }
             }
 
             if all_binary {
-                for payload in binary_payloads {
+                for i in 0..arr.len(&mut cx) {
+                    let v = arr.get_value(&mut cx, i)?;
+                    let Some(payload) = js_value_to_bytes(&mut cx, v) else {
+                        continue;
+                    };
                     let len = payload.len();
                     let msg = DenoMsg::PostMessage {
                         value: JsValueBridge::BufferView {
                             kind: "Uint8Array".into(),
-                            bytes: Bytes::from(payload),
+                            bytes: payload,
                             byte_offset: 0,
                             length: len,
                         },
                     };
-                    match tx.try_send(msg) {
-                        Ok(()) => sent += 1,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                            match tx.blocking_send(msg) {
-                                Ok(()) => sent += 1,
-                                Err(_) => {
-                                    if strict_channel() {
-                                        return cx.throw_error("Runtime is closed (postMessages)");
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            if strict_channel() {
-                                return cx.throw_error("Runtime is closed (postMessages)");
-                            }
-                            break;
-                        }
+                    match send_bool_with_optional_blocking(
+                        &tx,
+                        msg,
+                        "Runtime is closed (postMessages)",
+                    ) {
+                        Ok(true) => sent += 1,
+                        Ok(false) => break,
+                        Err(message) => return cx.throw_error(message),
                     }
                 }
                 return Ok(cx.number(sent as f64));
@@ -610,25 +661,11 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 let v = arr.get_value(&mut cx, i)?;
                 let msg = crate::bridge::neon_codec::from_neon_value(&mut cx, v)?;
                 let msg = DenoMsg::PostMessage { value: msg };
-                match tx.try_send(msg) {
-                    Ok(()) => sent += 1,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                        match tx.blocking_send(msg) {
-                            Ok(()) => sent += 1,
-                            Err(_) => {
-                                if strict_channel() {
-                                    return cx.throw_error("Runtime is closed (postMessages)");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        if strict_channel() {
-                            return cx.throw_error("Runtime is closed (postMessages)");
-                        }
-                        break;
-                    }
+                match send_bool_with_optional_blocking(&tx, msg, "Runtime is closed (postMessages)")
+                {
+                    Ok(true) => sent += 1,
+                    Ok(false) => break,
+                    Err(message) => return cx.throw_error(message),
                 }
             }
 
@@ -649,8 +686,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             let payload_js = cx.argument::<JsValue>(2)?;
             let payload = crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?;
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postMessageTyped)");
                 }
@@ -663,27 +699,10 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 payload,
             };
 
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postMessageTyped)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    if strict_channel() {
-                        cx.throw_error("Runtime is closed (postMessageTyped)")
-                    } else {
-                        Ok(cx.boolean(false))
-                    }
-                }
+            match send_bool_with_optional_blocking(&tx, msg, "Runtime is closed (postMessageTyped)")
+            {
+                Ok(sent) => Ok(cx.boolean(sent)),
+                Err(message) => cx.throw_error(message),
             }
         })?;
         api.set(&mut cx, "postMessageTyped", f)?;
@@ -698,33 +717,18 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 return cx.throw_error("postStreamChunk streamId must be non-empty");
             }
             let payload_js = cx.argument::<JsValue>(1)?;
-            let payload = if let Ok(buf) = payload_js.downcast::<JsBuffer, _>(&mut cx) {
+            let payload = if let Some(bytes) = js_value_to_bytes(&mut cx, payload_js) {
                 crate::bridge::types::JsValueBridge::BufferView {
                     kind: "Uint8Array".to_string(),
-                    bytes: bytes::Bytes::from(buf.as_slice(&cx).to_vec()),
                     byte_offset: 0,
-                    length: buf.as_slice(&cx).len(),
-                }
-            } else if let Ok(u8) = payload_js.downcast::<JsUint8Array, _>(&mut cx) {
-                crate::bridge::types::JsValueBridge::BufferView {
-                    kind: "Uint8Array".to_string(),
-                    bytes: bytes::Bytes::from(u8.as_slice(&cx).to_vec()),
-                    byte_offset: 0,
-                    length: u8.len(&mut cx) as usize,
-                }
-            } else if let Ok(ab) = payload_js.downcast::<JsArrayBuffer, _>(&mut cx) {
-                crate::bridge::types::JsValueBridge::BufferView {
-                    kind: "ArrayBuffer".to_string(),
-                    bytes: bytes::Bytes::from(ab.as_slice(&cx).to_vec()),
-                    byte_offset: 0,
-                    length: ab.as_slice(&cx).len(),
+                    length: bytes.len(),
+                    bytes,
                 }
             } else {
                 crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?
             };
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postStreamChunk)");
                 }
@@ -733,21 +737,16 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
 
             let msg = DenoMsg::PostStreamChunk { stream_id, payload };
 
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postStreamChunk)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
+            match send_with_backpressure(&tx, msg) {
+                SendOutcome::Sent => Ok(cx.boolean(true)),
+                SendOutcome::Full => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime channel saturated (postStreamChunk)")
+                    } else {
+                        Ok(cx.boolean(false))
                     }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                SendOutcome::Closed => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunk)")
                     } else {
@@ -790,8 +789,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 None
             };
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postStreamChunkRaw)");
                 }
@@ -804,21 +802,16 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 credit,
             };
 
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postStreamChunkRaw)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
+            match send_with_backpressure(&tx, msg) {
+                SendOutcome::Sent => Ok(cx.boolean(true)),
+                SendOutcome::Full => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime channel saturated (postStreamChunkRaw)")
+                    } else {
+                        Ok(cx.boolean(false))
                     }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                SendOutcome::Closed => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunkRaw)")
                     } else {
@@ -842,12 +835,8 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 return cx.throw_error("postStreamChunkRawBin streamId must be a finite uint32");
             }
             let payload_js = cx.argument::<JsValue>(1)?;
-            let payload = if let Ok(buf) = payload_js.downcast::<JsBuffer, _>(&mut cx) {
-                buf.as_slice(&cx).to_vec()
-            } else if let Ok(u8) = payload_js.downcast::<JsUint8Array, _>(&mut cx) {
-                u8.as_slice(&cx).to_vec()
-            } else if let Ok(ab) = payload_js.downcast::<JsArrayBuffer, _>(&mut cx) {
-                ab.as_slice(&cx).to_vec()
+            let payload = if let Some(bytes) = js_value_to_bytes(&mut cx, payload_js) {
+                bytes
             } else {
                 return cx.throw_error(
                     "postStreamChunkRawBin payload must be Buffer/Uint8Array/ArrayBuffer",
@@ -871,8 +860,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 None
             };
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postStreamChunkRawBin)");
                 }
@@ -885,21 +873,16 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 credit,
             };
 
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postStreamChunkRawBin)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
+            match send_with_backpressure(&tx, msg) {
+                SendOutcome::Sent => Ok(cx.boolean(true)),
+                SendOutcome::Full => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime channel saturated (postStreamChunkRawBin)")
+                    } else {
+                        Ok(cx.boolean(false))
                     }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                SendOutcome::Closed => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunkRawBin)")
                     } else {
@@ -925,8 +908,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 Err(_) => return Ok(cx.number(0.0)),
             };
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postStreamChunks)");
                 }
@@ -946,21 +928,16 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 stream_id,
                 payloads,
             };
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.number(count as f64)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.number(count as f64)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postStreamChunks)")
-                            } else {
-                                Ok(cx.number(0.0))
-                            }
-                        }
+            match send_with_backpressure(&tx, msg) {
+                SendOutcome::Sent => Ok(cx.number(count as f64)),
+                SendOutcome::Full => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime channel saturated (postStreamChunks)")
+                    } else {
+                        Ok(cx.number(0.0))
                     }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                SendOutcome::Closed => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunks)")
                     } else {
@@ -986,8 +963,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             let payload_js = cx.argument::<JsValue>(1)?;
             let payload = crate::bridge::neon_codec::from_neon_value(&mut cx, payload_js)?;
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postStreamChunksRaw)");
                 }
@@ -998,21 +974,16 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 stream_id: stream_id_num as u32,
                 payload,
             };
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postStreamChunksRaw)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
+            match send_with_backpressure(&tx, msg) {
+                SendOutcome::Sent => Ok(cx.boolean(true)),
+                SendOutcome::Full => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime channel saturated (postStreamChunksRaw)")
+                    } else {
+                        Ok(cx.boolean(false))
                     }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                SendOutcome::Closed => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamChunksRaw)")
                     } else {
@@ -1047,8 +1018,7 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 None
             };
 
-            let tx = deno_data_tx_for_worker(id2);
-            let Some(tx) = tx else {
+            let Some(tx) = data_tx(id2) else {
                 if strict_channel() {
                     return cx.throw_error("Runtime is closed (postStreamControl)");
                 }
@@ -1061,21 +1031,16 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
                 aux,
             };
 
-            match tx.try_send(msg) {
-                Ok(()) => Ok(cx.boolean(true)),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                    match tx.blocking_send(msg) {
-                        Ok(()) => Ok(cx.boolean(true)),
-                        Err(_) => {
-                            if strict_channel() {
-                                cx.throw_error("Runtime is closed (postStreamControl)")
-                            } else {
-                                Ok(cx.boolean(false))
-                            }
-                        }
+            match send_with_backpressure(&tx, msg) {
+                SendOutcome::Sent => Ok(cx.boolean(true)),
+                SendOutcome::Full => {
+                    if strict_channel() {
+                        cx.throw_error("Runtime channel saturated (postStreamControl)")
+                    } else {
+                        Ok(cx.boolean(false))
                     }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                SendOutcome::Closed => {
                     if strict_channel() {
                         cx.throw_error("Runtime is closed (postStreamControl)")
                     } else {
@@ -1347,6 +1312,21 @@ pub fn create_worker(mut cx: FunctionContext) -> JsResult<JsObject> {
             Ok(promise)
         })?;
         api.set(&mut cx, "evalModule", f)?;
+    }
+
+    // buildModuleEvalCjsSource(source): string
+    {
+        let f = JsFunction::new(&mut cx, move |mut cx| {
+            let source = cx.argument::<JsString>(0)?.value(&mut cx);
+            let transformed =
+                crate::worker::modules::DynamicModuleLoader::build_module_eval_cjs_source(&source)
+                    .ok_or_else(|| {
+                        cx.throw_error::<_, ()>("Failed to build module.eval CommonJS facade")
+                            .unwrap_err()
+                    })?;
+            Ok(cx.string(transformed))
+        })?;
+        api.set(&mut cx, "buildModuleEvalCjsSource", f)?;
     }
 
     // registerModule(moduleName, source): Promise<void>

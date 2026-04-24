@@ -21,8 +21,9 @@ use crate::worker::ops::{
     op_denojs_worker_env_set, op_denojs_worker_env_to_object, op_denojs_worker_host_call_async,
     op_denojs_worker_host_call_async_bin, op_denojs_worker_host_call_async_bin_mixed,
     op_denojs_worker_host_call_sync, op_denojs_worker_host_call_sync_bin,
-    op_denojs_worker_host_call_sync_bin_mixed, op_denojs_worker_post_message,
-    op_denojs_worker_post_message_bin, op_denojs_worker_stream_accept,
+    op_denojs_worker_host_call_sync_bin_mixed, op_denojs_worker_host_call_sync_raw,
+    op_denojs_worker_post_message, op_denojs_worker_post_message_bin,
+    op_denojs_worker_post_message_raw, op_denojs_worker_stream_accept,
     op_denojs_worker_stream_accept_async, op_denojs_worker_stream_discard,
     op_denojs_worker_stream_read, op_denojs_worker_stream_read_async,
     op_denojs_worker_stream_read_async_raw, op_denojs_worker_stream_read_raw,
@@ -67,8 +68,10 @@ extension!(
     deno_worker_extension,
     ops = [
         op_denojs_worker_post_message,
+        op_denojs_worker_post_message_raw,
         op_denojs_worker_post_message_bin,
         op_denojs_worker_host_call_sync,
+        op_denojs_worker_host_call_sync_raw,
         op_denojs_worker_host_call_sync_bin,
         op_denojs_worker_host_call_sync_bin_mixed,
         op_denojs_worker_host_call_async,
@@ -91,7 +94,7 @@ extension!(
     esm = ["src/worker/bootstrap.js", "src/shared/stream-envelope.ts",],
 );
 
-// Cfg items.
+// Reads string allow-list entries from a permissions field.
 fn cfg_items(v: &serde_json::Value) -> Option<Vec<String>> {
     v.as_array().map(|arr| {
         arr.iter()
@@ -100,7 +103,7 @@ fn cfg_items(v: &serde_json::Value) -> Option<Vec<String>> {
     })
 }
 
-// Applies perm field updates used by worker runtime lifecycle and thread orchestration.
+// Applies one Deno permission field, preserving Deno's true/list/false semantics.
 fn apply_perm_field(
     cfg: &serde_json::Value,
     key: &str,
@@ -129,7 +132,7 @@ fn apply_perm_field(
     });
 }
 
-// Permissions from limits.
+// Builds the Deno permissions container from normalized worker limits.
 fn permissions_from_limits(limits: &RuntimeLimits, root: &Path) -> PermissionsContainer {
     let desc_parser: std::sync::Arc<dyn PermissionDescriptorParser> =
         std::sync::Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
@@ -225,7 +228,7 @@ fn inspector_http_response(method: &str, path: &str, port: u16) -> (&'static str
     ("404 Not Found", r#"{"error":"not found"}"#.to_string())
 }
 
-// Parses http method path from input data and validates it for worker runtime lifecycle and thread orchestration.
+// Extracts the method and path from the first HTTP request line.
 fn parse_http_method_path(req: &str) -> (String, String) {
     let first_line = req.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
@@ -234,14 +237,14 @@ fn parse_http_method_path(req: &str) -> (String, String) {
     (method, path)
 }
 
-// Creates params from limits used by worker runtime lifecycle and thread orchestration.
+// Creates V8 isolate params only when the caller configured a heap limit.
 fn create_params_from_limits(limits: &RuntimeLimits) -> Option<deno_core::v8::CreateParams> {
     let max_mem = limits.max_memory_bytes?;
     let max_heap = usize::try_from(max_mem).unwrap_or(usize::MAX);
     Some(deno_core::v8::Isolate::create_params().heap_limits(0, max_heap))
 }
 
-// Emit startup warning.
+// Emits startup warnings both inside the worker console and to host stderr.
 fn emit_startup_warning(worker: &mut MainWorker, message: &str) {
     let msg_json = serde_json::to_string(message).unwrap_or_else(|_| "\"startup warning\"".into());
     let script = format!(
@@ -251,7 +254,7 @@ fn emit_startup_warning(worker: &mut MainWorker, message: &str) {
     eprintln!("[deno-director] {message}");
 }
 
-// Mark worker closed.
+// Marks the shared worker handle closed without requiring ownership of the runtime thread.
 fn mark_worker_closed(worker_id: usize) {
     if let Ok(map) = crate::WORKERS.read() {
         if let Some(w) = map.get(&worker_id) {
@@ -260,7 +263,7 @@ fn mark_worker_closed(worker_id: usize) {
     }
 }
 
-/// Spawns worker thread as part of worker runtime lifecycle and thread orchestration.
+/// Spawns the runtime thread and pumps control, data, and Node callback queues.
 pub fn spawn_worker_thread(
     worker_id: usize,
     limits: RuntimeLimits,
@@ -694,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    // Merges env snapshot overlays and filters invalid keys while preserving invariants required by worker runtime lifecycle and thread orchestration.
+    // Env overlays should replace/add valid keys while leaving invalid keys out.
     fn merge_env_snapshot_overlays_and_filters_invalid_keys() {
         let mut base = HashMap::new();
         base.insert("A".to_string(), "1".to_string());
@@ -724,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    // Applies perm field honors bool and list forms updates used by worker runtime lifecycle and thread orchestration.
+    // Permission fields accept true, false, or a string allow-list.
     fn apply_perm_field_honors_bool_and_list_forms() {
         let cfg = serde_json::json!({
             "read": true,
@@ -754,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    // Applies perm field ignores missing or non array non bool updates used by worker runtime lifecycle and thread orchestration.
+    // Invalid or missing permission fields leave existing destinations unchanged.
     fn apply_perm_field_ignores_missing_or_non_array_non_bool() {
         let cfg = serde_json::json!({
             "env": "invalid",
@@ -829,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    // Parses http method path extracts method and path from input data and validates it for worker runtime lifecycle and thread orchestration.
+    // The inspector shim only needs the method and path from the request line.
     fn parse_http_method_path_extracts_method_and_path() {
         let req = "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         let (method, path) = parse_http_method_path(req);
@@ -838,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    // Parses http method path handles invalid or empty requests from input data and validates it for worker runtime lifecycle and thread orchestration.
+    // Empty or malformed requests should fail closed into empty method/path.
     fn parse_http_method_path_handles_invalid_or_empty_requests() {
         let (m1, p1) = parse_http_method_path("");
         assert_eq!(m1, "");
@@ -856,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    // Creates params from limits only when max memory is set used by worker runtime lifecycle and thread orchestration.
+    // V8 heap params are absent unless maxMemoryBytes is configured.
     fn create_params_from_limits_only_when_max_memory_is_set() {
         let none = RuntimeLimits::default();
         assert!(create_params_from_limits(&none).is_none());

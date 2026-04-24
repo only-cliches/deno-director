@@ -35,6 +35,71 @@ function wireNum(tag: string): WireJson {
     return { __num: tag };
 }
 
+/** Emits the canonical buffer marker for fallback JS-side wire paths. */
+function encodeBufferWire(kind: string, u8: Uint8Array, length: number): WireJson {
+    const bytes = Array.from(u8);
+    return { __buffer: { kind, bytes, byteOffset: 0, length } };
+}
+
+function bufferViewBytesPerElement(kind: string): number {
+    switch (kind) {
+        case "Int8Array":
+        case "Uint8Array":
+        case "Uint8ClampedArray":
+        case "DataView":
+            return 1;
+        case "Int16Array":
+        case "Uint16Array":
+            return 2;
+        case "Int32Array":
+        case "Uint32Array":
+        case "Float32Array":
+            return 4;
+        case "Float64Array":
+        case "BigInt64Array":
+        case "BigUint64Array":
+            return 8;
+        default:
+            return 1;
+    }
+}
+
+function safeNonNegativeInt(value: number, fallback = 0): number {
+    return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function bufferViewWindow(kind: string, rawByteLength: number, byteOffset: number, length: number): { byteOffset: number; length: number } {
+    const requestedOffset = safeNonNegativeInt(byteOffset);
+    const requestedLength = safeNonNegativeInt(length);
+    if (kind === "ArrayBuffer" || kind === "SharedArrayBuffer") {
+        return { byteOffset: 0, length: Math.min(requestedLength || rawByteLength, rawByteLength) };
+    }
+
+    const bytesPerElement = bufferViewBytesPerElement(kind);
+    const spanBytes = requestedLength * bytesPerElement;
+
+    if (requestedOffset <= rawByteLength && requestedOffset + spanBytes <= rawByteLength) {
+        return { byteOffset: requestedOffset, length: requestedLength };
+    }
+
+    // Most bridge producers copy only the view bytes but may still carry the
+    // source buffer's byteOffset. Rebase those copied payloads onto offset 0.
+    if (spanBytes <= rawByteLength) {
+        return { byteOffset: 0, length: requestedLength };
+    }
+
+    const clampedOffset = Math.min(requestedOffset, rawByteLength);
+    const available = Math.max(0, rawByteLength - clampedOffset);
+    return { byteOffset: clampedOffset, length: Math.floor(available / bytesPerElement) };
+}
+
+function exactArrayBufferFromBytes(u8: Uint8Array): ArrayBuffer {
+    if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength && u8.buffer instanceof ArrayBuffer) {
+        return u8.buffer;
+    }
+    return u8.slice().buffer;
+}
+
 /** Fast check for plain acyclic JSON values that need no wire tags. */
 function isPlainJsonAcyclic(value: any): boolean {
     if (value === null) return true;
@@ -162,13 +227,13 @@ export function dehydrateForWire(value: any): WireJson {
         }
 
         if (typeof ArrayBuffer !== "undefined" && x instanceof ArrayBuffer) {
-            const bytes = Array.from(new Uint8Array(x));
-            return { __buffer: { kind: "ArrayBuffer", bytes, byteOffset: 0, length: bytes.length } };
+            const u8 = new Uint8Array(x);
+            return encodeBufferWire("ArrayBuffer", u8, u8.byteLength);
         }
 
         if (typeof SharedArrayBuffer !== "undefined" && x instanceof SharedArrayBuffer) {
-            const bytes = Array.from(new Uint8Array(x));
-            return { __buffer: { kind: "SharedArrayBuffer", bytes, byteOffset: 0, length: bytes.length } };
+            const u8 = new Uint8Array(x);
+            return encodeBufferWire("SharedArrayBuffer", u8, u8.byteLength);
         }
 
         if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(x)) {
@@ -180,8 +245,7 @@ export function dehydrateForWire(value: any): WireJson {
 
             try {
                 const u8 = new Uint8Array(x.buffer, byteOffset, byteLength);
-                const bytes = Array.from(u8);
-                return { __buffer: { kind, bytes, byteOffset: 0, length } };
+                return encodeBufferWire(kind, u8, length);
             } catch {
                 return wireUndef();
             }
@@ -239,7 +303,12 @@ export function dehydrateForWire(value: any): WireJson {
             }
 
             const out: any = {};
-            for (const [k, v] of Object.entries(x)) out[k] = inner(v, depth + 1);
+            for (const [k, v] of Object.entries(x)) {
+                // Keep prototype-mutation keys out of graph wrappers; the
+                // receiver also drops them during hydration.
+                if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+                out[k] = inner(v, depth + 1);
+            }
             return {
                 [GRAPH_ID_KEY]: graphId,
                 [GRAPH_KIND_KEY]: "object",
@@ -320,7 +389,9 @@ function bufferViewFromWire(obj: any): any {
 
     const u8 = new Uint8Array(bytes.map((n) => (typeof n === "number" ? n & 255 : 0)));
 
-    if (kind === "ArrayBuffer") return u8.buffer;
+    const ab = exactArrayBufferFromBytes(u8);
+
+    if (kind === "ArrayBuffer") return ab;
 
     if (kind === "SharedArrayBuffer") {
         if (typeof SharedArrayBuffer !== "undefined") {
@@ -328,14 +399,14 @@ function bufferViewFromWire(obj: any): any {
             new Uint8Array(sab).set(u8);
             return sab;
         }
-        return u8.buffer;
+        return ab;
     }
 
-    const ab = u8.buffer;
+    const view = bufferViewWindow(kind, u8.byteLength, byteOffset, length);
 
     if (kind === "DataView") {
         try {
-            return new DataView(ab, byteOffset, length);
+            return new DataView(ab, view.byteOffset, view.length);
         } catch {
             return undefined;
         }
@@ -344,14 +415,14 @@ function bufferViewFromWire(obj: any): any {
     const Ctor = (globalThis as any)[kind];
     if (typeof Ctor === "function") {
         try {
-            return new Ctor(ab, byteOffset, length);
+            return new Ctor(ab, view.byteOffset, view.length);
         } catch {
             // ignore
         }
     }
 
     try {
-        return new Uint8Array(ab, byteOffset, length);
+        return new Uint8Array(ab, view.byteOffset, view.length);
     } catch {
         return undefined;
     }

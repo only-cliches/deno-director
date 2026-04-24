@@ -1391,6 +1391,8 @@ export type NativeWorker = {
 
     /** Evaluate source as module and resolve module result/namespace. */
     evalModule?: <T = any>(src: string, options?: EvalOptions) => Promise<T>;
+    /** Build the CommonJS facade used by `module.eval(..., { cjs: true })`. */
+    buildModuleEvalCjsSource: (source: string) => string;
     registerModule?: (moduleName: string, source: string, options?: Pick<EvalOptions, "srcLoader">) => Promise<void>;
     clearModule?: (moduleName: string) => Promise<boolean>;
 

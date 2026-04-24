@@ -4,9 +4,10 @@ use crate::bridge::tags::{
     V8_KEY,
 };
 use crate::bridge::types::JsValueBridge;
+use base64::Engine;
 use bytes::Bytes;
 
-// Decodes special number tag from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+// Decodes non-JSON number markers emitted by the JS wire layer.
 fn decode_special_number_tag(tag: &str) -> Option<f64> {
     match tag {
         "NaN" => Some(f64::NAN),
@@ -16,17 +17,73 @@ fn decode_special_number_tag(tag: &str) -> Option<f64> {
     }
 }
 
-// Parses u8 array from input data and validates it for bridge encoding/decoding between Rust, V8, and Neon.
+// Parses byte arrays from JSON wire payloads. Numeric entries follow
+// Uint8Array-style modulo conversion so legacy producers with signed bytes
+// still decode to the same payload bytes.
 fn parse_u8_array(items: &[serde_json::Value]) -> Option<Bytes> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let n = item.as_u64()?;
-        out.push((n & 0xFF) as u8);
+        if let Some(n) = item.as_i64() {
+            out.push(n as u8);
+        } else if let Some(n) = item.as_u64() {
+            out.push((n & 0xFF) as u8);
+        } else {
+            return None;
+        }
     }
     Some(Bytes::from(out))
 }
 
-// Decodes error object from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+fn parse_base64_bytes(text: &str) -> Option<Bytes> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(text.as_bytes())
+        .ok()?;
+    Some(Bytes::from(decoded))
+}
+
+fn buffer_view_bytes_per_element(kind: &str) -> usize {
+    match kind {
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "DataView" => 1,
+        "Int16Array" | "Uint16Array" => 2,
+        "Int32Array" | "Uint32Array" | "Float32Array" => 4,
+        "Float64Array" | "BigInt64Array" | "BigUint64Array" => 8,
+        _ => 1,
+    }
+}
+
+fn buffer_view_window(
+    kind: &str,
+    raw_byte_len: usize,
+    byte_offset: usize,
+    length: usize,
+) -> Option<(usize, usize)> {
+    if matches!(kind, "ArrayBuffer" | "SharedArrayBuffer") {
+        return Some((0, length.min(raw_byte_len)));
+    }
+
+    let bytes_per_element = buffer_view_bytes_per_element(kind);
+    let span_bytes = length.checked_mul(bytes_per_element)?;
+
+    if byte_offset <= raw_byte_len {
+        if let Some(end) = byte_offset.checked_add(span_bytes) {
+            if end <= raw_byte_len {
+                return Some((byte_offset, length));
+            }
+        }
+    }
+
+    // Most producers copy just the view bytes but may still carry the source
+    // buffer's byteOffset. Rebase that copied payload onto offset 0.
+    if span_bytes <= raw_byte_len {
+        return Some((0, length));
+    }
+
+    let safe_offset = byte_offset.min(raw_byte_len);
+    let available = raw_byte_len.saturating_sub(safe_offset);
+    Some((safe_offset, available / bytes_per_element))
+}
+
+// Decodes Error markers from the canonical wire JSON format.
 fn decode_error_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<JsValueBridge> {
     if map.get(TYPE_KEY).and_then(|v| v.as_str()) != Some(TYPE_ERROR) {
         return None;
@@ -67,7 +124,7 @@ fn decode_error_object(map: &serde_json::Map<String, serde_json::Value>) -> Opti
     })
 }
 
-// Decodes host function object from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+// Decodes a host callback marker into the internal bridge representation.
 fn decode_host_function_object(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<JsValueBridge> {
@@ -82,7 +139,7 @@ fn decode_host_function_object(
     })
 }
 
-// Decodes buffer view object from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+// Decodes ArrayBuffer/view markers, accepting both byte arrays and compact base64 payloads.
 fn decode_buffer_view_object(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<Result<JsValueBridge, ()>> {
@@ -94,14 +151,24 @@ fn decode_buffer_view_object(
         .to_string();
     let byte_offset = obj.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let requested_length = obj.get("length").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let bytes_arr = obj.get("bytes").and_then(|v| v.as_array())?;
-    let Some(bytes) = parse_u8_array(bytes_arr) else {
+    let bytes = if let Some(bytes_arr) = obj.get("bytes").and_then(|v| v.as_array()) {
+        let Some(bytes) = parse_u8_array(bytes_arr) else {
+            return Some(Err(()));
+        };
+        bytes
+    } else if let Some(base64) = obj.get("base64").and_then(|v| v.as_str()) {
+        let Some(bytes) = parse_base64_bytes(base64) else {
+            return Some(Err(()));
+        };
+        bytes
+    } else {
         return Some(Err(()));
     };
-    // Never trust caller-supplied offset/length blindly; clamp to actual byte payload.
-    let safe_byte_offset = byte_offset.min(bytes.len());
-    let max_len = bytes.len().saturating_sub(safe_byte_offset);
-    let safe_length = requested_length.min(max_len);
+    let Some((safe_byte_offset, safe_length)) =
+        buffer_view_window(&kind, bytes.len(), byte_offset, requested_length)
+    else {
+        return Some(Err(()));
+    };
 
     Some(Ok(JsValueBridge::BufferView {
         kind,
@@ -111,7 +178,7 @@ fn decode_buffer_view_object(
     }))
 }
 
-// Decodes v8 serialized object from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+// Decodes Node/V8 structured-clone bytes carried by the wire JSON format.
 fn decode_v8_serialized_object(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<Result<JsValueBridge, ()>> {
@@ -122,7 +189,22 @@ fn decode_v8_serialized_object(
     Some(Ok(JsValueBridge::V8Serialized(bytes.to_vec())))
 }
 
-// Decodes map entries from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+fn decode_console_buffer_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Result<JsValueBridge, ()>> {
+    let bytes_arr = map.get("__denojs_worker_console_buffer")?.as_array()?;
+    let Some(bytes) = parse_u8_array(bytes_arr) else {
+        return Some(Err(()));
+    };
+    Some(Ok(JsValueBridge::BufferView {
+        kind: "Uint8Array".into(),
+        byte_offset: 0,
+        length: bytes.len(),
+        bytes,
+    }))
+}
+
+// Decodes map entries, ignoring malformed entries rather than rejecting the whole payload.
 fn decode_map_entries(items: &[serde_json::Value]) -> JsValueBridge {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -140,7 +222,7 @@ fn decode_map_entries(items: &[serde_json::Value]) -> JsValueBridge {
     JsValueBridge::Map(out)
 }
 
-// Decodes set items from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+// Decodes set items in their wire order.
 fn decode_set_items(items: &[serde_json::Value]) -> JsValueBridge {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -304,6 +386,13 @@ pub fn from_wire_json(v: serde_json::Value) -> JsValueBridge {
                 }
             }
 
+            if let Some(decoded) = decode_console_buffer_object(&map) {
+                match decoded {
+                    Ok(val) => return val,
+                    Err(()) => return JsValueBridge::Json(serde_json::Value::Object(map)),
+                }
+            }
+
             if let Some(arr) = map.get(MAP_KEY).and_then(|v| v.as_array()) {
                 return decode_map_entries(arr);
             }
@@ -357,7 +446,6 @@ mod tests {
     };
     use crate::bridge::types::JsValueBridge;
 
-    // Assert number eq.
     fn assert_number_eq(actual: f64, expected: f64) {
         if expected.is_nan() {
             assert!(actual.is_nan(), "expected NaN, got {}", actual);
@@ -374,7 +462,6 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    // Assert bridge eq.
     fn assert_bridge_eq(actual: JsValueBridge, expected: JsValueBridge) {
         match (actual, expected) {
             (JsValueBridge::Undefined, JsValueBridge::Undefined)
@@ -614,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    // Sets decoder preserves item order and types state used by bridge encoding/decoding between Rust, V8, and Neon.
+    // Set decoding preserves insertion order from the wire array.
     fn set_decoder_preserves_item_order_and_types() {
         let raw = serde_json::json!({
             SET_KEY: [null, true, "x", { NUMBER_KEY: "Infinity" }]
@@ -726,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes special number tag handles supported and unknown tags from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Unknown numeric markers are rejected instead of becoming arbitrary numbers.
     fn decode_special_number_tag_handles_supported_and_unknown_tags() {
         assert!(decode_special_number_tag("NaN").expect("NaN").is_nan());
         assert_eq!(decode_special_number_tag("Infinity"), Some(f64::INFINITY));
@@ -738,9 +825,10 @@ mod tests {
     }
 
     #[test]
-    // Parses u8 array parses and masks values from input data and validates it for bridge encoding/decoding between Rust, V8, and Neon.
+    // JSON byte arrays use typed-array masking semantics for out-of-range numbers.
     fn parse_u8_array_parses_and_masks_values() {
         let arr = vec![
+            serde_json::json!(-1),
             serde_json::json!(0),
             serde_json::json!(255),
             serde_json::json!(256),
@@ -748,12 +836,12 @@ mod tests {
         ];
         assert_eq!(
             parse_u8_array(&arr),
-            Some(bytes::Bytes::from(vec![0, 255, 0, 255]))
+            Some(bytes::Bytes::from(vec![255, 0, 255, 0, 255]))
         );
     }
 
     #[test]
-    // Parses u8 array rejects non numeric entries from input data and validates it for bridge encoding/decoding between Rust, V8, and Neon.
+    // Non-numeric byte entries make the whole payload malformed.
     fn parse_u8_array_rejects_non_numeric_entries() {
         let arr = vec![
             serde_json::json!(1),
@@ -764,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes error object parses error payloads from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Error markers carry optional stack/code/cause fields.
     fn decode_error_object_parses_error_payloads() {
         let map = serde_json::json!({
             TYPE_KEY: TYPE_ERROR,
@@ -791,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes host function object parses and defaults async from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Host function markers default to sync callbacks unless async is explicit.
     fn decode_host_function_object_parses_and_defaults_async() {
         let a = serde_json::json!({
             TYPE_KEY: TYPE_FUNCTION,
@@ -828,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes buffer view object parses valid payload from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Valid buffer markers preserve bytes and view metadata.
     fn decode_buffer_view_object_parses_valid_payload() {
         let map = serde_json::json!({
             BUFFER_KEY: {
@@ -851,6 +939,62 @@ mod tests {
                 bytes: bytes::Bytes::from(vec![1, 2, 255, 0]),
                 byte_offset: 0,
                 length: 4,
+            },
+        );
+    }
+
+    #[test]
+    // Base64 is the compact wire form for larger binary payloads.
+    fn decode_buffer_view_object_parses_base64_payload() {
+        let map = serde_json::json!({
+            BUFFER_KEY: {
+                "kind": "Uint8Array",
+                "base64": "AQID/wA=",
+                "byteOffset": 0,
+                "length": 5
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out = decode_buffer_view_object(&map)
+            .expect("tag")
+            .expect("decode");
+        assert_bridge_eq(
+            out,
+            JsValueBridge::BufferView {
+                kind: "Uint8Array".into(),
+                bytes: bytes::Bytes::from(vec![1, 2, 3, 255, 0]),
+                byte_offset: 0,
+                length: 5,
+            },
+        );
+    }
+
+    #[test]
+    // Sliced view payloads carry only view bytes, so stale source offsets must rebase to zero.
+    fn decode_buffer_view_object_rebases_sliced_view_offset() {
+        let map = serde_json::json!({
+            BUFFER_KEY: {
+                "kind": "Int16Array",
+                "bytes": [1, 0, 2, 0],
+                "byteOffset": 2,
+                "length": 2
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let out = decode_buffer_view_object(&map)
+            .expect("tag")
+            .expect("decode");
+        assert_bridge_eq(
+            out,
+            JsValueBridge::BufferView {
+                kind: "Int16Array".into(),
+                bytes: bytes::Bytes::from(vec![1, 0, 2, 0]),
+                byte_offset: 0,
+                length: 2,
             },
         );
     }
@@ -884,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes v8 serialized object parses valid payload from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Valid V8 markers preserve the serialized byte payload.
     fn decode_v8_serialized_object_parses_valid_payload() {
         let map = serde_json::json!({
             V8_KEY: [0, 255, 256]
@@ -899,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes buffer and v8 objects return error on invalid bytes from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Invalid byte payloads are reported to callers so they can fall back to plain JSON.
     fn decode_buffer_and_v8_objects_return_error_on_invalid_bytes() {
         let bad_buf = serde_json::json!({
             BUFFER_KEY: {
@@ -927,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes map entries skips invalid pairs from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Invalid map entries are skipped while valid pairs remain ordered.
     fn decode_map_entries_skips_invalid_pairs() {
         let out = decode_map_entries(&[
             serde_json::json!(["k", 1]),
@@ -945,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    // Decodes set items preserves order and value decoding from wire/serialized form for bridge encoding/decoding between Rust, V8, and Neon.
+    // Set decoding preserves wire order and recursively decodes tagged values.
     fn decode_set_items_preserves_order_and_value_decoding() {
         let out = decode_set_items(&[
             serde_json::json!(null),

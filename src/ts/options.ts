@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { dehydrateForWire } from "./wire";
 import type {
     DenoConsoleMethod,
     DenoWorkerOptions,
@@ -31,8 +30,8 @@ function nonEmptyTrimmed(v: unknown): string | undefined {
 /**
  * Sanitizes user-provided eval options before crossing the native boundary.
  *
- * This strips invalid fields and preserves binary views as raw payloads so
- * hot data paths avoid avoidable byte expansion.
+ * This strips invalid fields and leaves argument values raw so the native
+ * Rust bridge remains the canonical encoder.
  */
 export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undefined {
     if (!options) return undefined;
@@ -49,21 +48,7 @@ export function normalizeEvalOptions(options?: EvalOptions): EvalOptions | undef
         out.srcLoader = srcLoader;
     }
     if ("args" in options) {
-        out.args = Array.isArray(options.args)
-            ? options.args.map((a) => {
-                    if (typeof Buffer !== "undefined" && Buffer.isBuffer(a)) return a;
-                    if (typeof ArrayBuffer !== "undefined" && a instanceof ArrayBuffer) return a;
-                    if (typeof SharedArrayBuffer !== "undefined" && a instanceof SharedArrayBuffer) return a;
-                    if (
-                        typeof ArrayBuffer !== "undefined" &&
-                        typeof ArrayBuffer.isView === "function" &&
-                        ArrayBuffer.isView(a)
-                    ) {
-                        return a;
-                    }
-                    return dehydrateForWire(a);
-                })
-            : [];
+        out.args = Array.isArray(options.args) ? options.args : [];
     }
     if (typeof options.maxEvalMs === "number" && Number.isFinite(options.maxEvalMs) && options.maxEvalMs > 0) {
         out.maxEvalMs = options.maxEvalMs;

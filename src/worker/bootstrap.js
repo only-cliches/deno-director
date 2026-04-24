@@ -34,6 +34,11 @@ const coreOpSync =
 const coreOpAsync =
   coreApi && typeof coreApi.opAsync === "function" ? coreApi.opAsync.bind(coreApi) : null;
 
+const coreDeserialize =
+  coreApi && typeof coreApi.deserialize === "function"
+    ? coreApi.deserialize.bind(coreApi)
+    : null;
+
 function isThenable(x) {
   return x != null && (typeof x === "object" || typeof x === "function") && typeof x.then === "function";
 }
@@ -100,11 +105,14 @@ async function callCapturedAwait(captured, name, ...args) {
 // Unique op names to avoid collisions with built-in ops.
 const OP_HOST_CALL_SYNC = "op_denojs_worker_host_call_sync";
 const OP_HOST_CALL_ASYNC = "op_denojs_worker_host_call_async";
+const OP_HOST_CALL_SYNC_RAW = "op_denojs_worker_host_call_sync_raw";
+const OP_HOST_CALL_ASYNC_RAW = "op_denojs_worker_host_call_async_raw";
 const OP_HOST_CALL_SYNC_BIN = "op_denojs_worker_host_call_sync_bin";
 const OP_HOST_CALL_ASYNC_BIN = "op_denojs_worker_host_call_async_bin";
 const OP_HOST_CALL_SYNC_BIN_MIXED = "op_denojs_worker_host_call_sync_bin_mixed";
 const OP_HOST_CALL_ASYNC_BIN_MIXED = "op_denojs_worker_host_call_async_bin_mixed";
 const OP_POST_MESSAGE = "op_denojs_worker_post_message";
+const OP_POST_MESSAGE_RAW = "op_denojs_worker_post_message_raw";
 const OP_POST_MESSAGE_BIN = "op_denojs_worker_post_message_bin";
 const OP_ENV_GET = "op_denojs_worker_env_get";
 const OP_ENV_SET = "op_denojs_worker_env_set";
@@ -122,11 +130,14 @@ const OP_STREAM_DISCARD = "op_denojs_worker_stream_discard";
 // Capture stable references at bootstrap time.
 const CAP_HOST_CALL_SYNC = getOpEntry(OP_HOST_CALL_SYNC);
 const CAP_HOST_CALL_ASYNC = getOpEntry(OP_HOST_CALL_ASYNC);
+const CAP_HOST_CALL_SYNC_RAW = getOpEntry(OP_HOST_CALL_SYNC_RAW);
+const CAP_HOST_CALL_ASYNC_RAW = getOpEntry(OP_HOST_CALL_ASYNC_RAW);
 const CAP_HOST_CALL_SYNC_BIN = getOpEntry(OP_HOST_CALL_SYNC_BIN);
 const CAP_HOST_CALL_ASYNC_BIN = getOpEntry(OP_HOST_CALL_ASYNC_BIN);
 const CAP_HOST_CALL_SYNC_BIN_MIXED = getOpEntry(OP_HOST_CALL_SYNC_BIN_MIXED);
 const CAP_HOST_CALL_ASYNC_BIN_MIXED = getOpEntry(OP_HOST_CALL_ASYNC_BIN_MIXED);
 const CAP_POST_MESSAGE = getOpEntry(OP_POST_MESSAGE);
+const CAP_POST_MESSAGE_RAW = getOpEntry(OP_POST_MESSAGE_RAW);
 const CAP_POST_MESSAGE_BIN = getOpEntry(OP_POST_MESSAGE_BIN);
 const CAP_ENV_GET = getOpEntry(OP_ENV_GET);
 const CAP_ENV_SET = getOpEntry(OP_ENV_SET);
@@ -165,6 +176,112 @@ function wireNum(tag) {
   return { __num: tag };
 }
 
+const FORBIDDEN_PROTO_KEYS = new Set(["__proto__"]);
+const WIRE_MARKER_KEYS = new Set([
+  "__undef",
+  "__num",
+  "__denojs_worker_num",
+  "__date",
+  "__bigint",
+  "__regexp",
+  "__url",
+  "__urlSearchParams",
+  "__buffer",
+  "__map",
+  "__set",
+  "__denojs_worker_type",
+  "__denojs_worker_graph_id",
+  "__denojs_worker_graph_ref",
+  "__denojs_worker_graph_kind",
+  "__denojs_worker_graph_value",
+]);
+
+function encodeBufferWire(kind, u8, length) {
+  const bytes = Array.from(u8);
+  return { __buffer: { kind, bytes, byteOffset: 0, length } };
+}
+
+function bufferViewBytesPerElement(kind) {
+  switch (kind) {
+    case "Int8Array":
+    case "Uint8Array":
+    case "Uint8ClampedArray":
+    case "DataView":
+      return 1;
+    case "Int16Array":
+    case "Uint16Array":
+      return 2;
+    case "Int32Array":
+    case "Uint32Array":
+    case "Float32Array":
+      return 4;
+    case "Float64Array":
+    case "BigInt64Array":
+    case "BigUint64Array":
+      return 8;
+    default:
+      return 1;
+  }
+}
+
+function safeNonNegativeInt(value, fallback = 0) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function bufferViewWindow(kind, rawByteLength, byteOffset, length) {
+  const requestedOffset = safeNonNegativeInt(byteOffset);
+  const requestedLength = safeNonNegativeInt(length);
+  if (kind === "ArrayBuffer" || kind === "SharedArrayBuffer") {
+    return { byteOffset: 0, length: Math.min(requestedLength || rawByteLength, rawByteLength) };
+  }
+
+  const bytesPerElement = bufferViewBytesPerElement(kind);
+  const spanBytes = requestedLength * bytesPerElement;
+  if (requestedOffset <= rawByteLength && requestedOffset + spanBytes <= rawByteLength) {
+    return { byteOffset: requestedOffset, length: requestedLength };
+  }
+
+  // Most bridge producers copy only the view bytes but may still carry the
+  // source buffer's byteOffset. Rebase those copied payloads onto offset 0.
+  if (spanBytes <= rawByteLength) {
+    return { byteOffset: 0, length: requestedLength };
+  }
+
+  const clampedOffset = Math.min(requestedOffset, rawByteLength);
+  const available = Math.max(0, rawByteLength - clampedOffset);
+  return { byteOffset: clampedOffset, length: Math.floor(available / bytesPerElement) };
+}
+
+function exactArrayBufferFromBytes(u8) {
+  if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength && u8.buffer instanceof ArrayBuffer) {
+    return u8.buffer;
+  }
+  return u8.slice().buffer;
+}
+
+function parseWireByteArray(bytes) {
+  if (!Array.isArray(bytes)) return null;
+  const out = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i += 1) {
+    const n = bytes[i];
+    if (typeof n !== "number" || !Number.isFinite(n)) return null;
+    out[i] = n & 255;
+  }
+  return out;
+}
+
+function decodeV8SerializedWire(obj) {
+  if (!obj || typeof obj !== "object" || !Array.isArray(obj.__v8)) return null;
+  if (typeof coreDeserialize !== "function") return null;
+  const u8 = parseWireByteArray(obj.__v8);
+  if (!u8) return null;
+  try {
+    return coreDeserialize(u8);
+  } catch {
+    return null;
+  }
+}
+
 function isPlainJsonFast(value) {
   if (value === null) return true;
   const t = typeof value;
@@ -189,7 +306,7 @@ function isPlainJsonFast(value) {
   const entries = Object.entries(value);
   if (entries.length > 32) return false;
   for (const [k, v] of entries) {
-    if (k === "__proto__") return false;
+    if (FORBIDDEN_PROTO_KEYS.has(k) || WIRE_MARKER_KEYS.has(k)) return false;
     if (v === null) continue;
     const vt = typeof v;
     if (vt === "string" || vt === "boolean") continue;
@@ -250,13 +367,13 @@ function dehydrateAny(v) {
 
     // ArrayBuffer + TypedArrays + DataView
     if (typeof ArrayBuffer !== "undefined" && x instanceof ArrayBuffer) {
-      const bytes = Array.from(new Uint8Array(x));
-      return { __buffer: { kind: "ArrayBuffer", bytes, byteOffset: 0, length: bytes.length } };
+      const u8 = new Uint8Array(x);
+      return encodeBufferWire("ArrayBuffer", u8, u8.byteLength);
     }
 
     if (typeof SharedArrayBuffer !== "undefined" && x instanceof SharedArrayBuffer) {
-      const bytes = Array.from(new Uint8Array(x));
-      return { __buffer: { kind: "SharedArrayBuffer", bytes, byteOffset: 0, length: bytes.length } };
+      const u8 = new Uint8Array(x);
+      return encodeBufferWire("SharedArrayBuffer", u8, u8.byteLength);
     }
 
     if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(x)) {
@@ -272,8 +389,7 @@ function dehydrateAny(v) {
         return wireUndef();
       }
 
-      const bytes = Array.from(u8);
-      return { __buffer: { kind, bytes, byteOffset, length } };
+      return encodeBufferWire(kind, u8, length);
     }
 
     // Map/Set (primitive keys only)
@@ -337,7 +453,10 @@ function dehydrateAny(v) {
       }
 
       const out = {};
-      for (const [k, val] of Object.entries(x)) out[k] = inner(val, depth + 1);
+      for (const [k, val] of Object.entries(x)) {
+        if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
+        out[k] = inner(val, depth + 1);
+      }
       return {
         [GRAPH_ID_KEY]: id,
         [GRAPH_KIND_KEY]: "object",
@@ -449,6 +568,7 @@ function dehydrateConsoleAny(v) {
       }
       const out = {};
       for (const [k, val] of Object.entries(x)) {
+        if (FORBIDDEN_PROTO_KEYS.has(k)) continue;
         out[k] = inner(val, depth + 1);
       }
       return out;
@@ -481,7 +601,9 @@ function callHostFromConsole(fn, args) {
   const payloadArgs = dehydrateConsoleArgs(args);
 
   try {
-    return hostCallSync(id, payloadArgs);
+    // Console routing needs its custom JSON markers (for example binary/date handling)
+    // to go through the structured host-call path instead of the raw V8 fast path.
+    return hostCallSync(id, null, () => payloadArgs);
   } catch (e) {
     // Keep console routing low-latency by preferring sync dispatch.
     // If the callback returns a Promise, treat it as fire-and-forget.
@@ -522,6 +644,11 @@ function hostPostMessageImpl(msg) {
     const bin = asUint8ArrayForOp(msg);
     if (bin && CAP_POST_MESSAGE_BIN && CAP_POST_MESSAGE_BIN.kind !== "missing") {
       callCapturedRaw(CAP_POST_MESSAGE_BIN, OP_POST_MESSAGE_BIN, bin);
+      return undefined;
+    }
+
+    if (CAP_POST_MESSAGE_RAW && CAP_POST_MESSAGE_RAW.kind !== "missing") {
+      callCapturedRaw(CAP_POST_MESSAGE_RAW, OP_POST_MESSAGE_RAW, msg);
       return undefined;
     }
 
@@ -1733,7 +1860,7 @@ function handleHostReply(res) {
   throw globalThis.__hydrate(r.error);
 }
 
-async function hostCallAsync(funcId, payloadArgs, rawArgs) {
+async function hostCallAsync(funcId, rawArgs, getPayloadArgs) {
   if (Array.isArray(rawArgs) && rawArgs.length >= 1) {
     const maybeBin = asUint8ArrayForOp(rawArgs[0]);
     if (maybeBin) {
@@ -1746,21 +1873,33 @@ async function hostCallAsync(funcId, payloadArgs, rawArgs) {
         );
         return handleHostReply(res);
       }
+    }
 
-      if (rawArgs.length > 1 && CAP_HOST_CALL_ASYNC_BIN_MIXED && CAP_HOST_CALL_ASYNC_BIN_MIXED.kind !== "missing") {
-        const rest = dehydrateArgs(rawArgs.slice(1));
-        const res = await callCapturedAwait(
-          CAP_HOST_CALL_ASYNC_BIN_MIXED,
-          OP_HOST_CALL_ASYNC_BIN_MIXED,
-          funcId,
-          maybeBin,
-          rest
-        );
-        return handleHostReply(res);
-      }
+    if (CAP_HOST_CALL_ASYNC_RAW && CAP_HOST_CALL_ASYNC_RAW.kind !== "missing") {
+      const res = await callCapturedAwait(
+        CAP_HOST_CALL_ASYNC_RAW,
+        OP_HOST_CALL_ASYNC_RAW,
+        funcId,
+        rawArgs
+      );
+      return handleHostReply(res);
+    }
+
+    if (maybeBin && rawArgs.length > 1 && CAP_HOST_CALL_ASYNC_BIN_MIXED && CAP_HOST_CALL_ASYNC_BIN_MIXED.kind !== "missing") {
+      const payloadArgs = typeof getPayloadArgs === "function" ? getPayloadArgs() : [];
+      const rest = Array.isArray(payloadArgs) ? payloadArgs.slice(1) : [];
+      const res = await callCapturedAwait(
+        CAP_HOST_CALL_ASYNC_BIN_MIXED,
+        OP_HOST_CALL_ASYNC_BIN_MIXED,
+        funcId,
+        maybeBin,
+        rest
+      );
+      return handleHostReply(res);
     }
   }
 
+  const payloadArgs = typeof getPayloadArgs === "function" ? getPayloadArgs() : [];
   const res = await callCapturedAwait(
     CAP_HOST_CALL_ASYNC,
     OP_HOST_CALL_ASYNC,
@@ -1770,7 +1909,7 @@ async function hostCallAsync(funcId, payloadArgs, rawArgs) {
   return handleHostReply(res);
 }
 
-function hostCallSync(funcId, payloadArgs, rawArgs) {
+function hostCallSync(funcId, rawArgs, getPayloadArgs) {
   if (Array.isArray(rawArgs) && rawArgs.length >= 1) {
     const maybeBin = asUint8ArrayForOp(rawArgs[0]);
     if (maybeBin) {
@@ -1786,24 +1925,39 @@ function hostCallSync(funcId, payloadArgs, rawArgs) {
         }
         return handleHostReply(out);
       }
+    }
 
-      if (rawArgs.length > 1 && CAP_HOST_CALL_SYNC_BIN_MIXED && CAP_HOST_CALL_SYNC_BIN_MIXED.kind !== "missing") {
-        const rest = dehydrateArgs(rawArgs.slice(1));
-        const out = callCapturedRaw(
-          CAP_HOST_CALL_SYNC_BIN_MIXED,
-          OP_HOST_CALL_SYNC_BIN_MIXED,
-          funcId,
-          maybeBin,
-          rest
-        );
-        if (isThenable(out)) {
-          return out.then((res) => handleHostReply(res));
-        }
-        return handleHostReply(out);
+    if (CAP_HOST_CALL_SYNC_RAW && CAP_HOST_CALL_SYNC_RAW.kind !== "missing") {
+      const out = callCapturedRaw(
+        CAP_HOST_CALL_SYNC_RAW,
+        OP_HOST_CALL_SYNC_RAW,
+        funcId,
+        rawArgs
+      );
+      if (isThenable(out)) {
+        return out.then((res) => handleHostReply(res));
       }
+      return handleHostReply(out);
+    }
+
+    if (maybeBin && rawArgs.length > 1 && CAP_HOST_CALL_SYNC_BIN_MIXED && CAP_HOST_CALL_SYNC_BIN_MIXED.kind !== "missing") {
+      const payloadArgs = typeof getPayloadArgs === "function" ? getPayloadArgs() : [];
+      const rest = Array.isArray(payloadArgs) ? payloadArgs.slice(1) : [];
+      const out = callCapturedRaw(
+        CAP_HOST_CALL_SYNC_BIN_MIXED,
+        OP_HOST_CALL_SYNC_BIN_MIXED,
+        funcId,
+        maybeBin,
+        rest
+      );
+      if (isThenable(out)) {
+        return out.then((res) => handleHostReply(res));
+      }
+      return handleHostReply(out);
     }
   }
 
+  const payloadArgs = typeof getPayloadArgs === "function" ? getPayloadArgs() : [];
   const out = callCapturedRaw(CAP_HOST_CALL_SYNC, OP_HOST_CALL_SYNC, funcId, payloadArgs);
   if (isThenable(out)) {
     return out.then((res) => handleHostReply(res));
@@ -1884,43 +2038,48 @@ function bufferViewFromWire(obj) {
   const bytes = Array.isArray(b.bytes) ? b.bytes : [];
   const byteOffset = typeof b.byteOffset === "number" ? b.byteOffset : 0;
   const length = typeof b.length === "number" ? b.length : bytes.length;
-
   const u8 = new Uint8Array(bytes);
 
+  const ab = exactArrayBufferFromBytes(u8);
+
   if (kind === "ArrayBuffer") {
-    return u8.buffer;
+    return ab;
   }
   if (kind === "SharedArrayBuffer") {
-    return u8.buffer;
+    if (typeof SharedArrayBuffer !== "undefined") {
+      const sab = new SharedArrayBuffer(u8.byteLength);
+      new Uint8Array(sab).set(u8);
+      return sab;
+    }
+    return ab;
   }
 
-  const ab = u8.buffer;
+  const view = bufferViewWindow(kind, u8.byteLength, byteOffset, length);
 
-  function safeTyped(TypedCtor, bytesPerElem) {
+  function safeTyped(TypedCtor) {
     try {
-      const elemOffset = Math.floor(byteOffset / bytesPerElem);
-      return new TypedCtor(ab, elemOffset * bytesPerElem, length);
+      return new TypedCtor(ab, view.byteOffset, view.length);
     } catch {
       return null;
     }
   }
 
   switch (kind) {
-    case "Uint8Array": return safeTyped(Uint8Array, 1);
-    case "Uint8ClampedArray": return safeTyped(Uint8ClampedArray, 1);
-    case "Int8Array": return safeTyped(Int8Array, 1);
-    case "Uint16Array": return safeTyped(Uint16Array, 2);
-    case "Int16Array": return safeTyped(Int16Array, 2);
-    case "Uint32Array": return safeTyped(Uint32Array, 4);
-    case "Int32Array": return safeTyped(Int32Array, 4);
-    case "Float32Array": return safeTyped(Float32Array, 4);
-    case "Float64Array": return safeTyped(Float64Array, 8);
-    case "BigInt64Array": return typeof BigInt64Array !== "undefined" ? safeTyped(BigInt64Array, 8) : null;
-    case "BigUint64Array": return typeof BigUint64Array !== "undefined" ? safeTyped(BigUint64Array, 8) : null;
+    case "Uint8Array": return safeTyped(Uint8Array);
+    case "Uint8ClampedArray": return safeTyped(Uint8ClampedArray);
+    case "Int8Array": return safeTyped(Int8Array);
+    case "Uint16Array": return safeTyped(Uint16Array);
+    case "Int16Array": return safeTyped(Int16Array);
+    case "Uint32Array": return safeTyped(Uint32Array);
+    case "Int32Array": return safeTyped(Int32Array);
+    case "Float32Array": return safeTyped(Float32Array);
+    case "Float64Array": return safeTyped(Float64Array);
+    case "BigInt64Array": return typeof BigInt64Array !== "undefined" ? safeTyped(BigInt64Array) : null;
+    case "BigUint64Array": return typeof BigUint64Array !== "undefined" ? safeTyped(BigUint64Array) : null;
     case "DataView":
-      try { return new DataView(ab, byteOffset, length); } catch { return null; }
+      try { return new DataView(ab, view.byteOffset, view.length); } catch { return null; }
     default:
-      return safeTyped(Uint8Array, 1);
+      return safeTyped(Uint8Array);
   }
 }
 
@@ -2026,6 +2185,12 @@ function bufferViewFromWire(obj) {
         return undefined;
       }
 
+      if (vv.__v8 !== undefined) {
+        const decoded = decodeV8SerializedWire(vv);
+        if (decoded != null) return decoded;
+        return undefined;
+      }
+
       if (vv.__map !== undefined && Array.isArray(vv.__map)) {
         const m = new Map();
         for (const pair of vv.__map) {
@@ -2083,17 +2248,15 @@ function bufferViewFromWire(obj) {
         let fn;
         if (isAsync) {
           fn = async (...args) => {
-            const payloadArgs = dehydrateArgs(args);
-            return await hostCallAsync(id, payloadArgs, args);
+            return await hostCallAsync(id, args, () => dehydrateArgs(args));
           };
         } else {
           fn = (...args) => {
-            const payloadArgs = dehydrateArgs(args);
             try {
-              return hostCallSync(id, payloadArgs, args);
+              return hostCallSync(id, args, () => dehydrateArgs(args));
             } catch (e) {
               if (isSyncReturnedPromiseError(e)) {
-                return hostCallAsync(id, payloadArgs, args);
+                return hostCallAsync(id, args, () => dehydrateArgs(args));
               }
               throw e;
             }

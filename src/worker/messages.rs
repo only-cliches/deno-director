@@ -1,5 +1,6 @@
 use crate::bridge::promise::PromiseSettler;
 use crate::bridge::types::{EvalOptions, JsValueBridge};
+use bytes::Bytes;
 use tokio::sync::oneshot;
 
 #[derive(Debug, Clone)]
@@ -70,7 +71,7 @@ pub enum DenoMsg {
     },
     PostStreamChunkRawBin {
         stream_id: u32,
-        payload: Vec<u8>,
+        payload: Bytes,
         credit: Option<u32>,
     },
     PostStreamChunks {
@@ -108,7 +109,7 @@ pub enum DenoMsg {
 }
 
 impl DenoMsg {
-    /// Checks whether data plane and returns the boolean result for runtime bridge internals.
+    /// Returns true for high-volume messages that should use the data-plane queue.
     pub fn is_data_plane(&self) -> bool {
         matches!(
             self,

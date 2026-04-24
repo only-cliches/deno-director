@@ -117,13 +117,7 @@ pub async fn handle_deno_msg(
             kind,
             stream_id,
             aux,
-        } => handle_post_stream_control_msg(
-            worker,
-            kind,
-            stream_id,
-            aux,
-            use_native_stream_plane,
-        ),
+        } => handle_post_stream_control_msg(worker, kind, stream_id, aux, use_native_stream_plane),
         DenoMsg::SetGlobal {
             key,
             value,
@@ -164,18 +158,64 @@ pub async fn handle_deno_msg(
     }
 }
 
+fn buffer_view_bytes_per_element(kind: &str) -> usize {
+    match kind {
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "DataView" | "ArrayBuffer"
+        | "SharedArrayBuffer" => 1,
+        "Int16Array" | "Uint16Array" => 2,
+        "Int32Array" | "Uint32Array" | "Float32Array" => 4,
+        "Float64Array" | "BigInt64Array" | "BigUint64Array" => 8,
+        _ => 1,
+    }
+}
+
+fn buffer_view_window(
+    kind: &str,
+    raw_byte_len: usize,
+    byte_offset: usize,
+    length: usize,
+) -> Option<(usize, usize)> {
+    if matches!(kind, "ArrayBuffer" | "SharedArrayBuffer") {
+        return Some((0, length.min(raw_byte_len)));
+    }
+
+    let bytes_per_element = buffer_view_bytes_per_element(kind);
+    let span_bytes = length.checked_mul(bytes_per_element)?;
+    if byte_offset <= raw_byte_len {
+        if let Some(end) = byte_offset.checked_add(span_bytes) {
+            if end <= raw_byte_len {
+                return Some((byte_offset, length));
+            }
+        }
+    }
+
+    // Some bridge paths carry only the view bytes while retaining the original
+    // backing-buffer offset. Rebase those payloads before handing bytes to the
+    // stream plane.
+    if span_bytes <= raw_byte_len {
+        return Some((0, length));
+    }
+
+    let safe_offset = byte_offset.min(raw_byte_len);
+    let available = raw_byte_len.saturating_sub(safe_offset);
+    Some((safe_offset, available / bytes_per_element))
+}
+
 fn payload_to_chunk_bytes(payload: &JsValueBridge) -> Option<Bytes> {
     let JsValueBridge::BufferView {
+        kind,
         bytes,
         byte_offset,
         length,
-        ..
     } = payload
     else {
         return None;
     };
-    let start = (*byte_offset).min(bytes.len());
-    let end = start.checked_add(*length)?.min(bytes.len());
+    let (start, element_len) = buffer_view_window(kind, bytes.len(), *byte_offset, *length)?;
+    // BufferView.length is elements for typed arrays but bytes for DataView and
+    // ArrayBuffer. Stream transport always needs the byte span.
+    let byte_len = element_len.checked_mul(buffer_view_bytes_per_element(kind))?;
+    let end = start.checked_add(byte_len)?.min(bytes.len());
     Some(bytes.slice(start..end))
 }
 
@@ -534,9 +574,7 @@ fn handle_post_stream_chunks_msg(
         }
         let id_num = stream_id.parse::<u32>().unwrap_or(0);
         if id_num > 0 {
-            if use_native_stream_plane
-                && let Some(plane) = native_stream_plane(worker)
-            {
+            if use_native_stream_plane && let Some(plane) = native_stream_plane(worker) {
                 let (_, wake) = plane.push_vectorized_with_wake(id_num, Bytes::from(merged));
                 if wake {
                     let _ = dispatch_native_stream_poke(worker, id_num);
@@ -664,7 +702,7 @@ fn handle_post_stream_chunk_raw_msg(
 fn handle_post_stream_chunk_raw_bin_msg(
     worker: &mut MainWorker,
     stream_id: u32,
-    payload: Vec<u8>,
+    payload: Bytes,
     credit: Option<u32>,
     use_native_stream_plane: bool,
 ) -> bool {
@@ -675,11 +713,9 @@ fn handle_post_stream_chunk_raw_bin_msg(
             payload.len()
         );
     }
-    if use_native_stream_plane
-        && let Some(plane) = native_stream_plane(worker)
-    {
+    if use_native_stream_plane && let Some(plane) = native_stream_plane(worker) {
         let _ = credit;
-        let (_, wake) = plane.push_chunk_with_wake(stream_id, Bytes::from(payload));
+        let (_, wake) = plane.push_chunk_with_wake(stream_id, payload.clone());
         if wake {
             let _ = dispatch_native_stream_poke(worker, stream_id);
         }
@@ -702,7 +738,7 @@ fn handle_post_stream_chunk_raw_bin_msg(
         let ab = if payload.is_empty() {
             v8::ArrayBuffer::new(scope, 0)
         } else {
-            let bs = v8::ArrayBuffer::new_backing_store_from_vec(payload).make_shared();
+            let bs = v8::ArrayBuffer::new_backing_store_from_vec(payload.to_vec()).make_shared();
             v8::ArrayBuffer::with_backing_store(scope, &bs)
         };
         let Some(payload_val) =
@@ -790,9 +826,7 @@ fn handle_post_stream_control_msg(
     aux: Option<String>,
     use_native_stream_plane: bool,
 ) -> bool {
-    if use_native_stream_plane
-        && let Some(plane) = native_stream_plane(worker)
-    {
+    if use_native_stream_plane && let Some(plane) = native_stream_plane(worker) {
         let (handled, wake) = match kind.as_str() {
             "open" => {
                 let key = aux.as_deref().unwrap_or_default();
@@ -1147,7 +1181,7 @@ async fn handle_eval_msg(
     false
 }
 
-// Send node msg or reject.
+// Sends a Node message and rejects the attached promise if the Node side is gone.
 async fn send_node_msg_or_reject(node_tx: &mpsc::Sender<NodeMsg>, msg: NodeMsg) {
     // If node side is gone, reject pending promise instead of dropping silently.
     if let Err(send_err) = node_tx.send(msg).await {
@@ -1157,7 +1191,7 @@ async fn send_node_msg_or_reject(node_tx: &mpsc::Sender<NodeMsg>, msg: NodeMsg) 
     }
 }
 
-// Returns node tx from state used by runtime bridge internals.
+// Looks up the Node callback-thread sender for a live worker.
 fn get_node_tx(worker_id: usize) -> Option<mpsc::Sender<NodeMsg>> {
     crate::WORKERS
         .read()
@@ -1166,7 +1200,7 @@ fn get_node_tx(worker_id: usize) -> Option<mpsc::Sender<NodeMsg>> {
         .map(|w| w.node_tx.clone())
 }
 
-// Heap stats to json.
+// Converts V8 heap statistics into the public memory() result shape.
 fn heap_stats_to_json(stats: &v8::HeapStatistics) -> serde_json::Value {
     serde_json::json!({
         "totalHeapSize": stats.total_heap_size(),
@@ -1184,7 +1218,7 @@ fn heap_stats_to_json(stats: &v8::HeapStatistics) -> serde_json::Value {
     })
 }
 
-// Heap space stats to json.
+// Converts per-space V8 heap statistics into the public memory() result shape.
 fn heap_space_stats_to_json(isolate: &mut v8::Isolate) -> serde_json::Value {
     let count = isolate.number_of_heap_spaces();
     let mut out = Vec::with_capacity(count as usize);
@@ -1202,4 +1236,41 @@ fn heap_space_stats_to_json(isolate: &mut v8::Isolate) -> serde_json::Value {
     }
 
     serde_json::Value::Array(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::payload_to_chunk_bytes;
+    use crate::bridge::types::JsValueBridge;
+    use bytes::Bytes;
+
+    #[test]
+    fn payload_to_chunk_bytes_uses_typed_array_element_width() {
+        let payload = JsValueBridge::BufferView {
+            kind: "Int16Array".to_string(),
+            bytes: Bytes::from(vec![1, 0, 2, 0]),
+            byte_offset: 0,
+            length: 2,
+        };
+
+        assert_eq!(
+            payload_to_chunk_bytes(&payload).map(|b| b.to_vec()),
+            Some(vec![1, 0, 2, 0])
+        );
+    }
+
+    #[test]
+    fn payload_to_chunk_bytes_rebases_copied_sliced_views() {
+        let payload = JsValueBridge::BufferView {
+            kind: "Int16Array".to_string(),
+            bytes: Bytes::from(vec![22, 0, 33, 0]),
+            byte_offset: 2,
+            length: 2,
+        };
+
+        assert_eq!(
+            payload_to_chunk_bytes(&payload).map(|b| b.to_vec()),
+            Some(vec![22, 0, 33, 0])
+        );
+    }
 }

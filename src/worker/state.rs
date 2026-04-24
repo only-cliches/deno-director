@@ -1,5 +1,3 @@
-use crate::bridge::neon_codec::from_neon_value;
-use crate::bridge::types::JsValueBridge;
 use crate::worker::messages::{DenoMsg, ExecStats, NodeMsg};
 use crate::worker::stream_plane::NativeIncomingPlane;
 use neon::prelude::*;
@@ -14,27 +12,44 @@ use crate::bridge::promise::PromiseSettler;
 
 #[derive(Default)]
 pub struct PendingRequests {
-    // Monotonic request id source for pending Promise settlers.
+    // Last issued request id. Request ids are one-based so `0` can remain a
+    // sentinel in logs and wire payloads.
     next_id: AtomicU64,
     // In-flight request -> settler map. Drained on forced shutdown/restart.
     map: Mutex<HashMap<u64, PromiseSettler>>,
 }
 
 impl PendingRequests {
-    /// Insert.
+    fn next_request_id(&self) -> u64 {
+        let mut observed = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let next = observed.wrapping_add(1);
+            let next = if next == 0 { 1 } else { next };
+            match self.next_id.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    /// Stores a settler and returns the non-zero id used to match the runtime reply.
     pub fn insert(&self, settler: PromiseSettler) -> u64 {
-        // Never return 0 so "missing id" and "first id" are distinguishable in logs.
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let id = self.next_request_id();
         self.map.lock().unwrap().insert(id, settler);
         id
     }
 
-    /// Take.
+    /// Removes the settler for a completed request.
     pub fn take(&self, id: u64) -> Option<PromiseSettler> {
         self.map.lock().unwrap().remove(&id)
     }
 
-    /// Reject all.
+    /// Rejects and drains all in-flight requests during worker shutdown.
     pub fn reject_all(&self, message: &str) {
         let mut guard = self.map.lock().unwrap();
         let pending: Vec<_> = guard.drain().map(|(_, v)| v).collect();
@@ -45,7 +60,7 @@ impl PendingRequests {
         }
     }
 
-    /// Len.
+    /// Returns the number of unsettled requests.
     pub fn len(&self) -> usize {
         self.map.lock().unwrap().len()
     }
@@ -114,7 +129,7 @@ pub struct ModuleLoaderConfig {
 }
 
 impl Default for ModuleLoaderConfig {
-    // Provides default default values used by worker configuration/state parsing and runtime limits.
+    // Defaults keep network and Node-style resolution opt-in.
     fn default() -> Self {
         Self {
             https_resolve: false,
@@ -163,7 +178,7 @@ pub struct RuntimeLimits {
 }
 
 impl Default for RuntimeLimits {
-    // Returns default values used by worker option/state normalization.
+    // Defaults start with a local, script-only runtime and no extra permissions.
     fn default() -> Self {
         Self {
             max_memory_bytes: None,
@@ -201,9 +216,8 @@ pub struct WorkerCreateOptions {
     pub runtime_options: RuntimeLimits,
 }
 
-// Parses dotenv text strict from input data and validates it for worker configuration/state parsing and runtime limits.
+// Parses the supported dotenv subset used by `envFile`.
 fn parse_dotenv_text_strict(text: &str) -> Vec<(String, String)> {
-    // Unquote.
     fn unquote(s: &str) -> String {
         let ss = s.trim();
         if ss.len() >= 2 {
@@ -254,7 +268,7 @@ fn parse_dotenv_text_strict(text: &str) -> Vec<(String, String)> {
     out
 }
 
-// Resolves env path according to rules used by worker configuration/state parsing and runtime limits.
+// Resolves env file paths relative to the worker cwd while accepting file URLs.
 fn resolve_env_path(base_cwd: &Path, raw: &str) -> PathBuf {
     let s = raw.trim();
 
@@ -275,7 +289,7 @@ fn resolve_env_path(base_cwd: &Path, raw: &str) -> PathBuf {
     }
 }
 
-// Canonicalize or lexical.
+// Canonicalizes existing paths and falls back to lexical normalization for paths not yet created.
 fn canonicalize_or_lexical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| crate::worker::filesystem::normalize_lexical_path(path))
@@ -289,14 +303,14 @@ fn default_internal_cwd() -> PathBuf {
         .join(format!("w-{}", uuid::Uuid::new_v4()))
 }
 
-// Checks whether base dir and returns the boolean result for worker configuration/state parsing and runtime limits.
+// Enforces env-file sandboxing against normalized absolute paths.
 fn within_base_dir(base_dir: &Path, candidate: &Path) -> bool {
     let base_abs = canonicalize_or_lexical(base_dir);
     let cand_abs = canonicalize_or_lexical(candidate);
     cand_abs.starts_with(&base_abs)
 }
 
-// Env map from js object.
+// Converts a JSON object into process env entries, dropping invalid keys and non-string values.
 fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Some(map) = j.as_object() else {
@@ -315,7 +329,38 @@ fn env_map_from_js_object(j: &serde_json::Value) -> HashMap<String, String> {
     out
 }
 
-// Parses ts compiler config from input data and validates it for worker configuration/state parsing and runtime limits.
+// Best-effort JSON parse for plain JS option payloads crossing the Neon boundary.
+fn json_from_neon_value<'a>(
+    cx: &mut FunctionContext<'a>,
+    value: Handle<'a, JsValue>,
+) -> Option<serde_json::Value> {
+    if value.is_a::<JsUndefined, _>(cx) {
+        return None;
+    }
+    if value.is_a::<JsNull, _>(cx) {
+        return Some(serde_json::Value::Null);
+    }
+    if let Ok(b) = value.downcast::<JsBoolean, _>(cx) {
+        return Some(serde_json::Value::Bool(b.value(cx)));
+    }
+    if let Ok(n) = value.downcast::<JsNumber, _>(cx) {
+        return serde_json::Number::from_f64(n.value(cx)).map(serde_json::Value::Number);
+    }
+    if let Ok(s) = value.downcast::<JsString, _>(cx) {
+        return Some(serde_json::Value::String(s.value(cx)));
+    }
+
+    let global_json = cx.global::<JsObject>("JSON").ok()?;
+    let stringify = global_json.get::<JsFunction, _, _>(cx, "stringify").ok()?;
+    let out = stringify.call(cx, global_json, &[value]).ok()?;
+    if out.is_a::<JsUndefined, _>(cx) {
+        return None;
+    }
+    let text = out.downcast::<JsString, _>(cx).ok()?.value(cx);
+    serde_json::from_str(&text).ok()
+}
+
+// Parses optional TypeScript compiler settings accepted by moduleLoader.
 fn parse_ts_compiler_config<'a>(
     cx: &mut FunctionContext<'a>,
     tco: Handle<'a, JsObject>,
@@ -411,7 +456,7 @@ fn expand_permissions_shorthand(value: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
-// Ensure env permission enabled.
+// Ensures configured env values are readable by the runtime permission policy.
 fn ensure_env_permission_enabled(
     permissions: Option<serde_json::Value>,
     env_keys: Option<&HashMap<String, String>>,
@@ -488,7 +533,7 @@ fn ensure_env_permission_enabled(
     (Some(serde_json::Value::Object(out)), warnings)
 }
 
-// Checks whether `permissions.run` enables subprocess execution.
+// Returns true when runtime permissions allow subprocess execution.
 fn run_permission_enabled(permissions: Option<&serde_json::Value>) -> bool {
     if permissions == Some(&serde_json::Value::Bool(true)) {
         return true;
@@ -507,7 +552,7 @@ fn run_permission_enabled(permissions: Option<&serde_json::Value>) -> bool {
     }
 }
 
-// Checks whether `permissions.hrtime` enables high-resolution timing.
+// Returns true when runtime permissions allow high-resolution timers.
 fn hrtime_permission_enabled(permissions: Option<&serde_json::Value>) -> bool {
     if permissions == Some(&serde_json::Value::Bool(true)) {
         return true;
@@ -521,8 +566,47 @@ fn hrtime_permission_enabled(permissions: Option<&serde_json::Value>) -> bool {
     matches!(hrtime, serde_json::Value::Bool(true))
 }
 
+// Reads a boolean option field, ignoring values of other JS types.
+fn get_bool_prop<'a>(
+    cx: &mut FunctionContext<'a>,
+    obj: Handle<'a, JsObject>,
+    key: &str,
+) -> Option<bool> {
+    let v = obj.get::<JsValue, _, _>(cx, key).ok()?;
+    let b = v.downcast::<JsBoolean, _>(cx).ok()?;
+    Some(b.value(cx))
+}
+
+// Reads a finite numeric option field, ignoring NaN and infinities.
+fn get_number_prop<'a>(
+    cx: &mut FunctionContext<'a>,
+    obj: Handle<'a, JsObject>,
+    key: &str,
+) -> Option<f64> {
+    let v = obj.get::<JsValue, _, _>(cx, key).ok()?;
+    let n = v.downcast::<JsNumber, _>(cx).ok()?;
+    let out = n.value(cx);
+    if out.is_finite() { Some(out) } else { None }
+}
+
+// Reads a string option field and treats blank strings as absent.
+fn get_trimmed_string_prop<'a>(
+    cx: &mut FunctionContext<'a>,
+    obj: Handle<'a, JsObject>,
+    key: &str,
+) -> Option<String> {
+    let v = obj.get::<JsValue, _, _>(cx, key).ok()?;
+    let s = v.downcast::<JsString, _>(cx).ok()?.value(cx);
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 impl WorkerCreateOptions {
-    /// Constructs neon from source input for worker configuration/state parsing and runtime limits.
+    /// Parses worker creation options from the JavaScript constructor argument.
     pub fn from_neon<'a>(cx: &mut FunctionContext<'a>, idx: i32) -> Result<Self, Throw> {
         let mut out = Self {
             channel_size: 2048,
@@ -589,14 +673,12 @@ impl WorkerCreateOptions {
         // `permissions`.
         if let Ok(v) = obj.get::<JsValue, _, _>(cx, "permissions") {
             if !v.is_a::<JsNull, _>(cx) && !v.is_a::<JsUndefined, _>(cx) {
-                if let Ok(bridged) = from_neon_value(cx, v) {
-                    if let JsValueBridge::Json(j) = bridged {
-                        let j = expand_permissions_shorthand(j);
-                        if let Some(w) = j.get("wasm").and_then(|v| v.as_bool()) {
-                            out.runtime_options.wasm = w;
-                        }
-                        out.runtime_options.permissions = Some(j);
+                if let Some(j) = json_from_neon_value(cx, v) {
+                    let j = expand_permissions_shorthand(j);
+                    if let Some(w) = j.get("wasm").and_then(|v| v.as_bool()) {
+                        out.runtime_options.wasm = w;
                     }
+                    out.runtime_options.permissions = Some(j);
                 }
             }
         }
@@ -772,11 +854,9 @@ impl WorkerCreateOptions {
                     let map = load_dotenv_file_strict(cx, &path)?;
                     out.runtime_options.env = Some(EnvConfig::Map(map));
                 }
-            } else if let Ok(bridged) = from_neon_value(cx, v) {
-                if let JsValueBridge::Json(j) = bridged {
-                    let map = env_map_from_js_object(&j);
-                    out.runtime_options.env = Some(EnvConfig::Map(map));
-                }
+            } else if let Some(j) = json_from_neon_value(cx, v) {
+                let map = env_map_from_js_object(&j);
+                out.runtime_options.env = Some(EnvConfig::Map(map));
             }
         }
 
@@ -793,34 +873,13 @@ impl WorkerCreateOptions {
                     });
                 }
             } else if let Ok(o) = v.downcast::<JsObject, _>(cx) {
-                let mut host = "127.0.0.1".to_string();
-                let mut port: u16 = 9229;
-                let mut brk = false;
-
-                if let Ok(hv) = o.get::<JsValue, _, _>(cx, "host") {
-                    if let Ok(hs) = hv.downcast::<JsString, _>(cx) {
-                        let raw = hs.value(cx);
-                        let trimmed = raw.trim();
-                        if !trimmed.is_empty() {
-                            host = trimmed.to_string();
-                        }
-                    }
-                }
-
-                if let Ok(pv) = o.get::<JsValue, _, _>(cx, "port") {
-                    if let Ok(pn) = pv.downcast::<JsNumber, _>(cx) {
-                        let n = pn.value(cx);
-                        if n.is_finite() && n >= 0.0 && n <= 65535.0 {
-                            port = n as u16;
-                        }
-                    }
-                }
-
-                if let Ok(bv) = o.get::<JsValue, _, _>(cx, "break") {
-                    if let Ok(bb) = bv.downcast::<JsBoolean, _>(cx) {
-                        brk = bb.value(cx);
-                    }
-                }
+                let host = get_trimmed_string_prop(cx, o, "host")
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = get_number_prop(cx, o, "port")
+                    .filter(|n| *n >= 0.0 && *n <= 65535.0)
+                    .map(|n| n as u16)
+                    .unwrap_or(9229);
+                let brk = get_bool_prop(cx, o, "break").unwrap_or(false);
 
                 out.runtime_options.inspect = Some(InspectConfig {
                     host,
@@ -844,53 +903,26 @@ impl WorkerCreateOptions {
             if let Ok(o) = v.downcast::<JsObject, _>(cx) {
                 let mut cfg = ModuleLoaderConfig::default();
 
-                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "httpsResolve") {
-                    if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
-                        cfg.https_resolve = rb.value(cx);
-                    }
+                if let Some(v) = get_bool_prop(cx, o, "httpsResolve") {
+                    cfg.https_resolve = v;
                 }
-
-                if let Ok(hv) = o.get::<JsValue, _, _>(cx, "httpResolve") {
-                    if let Ok(hb) = hv.downcast::<JsBoolean, _>(cx) {
-                        cfg.http_resolve = hb.value(cx);
-                    }
+                if let Some(v) = get_bool_prop(cx, o, "httpResolve") {
+                    cfg.http_resolve = v;
                 }
-
-                if let Ok(jv) = o.get::<JsValue, _, _>(cx, "jsrResolve") {
-                    if let Ok(jb) = jv.downcast::<JsBoolean, _>(cx) {
-                        cfg.jsr_resolve = jb.value(cx);
-                    }
+                if let Some(v) = get_bool_prop(cx, o, "jsrResolve") {
+                    cfg.jsr_resolve = v;
                 }
-
-                if let Ok(av) = o.get::<JsValue, _, _>(cx, "allowOutsideCwd") {
-                    if let Ok(ab) = av.downcast::<JsBoolean, _>(cx) {
-                        cfg.allow_outside_cwd = ab.value(cx);
-                    }
+                if let Some(v) = get_bool_prop(cx, o, "allowOutsideCwd") {
+                    cfg.allow_outside_cwd = v;
                 }
-
-                if let Ok(cv) = o.get::<JsValue, _, _>(cx, "cacheDir") {
-                    if let Ok(cs) = cv.downcast::<JsString, _>(cx) {
-                        let s = cs.value(cx);
-                        let t = s.trim();
-                        if !t.is_empty() {
-                            cfg.cache_dir = Some(t.to_string());
-                        }
-                    }
+                if let Some(v) = get_trimmed_string_prop(cx, o, "cacheDir") {
+                    cfg.cache_dir = Some(v);
                 }
-
-                if let Ok(rv) = o.get::<JsValue, _, _>(cx, "reload") {
-                    if let Ok(rb) = rv.downcast::<JsBoolean, _>(cx) {
-                        cfg.reload = rb.value(cx);
-                    }
+                if let Some(v) = get_bool_prop(cx, o, "reload") {
+                    cfg.reload = v;
                 }
-
-                if let Ok(mv) = o.get::<JsValue, _, _>(cx, "maxPayloadBytes") {
-                    if let Ok(mn) = mv.downcast::<JsNumber, _>(cx) {
-                        let n = mn.value(cx);
-                        if n.is_finite() {
-                            cfg.max_payload_bytes = n as i64;
-                        }
-                    }
+                if let Some(v) = get_number_prop(cx, o, "maxPayloadBytes") {
+                    cfg.max_payload_bytes = v as i64;
                 }
 
                 out.runtime_options.module_loader = Some(cfg);
@@ -997,10 +1029,8 @@ impl WorkerCreateOptions {
                                     .and_then(|f| f.downcast::<JsString, _>(cx).ok())
                                     .map(|s| s.value(cx))
                                     .unwrap_or_default();
-                                cfg.cjs_force_paths.push(CjsForcePathRule::Regex {
-                                    source,
-                                    flags,
-                                });
+                                cfg.cjs_force_paths
+                                    .push(CjsForcePathRule::Regex { source, flags });
                             }
                         }
                     }
@@ -1025,8 +1055,11 @@ impl WorkerCreateOptions {
         let env_keys = out.runtime_options.env.as_ref().and_then(|cfg| match cfg {
             EnvConfig::Map(map) => Some(map),
         });
-        let (permissions, env_warnings) =
-            ensure_env_permission_enabled(out.runtime_options.permissions.take(), env_keys, env_enabled);
+        let (permissions, env_warnings) = ensure_env_permission_enabled(
+            out.runtime_options.permissions.take(),
+            env_keys,
+            env_enabled,
+        );
         out.runtime_options.permissions = permissions;
         out.runtime_options.startup_warnings.extend(env_warnings);
         if run_permission_enabled(out.runtime_options.permissions.as_ref()) {
@@ -1072,13 +1105,12 @@ impl WorkerCreateOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_env_permission_enabled, hrtime_permission_enabled, run_permission_enabled,
-        within_base_dir,
+        PendingRequests, ensure_env_permission_enabled, hrtime_permission_enabled,
+        run_permission_enabled, within_base_dir,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    // Env map.
     fn env_map(keys: &[&str]) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for k in keys {
@@ -1088,7 +1120,15 @@ mod tests {
     }
 
     #[test]
-    // Ensure env permission enabled keeps permissions when env not configured.
+    fn pending_request_ids_are_one_based_and_unique() {
+        let pending = PendingRequests::default();
+        assert_eq!(pending.next_request_id(), 1);
+        assert_eq!(pending.next_request_id(), 2);
+        assert_eq!(pending.next_request_id(), 3);
+    }
+
+    #[test]
+    // No env configuration means permissions should be left untouched.
     fn ensure_env_permission_enabled_keeps_permissions_when_env_not_configured() {
         let original = Some(serde_json::json!({ "read": true, "env": false }));
         let (out, warnings) = ensure_env_permission_enabled(original.clone(), None, false);
@@ -1097,11 +1137,14 @@ mod tests {
     }
 
     #[test]
-    // Ensure env permission enabled sets env allow list when missing.
+    // Configured env keys become the minimum readable allow-list.
     fn ensure_env_permission_enabled_sets_env_allow_list_when_missing() {
         let env = env_map(&["A", "B"]);
-        let (out, warnings) =
-            ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), Some(&env), false);
+        let (out, warnings) = ensure_env_permission_enabled(
+            Some(serde_json::json!({ "read": true })),
+            Some(&env),
+            false,
+        );
         let obj = out.expect("permissions");
         let env_val = obj
             .as_object()
@@ -1113,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    // Ensure env permission enabled keeps existing env allow list.
+    // Existing allow-lists are not widened implicitly.
     fn ensure_env_permission_enabled_keeps_existing_env_allow_list() {
         let env = env_map(&["A", "B"]);
         let (out, warnings) = ensure_env_permission_enabled(
@@ -1130,17 +1173,20 @@ mod tests {
     }
 
     #[test]
-    // Ensure env permission enabled keeps env false and warns.
+    // Explicit env denial wins, but callers get a startup warning.
     fn ensure_env_permission_enabled_keeps_env_false_and_warns() {
         let env = env_map(&["A"]);
-        let (out, warnings) =
-            ensure_env_permission_enabled(Some(serde_json::json!({ "env": false })), Some(&env), false);
+        let (out, warnings) = ensure_env_permission_enabled(
+            Some(serde_json::json!({ "env": false })),
+            Some(&env),
+            false,
+        );
         assert_eq!(out, Some(serde_json::json!({ "env": false })));
         assert_eq!(warnings.len(), 1);
     }
 
     #[test]
-    // Ensure shorthand permissions=true expands to allow-all semantics.
+    // Shorthand permissions=true expands before env-specific checks.
     fn ensure_env_permission_enabled_expands_permissions_true_shorthand() {
         let env = env_map(&["A"]);
         let (out, warnings) =
@@ -1154,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    // Ensure explicit env enable sets permissions.env=true when missing.
+    // Explicit env API enablement grants env read permission when absent.
     fn ensure_env_permission_enabled_sets_env_true_for_explicit_enable() {
         let (out, warnings) =
             ensure_env_permission_enabled(Some(serde_json::json!({ "read": true })), None, true);
@@ -1163,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    // Checks whether permissions run enables subprocess execution.
+    // Boolean true and non-empty allow lists both enable subprocess execution.
     fn run_permission_enabled_detects_supported_forms() {
         assert!(run_permission_enabled(Some(&serde_json::Value::Bool(true))));
         assert!(run_permission_enabled(Some(
@@ -1185,9 +1231,11 @@ mod tests {
     }
 
     #[test]
-    // Checks whether permissions hrtime enables high-resolution timing.
+    // Only global true or explicit `hrtime: true` enables high-resolution timing.
     fn hrtime_permission_enabled_detects_supported_forms() {
-        assert!(hrtime_permission_enabled(Some(&serde_json::Value::Bool(true))));
+        assert!(hrtime_permission_enabled(Some(&serde_json::Value::Bool(
+            true
+        ))));
         assert!(hrtime_permission_enabled(Some(
             &serde_json::json!({ "hrtime": true })
         )));
@@ -1197,12 +1245,14 @@ mod tests {
         assert!(!hrtime_permission_enabled(Some(
             &serde_json::json!({ "read": true })
         )));
-        assert!(!hrtime_permission_enabled(Some(&serde_json::Value::Bool(false))));
+        assert!(!hrtime_permission_enabled(Some(&serde_json::Value::Bool(
+            false
+        ))));
         assert!(!hrtime_permission_enabled(None));
     }
 
     #[test]
-    // Checks whether base dir rejects parent escape and returns the boolean result for worker configuration/state parsing and runtime limits.
+    // Parent traversal must not escape the configured base directory.
     fn within_base_dir_rejects_parent_escape() {
         let base = if cfg!(windows) {
             PathBuf::from(r"C:\tmp\deno-director-sandbox")
@@ -1225,7 +1275,7 @@ pub enum ImportsPolicy {
 }
 
 impl Default for ImportsPolicy {
-    // Provides default default values used by worker configuration/state parsing and runtime limits.
+    // Imports are denied unless the caller opts into disk or callback loading.
     fn default() -> Self {
         ImportsPolicy::DenyAll
     }
@@ -1251,7 +1301,7 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    /// Creates a new instance initialized for worker option/state normalization.
+    /// Creates the worker handle plus its control, data, and Node callback queues.
     pub fn new(
         id: usize,
         channel: Channel,
@@ -1285,7 +1335,7 @@ impl WorkerHandle {
         (handle, deno_rx, deno_data_rx, node_rx)
     }
 
-    /// Registers global fn in shared state used by worker configuration/state parsing and runtime limits.
+    /// Stores a rooted host callback and returns the id exposed to the worker runtime.
     pub fn register_global_fn(&mut self, root: Root<JsFunction>) -> usize {
         let id = self.host_functions.len();
         self.host_functions.push(Arc::new(root));

@@ -11,6 +11,12 @@ import { wrapModuleNamespace } from "./module-namespace";
 import { buildImportModuleSource } from "./module-source";
 import { coerceMemoryPayload, normalizeEvalOptions, normalizeWorkerOptions } from "./options";
 import {
+    HANDLE_RUNTIME_CALL_SOURCE,
+    HANDLE_RUNTIME_INSTALL_SOURCE,
+    HANDLE_RUNTIME_KEY,
+    HANDLE_RUNTIME_RUN_SOURCE,
+} from "./handle-runtime";
+import {
     STREAM_BRIDGE_TAG as STREAM_BRIDGE_TAG_RAW,
     STREAM_CHUNK_MAGIC,
     STREAM_FRAME_TYPE_TO_CODE,
@@ -18,7 +24,7 @@ import {
     encodeStreamFrameEnvelope,
     STREAM_TYPED_CHUNK_PREFIX as STREAM_TYPED_CHUNK_PREFIX_RAW,
 } from "../shared/stream-envelope";
-import { dehydrateForWire, hydrateFromWire } from "./wire";
+import { hydrateFromWire } from "./wire";
 import type {
     DenoWorkerCpuOptions,
     DenoWorkerCpuStats,
@@ -130,357 +136,6 @@ const WIRE_MARKER_KEY_SET = new Set([
     "__denojs_worker_graph_kind",
     "__denojs_worker_graph_value",
 ]);
-const HANDLE_RUNTIME_KEY = "__denojs_worker_handle_v1";
-const HANDLE_RUNTIME_INSTALL_SOURCE = `var $args = globalThis.$args ?? [];
-(() => {
-    const mkErr = (code, message) => {
-        const e = new Error(message);
-        e.code = code;
-        throw e;
-    };
-
-    const existing = globalThis.${HANDLE_RUNTIME_KEY};
-    if (existing) {
-        if (existing.__denojs_worker_handle_api_v1 === true) return true;
-        mkErr("HANDLE_BRIDGE_TAMPERED", "Handle runtime bridge key is already occupied by incompatible value");
-    }
-
-    const reg = new Map();
-    const splitPath = (path) => {
-        if (path == null || path === "") return [];
-        if (typeof path !== "string") mkErr("HANDLE_PATH_INVALID", "Handle path must be a string");
-        const segs = path.split(".").map((s) => s.trim());
-        if (segs.length === 0 || segs.some((s) => !s)) {
-            mkErr("HANDLE_PATH_INVALID", \`Invalid handle path: \${String(path)}\`);
-        }
-        if (segs.some((s) => s === "__proto__" || s === "prototype" || s === "constructor")) {
-            mkErr("HANDLE_PATH_FORBIDDEN", "Path contains forbidden prototype mutation segment");
-        }
-        return segs;
-    };
-    const mustObjectLike = (v, path) => {
-        const t = typeof v;
-        if (v == null || (t !== "object" && t !== "function")) {
-            mkErr("HANDLE_PATH_INVALID", \`Cannot traverse handle path '\${path}'\`);
-        }
-    };
-    const hasOwnOrProto = (obj, key) => key in Object(obj);
-    const resolve = (base, path) => {
-        const segs = splitPath(path);
-        let cur = base;
-        for (const seg of segs) {
-            mustObjectLike(cur, path);
-            cur = cur[seg];
-        }
-        return cur;
-    };
-    const resolveWithExistence = (base, path) => {
-        const segs = splitPath(path);
-        let cur = base;
-        for (const seg of segs) {
-            mustObjectLike(cur, path);
-            if (!hasOwnOrProto(cur, seg)) return { exists: false, value: undefined };
-            cur = cur[seg];
-        }
-        return { exists: true, value: cur };
-    };
-    const resolveParent = (base, path) => {
-        const segs = splitPath(path);
-        if (segs.length === 0) mkErr("HANDLE_PATH_INVALID", "Handle set/call path cannot be empty");
-        let cur = base;
-        for (let i = 0; i < segs.length - 1; i += 1) {
-            const seg = segs[i];
-            mustObjectLike(cur, path);
-            cur = cur[seg];
-        }
-        return { parent: cur, key: segs[segs.length - 1] };
-    };
-    const toEntries = (value) => {
-        if (value == null) return [];
-        if (value instanceof Map) return Array.from(value.entries());
-        if (value instanceof Set) return Array.from(value.entries());
-        if (typeof value === "object" || typeof value === "function") return Object.entries(value);
-        return [];
-    };
-    const toKeys = (value) => {
-        if (value == null) return [];
-        if (value instanceof Map || value instanceof Set) return Array.from(value.keys());
-        if (typeof value === "object" || typeof value === "function") return Object.keys(value);
-        return [];
-    };
-    const toJsonSnapshot = (value) => {
-        const seen = new WeakSet();
-        const s = JSON.stringify(value, (_key, v) => {
-            if (typeof v === "bigint") return { __bigint: v.toString() };
-            if (typeof v === "function") return \`[Function \${v.name || "anonymous"}]\`;
-            if (typeof v === "symbol") return String(v);
-            if (v instanceof Map) return { __map: Array.from(v.entries()) };
-            if (v instanceof Set) return { __set: Array.from(v.values()) };
-            if (v instanceof Date) return { __date: v.toISOString() };
-            if (v instanceof Error) return { __error: { name: v.name, message: v.message, stack: v.stack } };
-            if (v && typeof v === "object") {
-                if (seen.has(v)) return "[Circular]";
-                seen.add(v);
-            }
-            return v;
-        });
-        if (s === undefined) return undefined;
-        return JSON.parse(s);
-    };
-    const isPromiseLike = (value) =>
-        value != null &&
-        (typeof value === "object" || typeof value === "function") &&
-        typeof value.then === "function";
-    const awaitOne = (value) =>
-        new Promise((resolve, reject) => {
-            try {
-                value.then(
-                    (v) => resolve({ value: v }),
-                    reject,
-                );
-            } catch (e) {
-                reject(e);
-            }
-        });
-    const withCallArgs = (args, invoke) => {
-        const prevArgs = $args;
-        $args = Array.isArray(args) ? args : [];
-        try {
-            const out = invoke();
-            if (isPromiseLike(out)) {
-                return Promise.resolve(out).finally(() => {
-                    $args = prevArgs;
-                });
-            }
-            $args = prevArgs;
-            return out;
-        } catch (e) {
-            $args = prevArgs;
-            throw e;
-        }
-    };
-    const typeInfo = (value) => {
-        const tag = Object.prototype.toString.call(value);
-        let type = "object";
-        if (value === undefined) type = "undefined";
-        else if (value === null) type = "null";
-        else if (Array.isArray(value)) type = "array";
-        else if (tag === "[object Date]") type = "date";
-        else if (tag === "[object RegExp]") type = "regexp";
-        else if (tag === "[object Map]") type = "map";
-        else if (tag === "[object Set]") type = "set";
-        else if (tag === "[object ArrayBuffer]") type = "arraybuffer";
-        else if (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value)) type = "typedarray";
-        else if (value instanceof Error) type = "error";
-        else if (tag === "[object Promise]") type = "promise";
-        else type = typeof value;
-        const out = { type, callable: typeof value === "function" };
-        if (value && (typeof value === "object" || typeof value === "function")) {
-            const ctorName = value.constructor && typeof value.constructor.name === "string" ? value.constructor.name : undefined;
-            if (ctorName) out.constructorName = ctorName;
-        }
-        return out;
-    };
-    const api = {
-        async run(payload) {
-            if (!payload || typeof payload !== "object") mkErr("HANDLE_PAYLOAD_INVALID", "Invalid handle payload");
-            const op = String(payload.op || "");
-            const id = String(payload.id || "");
-            if (!id) mkErr("HANDLE_ID_INVALID", "Invalid handle id");
-
-            if (op === "createFromPath") {
-                const found = resolveWithExistence(globalThis, payload.path);
-                if (!found.exists) mkErr("HANDLE_PATH_NOT_FOUND", \`Handle path not found: \${String(payload.path)}\`);
-                reg.set(id, found.value);
-                return { id };
-            }
-            if (op === "createFromEval") {
-                const src = String(payload.source || "");
-                if (!src.trim()) mkErr("HANDLE_EVAL_SOURCE_EMPTY", "handle.eval(source) requires non-empty source");
-                const root = (0, eval)(src);
-                reg.set(id, root);
-                return { id };
-            }
-            if (op === "dispose") {
-                reg.delete(id);
-                return true;
-            }
-
-            if (!reg.has(id)) mkErr("HANDLE_INVALIDATED", "Handle disposed or invalidated");
-            const root = reg.get(id);
-
-            if (op === "get") return resolve(root, payload.path);
-            if (op === "set") {
-                const { parent, key } = resolveParent(root, payload.path);
-                mustObjectLike(parent, payload.path);
-                parent[key] = payload.value;
-                return null;
-            }
-            if (op === "has") {
-                const found = resolveWithExistence(root, payload.path);
-                return found.exists;
-            }
-            if (op === "delete") {
-                const { parent, key } = resolveParent(root, payload.path);
-                mustObjectLike(parent, payload.path);
-                if (!(key in Object(parent))) return false;
-                return delete parent[key];
-            }
-            if (op === "keys") return toKeys(resolve(root, payload.path));
-            if (op === "entries") return toEntries(resolve(root, payload.path));
-            if (op === "getOwnPropertyDescriptor") {
-                const { parent, key } = resolveParent(root, payload.path);
-                mustObjectLike(parent, payload.path);
-                return Object.getOwnPropertyDescriptor(parent, key);
-            }
-            if (op === "define") {
-                const { parent, key } = resolveParent(root, payload.path);
-                mustObjectLike(parent, payload.path);
-                Object.defineProperty(parent, key, payload.descriptor || {});
-                return true;
-            }
-            if (op === "instanceOf") {
-                const ctor = resolve(globalThis, payload.constructorPath);
-                if (typeof ctor !== "function") mkErr("HANDLE_CTOR_INVALID", "constructorPath does not resolve to a function");
-                return root instanceof ctor;
-            }
-            if (op === "isCallable") return typeof resolve(root, payload.path) === "function";
-            if (op === "isPromise") return isPromiseLike(resolve(root, payload.path));
-            if (op === "call") {
-                const path = payload.path == null ? "" : String(payload.path);
-                const args = Array.isArray(payload.args) ? payload.args : [];
-                if (!path) {
-                    if (typeof root !== "function") mkErr("HANDLE_NOT_CALLABLE", "Handle root is not callable");
-                    return withCallArgs(args, () => root(...args));
-                }
-                const { parent, key } = resolveParent(root, path);
-                mustObjectLike(parent, path);
-                const fn = parent[key];
-                if (typeof fn !== "function") mkErr("HANDLE_NOT_CALLABLE", \`Handle path is not callable: \${path}\`);
-                return withCallArgs(args, () => fn.apply(parent, args));
-            }
-            if (op === "construct") {
-                const args = Array.isArray(payload.args) ? payload.args : [];
-                if (typeof root !== "function") mkErr("HANDLE_NOT_CONSTRUCTABLE", "Handle root is not constructable");
-                return withCallArgs(args, () => new root(...args));
-            }
-            if (op === "await") {
-                const returnValue = payload.returnValue !== false;
-                const untilNonPromise = payload.untilNonPromise === true;
-                const run = async () => {
-                    if (!untilNonPromise) {
-                        return await Promise.resolve(root);
-                    }
-                    let resolved = root;
-                    for (let i = 0; i < 1024; i += 1) {
-                        if (!isPromiseLike(resolved)) break;
-                        const step = await awaitOne(resolved);
-                        resolved = step.value;
-                    }
-                    if (isPromiseLike(resolved)) {
-                        mkErr("HANDLE_AWAIT_MAX_DEPTH", "handle.await({ untilNonPromise: true }) exceeded max unwrap depth");
-                    }
-                    return resolved;
-                };
-                return run().then((resolved) => {
-                    reg.set(id, resolved);
-                    return returnValue ? resolved : undefined;
-                });
-            }
-            if (op === "clone") {
-                const nextId = String(payload.nextId || "");
-                if (!nextId) mkErr("HANDLE_CLONE_ID_INVALID", "clone requires nextId");
-                reg.set(nextId, root);
-                return { id: nextId };
-            }
-            if (op === "toJSON") return toJsonSnapshot(resolve(root, payload.path));
-            if (op === "apply") {
-                const items = Array.isArray(payload.ops) ? payload.ops : [];
-                const out = [];
-                for (const item of items) {
-                    const opName = item && typeof item.op === "string" ? item.op : "";
-                    if (!opName) mkErr("HANDLE_APPLY_OP_INVALID", "Invalid handle apply op");
-                    if (opName === "get") out.push(resolve(root, item.path == null ? "" : item.path));
-                    else if (opName === "set") {
-                        const { parent, key } = resolveParent(root, item.path);
-                        mustObjectLike(parent, item.path);
-                        parent[key] = item.value;
-                        out.push(null);
-                    } else if (opName === "call") {
-                        const path = item.path == null ? "" : String(item.path);
-                        const args = Array.isArray(item.args) ? item.args : [];
-                        if (!path) {
-                            if (typeof root !== "function") mkErr("HANDLE_NOT_CALLABLE", "Handle root is not callable");
-                            let result = withCallArgs(args, () => root(...args));
-                            if (isPromiseLike(result)) result = await Promise.resolve(result);
-                            out.push(result);
-                        } else {
-                            const { parent, key } = resolveParent(root, path);
-                            mustObjectLike(parent, path);
-                            const fn = parent[key];
-                            if (typeof fn !== "function") mkErr("HANDLE_NOT_CALLABLE", \`Handle path is not callable: \${path}\`);
-                            let result = withCallArgs(args, () => fn.apply(parent, args));
-                            if (isPromiseLike(result)) result = await Promise.resolve(result);
-                            out.push(result);
-                        }
-                    } else if (opName === "has") {
-                        out.push(resolveWithExistence(root, item.path).exists);
-                    } else if (opName === "delete") {
-                        const { parent, key } = resolveParent(root, item.path);
-                        mustObjectLike(parent, item.path);
-                        out.push(key in Object(parent) ? delete parent[key] : false);
-                    } else if (opName === "getType") {
-                        out.push(typeInfo(resolve(root, item.path == null ? "" : item.path)));
-                    } else if (opName === "toJSON") {
-                        out.push(toJsonSnapshot(resolve(root, item.path == null ? "" : item.path)));
-                    } else if (opName === "isCallable") {
-                        out.push(typeof resolve(root, item.path == null ? "" : item.path) === "function");
-                    } else if (opName === "isPromise") {
-                        out.push(isPromiseLike(resolve(root, item.path == null ? "" : item.path)));
-                    } else {
-                        mkErr("HANDLE_APPLY_OP_UNSUPPORTED", \`Unsupported apply op: \${opName}\`);
-                    }
-                }
-                return out;
-            }
-            if (op === "getType") return typeInfo(resolve(root, payload.path));
-
-            mkErr("HANDLE_OP_UNKNOWN", \`Unknown handle operation: \${op}\`);
-        },
-    };
-    Object.defineProperty(api, "__denojs_worker_handle_api_v1", {
-        value: true,
-        enumerable: false,
-        configurable: false,
-        writable: false,
-    });
-
-    Object.defineProperty(globalThis, "${HANDLE_RUNTIME_KEY}", {
-        value: api,
-        configurable: false,
-        enumerable: false,
-        writable: false,
-    });
-    return true;
-})()`;
-const HANDLE_RUNTIME_RUN_SOURCE = `(payload) => {
-    const api = globalThis.${HANDLE_RUNTIME_KEY};
-    if (!api || typeof api.run !== "function") {
-        const e = new Error("Handle runtime bridge is not installed");
-        e.code = "HANDLE_BRIDGE_MISSING";
-        throw e;
-    }
-    return api.run(payload);
-}`;
-const HANDLE_RUNTIME_CALL_SOURCE = `(id, path, ...args) => {
-    const api = globalThis.${HANDLE_RUNTIME_KEY};
-    if (!api || typeof api.run !== "function") {
-        const e = new Error("Handle runtime bridge is not installed");
-        e.code = "HANDLE_BRIDGE_MISSING";
-        throw e;
-    }
-    return api.run({ op: "call", id, path, args });
-}`;
 type StreamFrameType = "open" | "chunk" | "close" | "error" | "cancel" | "discard" | "credit";
 
 type StreamFrame = {
@@ -1216,56 +871,10 @@ export class DenoWorker {
         return { type, id: Math.trunc(id), payload };
     }
 
-    /** Conservative binary fast path for setGlobal to preserve typed-array class fidelity. */
-    private isSetGlobalBinaryFastPath(value: any): boolean {
-        if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) return true;
-        if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return true;
-        if (typeof Uint8Array !== "undefined" && value instanceof Uint8Array) return true;
-        return false;
-    }
-
-    /** Recursively serializes globals while preserving special types and avoiding cycles. */
-    private serializeGlobalValue(value: any, seen?: WeakSet<object>): any {
-        if (value === undefined) return null;
-        if (value === null) return null;
-
-        const t = typeof value;
-        if (t === "function") return value;
-        if (t !== "object") return value;
-
-        const ws = seen ?? new WeakSet<object>();
-        if (ws.has(value)) return null;
-        ws.add(value);
-
-        const isSpecial =
-            value instanceof Date ||
-            value instanceof RegExp ||
-            (typeof URL !== "undefined" && value instanceof URL) ||
-            (typeof URLSearchParams !== "undefined" && value instanceof URLSearchParams) ||
-            (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) ||
-            (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) ||
-            (typeof ArrayBuffer !== "undefined" && typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value)) ||
-            value instanceof Map ||
-            value instanceof Set ||
-            value instanceof Error ||
-            (typeof Buffer !== "undefined" && Buffer.isBuffer(value));
-
-        if (isSpecial) return dehydrateForWire(value);
-
-        if (Array.isArray(value)) return value.map((x) => this.serializeGlobalValue(x, ws));
-
-        const out: Record<string, any> = {};
-        for (const [k, v] of Object.entries(value)) {
-            out[k] = this.serializeGlobalValue(v, ws);
-        }
-        return out;
-    }
-
-    /** Sets a global on native runtime after host-side serialization and in-flight tracking. */
+    /** Sets a global on native runtime after native-side serialization and in-flight tracking. */
     private async setGlobalInternal(key: string, value: any): Promise<void> {
         try {
-            const payload = this.isSetGlobalBinaryFastPath(value) ? value : this.serializeGlobalValue(value);
-            await this.trackInFlight(this.native.setGlobal(key, payload));
+            await this.trackInFlight(this.native.setGlobal(key, value));
         } catch (e) {
             throw hydrateFromWire(e);
         }
@@ -3087,10 +2696,9 @@ export class DenoWorker {
             this.recordOpSample("message", Date.now() - started, true);
             return;
         }
-        const payload = this.isBinaryLikeValue(msg) ? msg : dehydrateForWire(msg);
-        this.postMessageRaw(payload);
+        this.postMessageRaw(msg);
         this.totalsStats.messagesOut += 1;
-        this.totalsStats.bytesOut += this.estimatePayloadBytes(payload);
+        this.totalsStats.bytesOut += this.estimatePayloadBytes(msg);
         this.recordOpSample("message", Date.now() - started, true);
     }
 
@@ -3119,15 +2727,14 @@ export class DenoWorker {
         }
         if (!Array.isArray(msgs) || msgs.length === 0) return 0;
 
-        const payloads = msgs.map((m) => (this.isBinaryLikeValue(m) ? m : dehydrateForWire(m)));
-        const sent = (this.native as any).postMessages(payloads) as number;
-        if (sent !== payloads.length) {
+        const sent = (this.native as any).postMessages(msgs) as number;
+        if (sent !== msgs.length) {
             this.recordOpSample("message", Date.now() - started, false);
             throw new Error("DenoWorker.postMessages failed: worker is closed");
         }
         this.totalsStats.messagesOut += sent;
         let bytes = 0;
-        for (let i = 0; i < sent; i += 1) bytes += this.estimatePayloadBytes(payloads[i]);
+        for (let i = 0; i < sent; i += 1) bytes += this.estimatePayloadBytes(msgs[i]);
         this.totalsStats.bytesOut += bytes;
         this.recordOpSample("message", Date.now() - started, true);
         return sent;
@@ -3141,12 +2748,11 @@ export class DenoWorker {
     tryPostMessages(msgs: any[]): number {
         if (this.isClosed()) return 0;
         if (!Array.isArray(msgs) || msgs.length === 0) return 0;
-        const payloads = msgs.map((m) => (this.isBinaryLikeValue(m) ? m : dehydrateForWire(m)));
-        const sent = (this.native as any).postMessages(payloads);
+        const sent = (this.native as any).postMessages(msgs);
         if (typeof sent === "number" && Number.isFinite(sent) && sent > 0) {
             this.totalsStats.messagesOut += sent;
             let bytes = 0;
-            for (let i = 0; i < sent; i += 1) bytes += this.estimatePayloadBytes(payloads[i]);
+            for (let i = 0; i < sent; i += 1) bytes += this.estimatePayloadBytes(msgs[i]);
             this.totalsStats.bytesOut += bytes;
             this.recordOpSample("message", 0, true);
             return sent;
@@ -3171,11 +2777,10 @@ export class DenoWorker {
             }
             return ok;
         }
-        const payload = this.isBinaryLikeValue(msg) ? msg : dehydrateForWire(msg);
-        const ok = this.native.postMessage(payload);
+        const ok = this.native.postMessage(msg);
         if (ok) {
             this.totalsStats.messagesOut += 1;
-            this.totalsStats.bytesOut += this.estimatePayloadBytes(payload);
+            this.totalsStats.bytesOut += this.estimatePayloadBytes(msg);
             this.recordOpSample("message", 0, true);
         }
         return ok;
@@ -4297,7 +3902,8 @@ export class DenoWorker {
             if (sourceText.includes("@babel/parser") || sourceText.includes("@babel/generator")) {
                 await this.ensureBabelShimGlobals();
             }
-            const sourceForLoaders = options?.cjs === true ? this.buildCjsEvalEsmSource(sourceText) : sourceText;
+            const sourceForLoaders =
+                options?.cjs === true ? this.native.buildModuleEvalCjsSource(sourceText) : sourceText;
             const transformed = await this.applyLoadersAsync({
                 kind: "module-eval",
                 src: sourceForLoaders,
@@ -4374,134 +3980,6 @@ export class DenoWorker {
         } finally {
             this.clearHostCallsiteForOp(opId);
         }
-    }
-
-    private normalizeCjsRequireSpecifier(specifier: string): string {
-        const raw = String(specifier ?? "").trim();
-        if (!raw) return raw;
-        if (raw.startsWith("node:")) return raw;
-        const core = new Set([
-            "assert",
-            "buffer",
-            "child_process",
-            "cluster",
-            "console",
-            "constants",
-            "crypto",
-            "dgram",
-            "diagnostics_channel",
-            "dns",
-            "domain",
-            "events",
-            "fs",
-            "http",
-            "http2",
-            "https",
-            "inspector",
-            "module",
-            "net",
-            "os",
-            "path",
-            "perf_hooks",
-            "process",
-            "punycode",
-            "querystring",
-            "readline",
-            "repl",
-            "stream",
-            "string_decoder",
-            "sys",
-            "timers",
-            "tls",
-            "tty",
-            "url",
-            "util",
-            "v8",
-            "vm",
-            "worker_threads",
-            "zlib",
-        ]);
-        return core.has(raw) ? `node:${raw}` : raw;
-    }
-
-    private collectCjsRequireSpecifiers(source: string): Array<{ raw: string; normalized: string }> {
-        const out: Array<{ raw: string; normalized: string }> = [];
-        const seen = new Set<string>();
-        const re = /\brequire\s*\(\s*(['"])([^"'\\]*(?:\\.[^"'\\]*)*)\1\s*\)/g;
-        let m: RegExpExecArray | null = null;
-        while ((m = re.exec(source))) {
-            const raw = String(m[2] ?? "");
-            if (!raw || seen.has(raw)) continue;
-            seen.add(raw);
-            out.push({ raw, normalized: this.normalizeCjsRequireSpecifier(raw) });
-        }
-        return out;
-    }
-
-    private isJsIdentifier(name: string): boolean {
-        return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(String(name ?? ""));
-    }
-
-    private collectCjsNamedExports(source: string): string[] {
-        const names = new Set<string>();
-        const add = (name: string) => {
-            const n = String(name ?? "").trim();
-            if (!n || n === "default" || n === "__esModule") return;
-            if (!this.isJsIdentifier(n)) return;
-            names.add(n);
-        };
-
-        const reA = /\bexports\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
-        const reB = /\bmodule\.exports\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
-        const reC = /\bObject\.defineProperty\(\s*(?:exports|module\.exports)\s*,\s*(['"])([A-Za-z_$][A-Za-z0-9_$]*)\1/g;
-        let m: RegExpExecArray | null = null;
-        while ((m = reA.exec(source))) add(m[1]);
-        while ((m = reB.exec(source))) add(m[1]);
-        while ((m = reC.exec(source))) add(m[2]);
-        return [...names.values()];
-    }
-
-    private buildCjsEvalEsmSource(source: string): string {
-        const requires = this.collectCjsRequireSpecifiers(source);
-        const names = this.collectCjsNamedExports(source);
-        const q = (v: string) => JSON.stringify(v);
-        const lines: string[] = [];
-        for (let i = 0; i < requires.length; i += 1) {
-            lines.push(`import * as __ddReq${i} from ${q(requires[i].normalized)};`);
-        }
-        lines.push("const exports = {};");
-        lines.push("const module = { exports, filename: \"<module.eval:cjs>\", id: \"<module.eval:cjs>\", loaded: false, parent: null, children: [], paths: [] };");
-        lines.push("const __ddRequireMap = new Map();");
-        for (let i = 0; i < requires.length; i += 1) {
-            lines.push(`__ddRequireMap.set(${q(requires[i].raw)}, __ddReq${i});`);
-            if (requires[i].raw !== requires[i].normalized) {
-                lines.push(`__ddRequireMap.set(${q(requires[i].normalized)}, __ddReq${i});`);
-            }
-        }
-        lines.push("const require = (spec) => {");
-        lines.push("  const m = __ddRequireMap.get(String(spec));");
-        lines.push("  if (!m) throw new Error(`Unsupported require() in module.eval({ cjs: true }): ${String(spec)}`);");
-        lines.push("  try {");
-        lines.push("    const d = m && (typeof m === \"object\" || typeof m === \"function\") ? m.default : undefined;");
-        lines.push("    if (d && (typeof d === \"object\" || typeof d === \"function\")) return d;");
-        lines.push("  } catch {}");
-        lines.push("  if (m && (typeof m === \"object\" || typeof m === \"function\")) {");
-        lines.push("    const out = Object.create(null);");
-        lines.push("    for (const k of Object.keys(m)) { try { out[k] = m[k]; } catch {} }");
-        lines.push("    return out;");
-        lines.push("  }");
-        lines.push("  return m;");
-        lines.push("};");
-        lines.push(`const __ddSource = ${q(source)};`);
-        lines.push("const __ddFn = new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\", __ddSource);");
-        lines.push("try { __ddFn.call(module.exports, module.exports, require, module, module.filename, \".\"); } finally { module.loaded = true; }");
-        lines.push("const __ddFinal = module.exports;");
-        lines.push("const __ddNamed = (__ddFinal && (typeof __ddFinal === \"object\" || typeof __ddFinal === \"function\")) ? __ddFinal : Object.create(null);");
-        lines.push("export default __ddFinal;");
-        for (const name of names) {
-            lines.push(`export const ${name} = __ddNamed[${q(name)}];`);
-        }
-        return `${lines.join("\n")}\n`;
     }
 
     private async ensureBabelShimGlobals(): Promise<void> {

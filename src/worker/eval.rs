@@ -44,7 +44,8 @@ fn next_eval_args_key() -> String {
 
 // Injects a lexical `$args` binding into eval/module source.
 fn inject_eval_args_binding(source: &str, key: &str) -> String {
-    let key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"__denojs_worker_eval_args\"".into());
+    let key_json =
+        serde_json::to_string(key).unwrap_or_else(|_| "\"__denojs_worker_eval_args\"".into());
     format!("const $args = globalThis[{key_json}];\n{source}")
 }
 
@@ -56,8 +57,8 @@ fn set_eval_args_global(
 ) -> Result<(), JsValueBridge> {
     deno_core::scope!(scope, &mut worker.js_runtime);
     let global = scope.get_current_context().global(scope);
-    let key_v8 =
-        v8::String::new(scope, key).ok_or_else(|| mk_err("BridgeError", "Failed to allocate args key".into()))?;
+    let key_v8 = v8::String::new(scope, key)
+        .ok_or_else(|| mk_err("BridgeError", "Failed to allocate args key".into()))?;
     let arr = v8::Array::new(scope, args.len() as i32);
     for (idx, item) in args.iter().enumerate() {
         let vv = v8_codec::to_v8(scope, item).map_err(|e| mk_err("BridgeError", e))?;
@@ -83,7 +84,7 @@ struct EvalTimerService {
 }
 
 impl EvalTimerService {
-    // Global.
+    // One timer thread coordinates termination deadlines for all worker evals.
     fn global() -> &'static EvalTimerService {
         static TIMER: OnceLock<EvalTimerService> = OnceLock::new();
         TIMER.get_or_init(|| {
@@ -150,7 +151,6 @@ impl EvalTimerService {
         })
     }
 
-    // Arm.
     fn arm(
         &self,
         timeout_ms: u64,
@@ -168,13 +168,12 @@ impl EvalTimerService {
         timer_id
     }
 
-    // Disarm.
     fn disarm(&self, timer_id: u64) {
         let _ = self.tx.send(EvalTimerCmd::Disarm { timer_id });
     }
 }
 
-// Transpiles ts enabled as part of runtime eval, module execution, and timeout handling.
+// Module-loader settings can disable TS transpilation for evalModule.
 fn transpile_ts_enabled(limits: &RuntimeLimits) -> bool {
     limits
         .module_loader
@@ -356,7 +355,7 @@ fn transpile_cache_path_from_limits(
     Some(PathBuf::from(cache_dir).join(format!("{h:016x}.js")))
 }
 
-// Mk err.
+// Builds a bridge error without depending on a live JS scope.
 fn mk_err(name: &str, message: String) -> JsValueBridge {
     JsValueBridge::Error {
         name: name.to_string(),
@@ -367,7 +366,7 @@ fn mk_err(name: &str, message: String) -> JsValueBridge {
     }
 }
 
-// Rejection to bridge fallback.
+// Extracts common error-like fields when V8 conversion fails during rejection handling.
 fn rejection_to_bridge_fallback<'s, 'p>(
     ps: &mut v8::PinScope<'s, 'p>,
     v: v8::Local<'s, v8::Value>,
@@ -492,7 +491,8 @@ fn execute_script_catching(
     Ok(v8::Global::new(scope, v_val))
 }
 
-// Ensure runtime env bridge.
+// Installs runtime env helpers after bootstrap; failures are ignored so eval can
+// still run under runtimes that do not expose the optional hook.
 fn ensure_runtime_env_bridge(worker: &mut MainWorker) {
     let _ = worker.js_runtime.execute_script(
         "<runtime_env_bridge>",
@@ -551,18 +551,18 @@ pub async fn eval_in_runtime(
         &options.loader,
         &source_with_args_binding,
     ) {
-            Ok(s) => s,
-            Err(error) => {
-                if let Some(key) = eval_args_key.as_deref() {
-                    clear_eval_args_global(worker, key);
-                }
-                let stats = ExecStats {
-                    cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
-                    eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
-                };
-                return EvalReply::Err { error, stats };
+        Ok(s) => s,
+        Err(error) => {
+            if let Some(key) = eval_args_key.as_deref() {
+                clear_eval_args_global(worker, key);
             }
-        };
+            let stats = ExecStats {
+                cpu_time_ms: start_cpu.elapsed().as_nanos() as f64 / 1_000_000.0,
+                eval_time_ms: start_wall.elapsed().as_nanos() as f64 / 1_000_000.0,
+            };
+            return EvalReply::Err { error, stats };
+        }
+    };
 
     let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -733,7 +733,8 @@ async fn eval_module(
     settle_until_non_promise(worker, out).await
 }
 
-// Attempts to call if function and returns a fallible result for runtime eval, module execution, and timeout handling.
+// If eval returned a function, invoke it with bridged args; otherwise return the
+// original value unchanged.
 fn try_call_if_function(
     worker: &mut MainWorker,
     value: deno_core::v8::Global<v8::Value>,

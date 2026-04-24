@@ -1,4 +1,5 @@
 // src/bridge/neon_codec.rs
+use base64::Engine;
 use bytes::Bytes;
 use neon::prelude::*;
 use neon::result::Throw;
@@ -7,17 +8,24 @@ use std::cell::RefCell;
 
 use super::types::JsValueBridge;
 use crate::bridge::tags::{
-    BIGINT_KEY, BUFFER_KEY, DATE_KEY, MAP_KEY, NUMBER_NEG_ZERO_KEY, REGEXP_KEY, SET_KEY,
-    TYPE_ERROR, TYPE_KEY, URL_KEY, URL_SEARCH_PARAMS_KEY,
+    BIGINT_KEY, BUFFER_KEY, DATE_KEY, MAP_KEY, NUMBER_KEY, NUMBER_NEG_ZERO_KEY, REGEXP_KEY,
+    SET_KEY, TYPE_ERROR, TYPE_KEY, UNDEFINED_KEY, URL_KEY, URL_SEARCH_PARAMS_KEY,
 };
 use crate::worker::messages::EvalReply;
 use neon::types::buffer::TypedArray;
+
+const GRAPH_ID_KEY: &str = "__denojs_worker_graph_id";
+const GRAPH_REF_KEY: &str = "__denojs_worker_graph_ref";
+const GRAPH_KIND_KEY: &str = "__denojs_worker_graph_kind";
+const GRAPH_VALUE_KEY: &str = "__denojs_worker_graph_value";
+const GRAPH_KIND_ARRAY: &str = "array";
+const GRAPH_KIND_OBJECT: &str = "object";
 
 thread_local! {
     static BYTE_VEC_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-// Rent byte vec.
+// Reuses short-lived byte buffers created while decoding JSON wire payloads.
 fn rent_byte_vec(min_capacity: usize) -> Vec<u8> {
     BYTE_VEC_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -31,7 +39,7 @@ fn rent_byte_vec(min_capacity: usize) -> Vec<u8> {
     })
 }
 
-// Give back byte vec.
+// Returns a rented byte buffer unless it grew too large to keep around.
 fn give_back_byte_vec(mut v: Vec<u8>) {
     // Keep pooled buffers bounded; 1 MiB covers common transfer chunks.
     if v.capacity() > 1024 * 1024 {
@@ -46,7 +54,7 @@ fn give_back_byte_vec(mut v: Vec<u8>) {
     });
 }
 
-// Returns string prop from state used by bridge encoding/decoding between Rust, V8, and Neon.
+// Reads an own/inherited string property without requiring callers to handle JS exceptions.
 fn get_string_prop<'a, C: Context<'a>>(
     cx: &mut C,
     obj: Handle<'a, JsObject>,
@@ -57,7 +65,7 @@ fn get_string_prop<'a, C: Context<'a>>(
     Some(s.value(cx))
 }
 
-// Object to string tag.
+// Gets Object.prototype.toString.call(value), which is more robust across JS realms.
 fn object_to_string_tag<'a, C: Context<'a>>(cx: &mut C, v: Handle<'a, JsValue>) -> Option<String> {
     let out: Handle<JsString> = cx
         .try_catch(|cx| {
@@ -86,7 +94,52 @@ fn object_to_string_tag<'a, C: Context<'a>>(cx: &mut C, v: Handle<'a, JsValue>) 
     Some(out.value(cx))
 }
 
-/// Reflect construct.
+fn is_node_buffer<'a, C: Context<'a>>(cx: &mut C, value: Handle<'a, JsValue>) -> bool {
+    let Ok(buf_ctor) = cx.global::<JsFunction>("Buffer") else {
+        return false;
+    };
+
+    cx.try_catch(|cx| {
+        let fn_any = buf_ctor.get_value(cx, "isBuffer")?;
+        let fn_is_buffer = fn_any.downcast::<JsFunction, _>(cx).unwrap();
+        fn_is_buffer
+            .call_with(cx)
+            .this(buf_ctor)
+            .arg(value)
+            .apply::<JsBoolean, _>(cx)
+    })
+    .ok()
+    .map(|b| b.value(cx))
+    .unwrap_or(false)
+}
+
+// Returns own enumerable string keys using JavaScript Object.keys semantics.
+fn own_enumerable_string_keys<'a, C: Context<'a>>(
+    cx: &mut C,
+    obj: Handle<'a, JsObject>,
+) -> Vec<String> {
+    cx.try_catch(|cx| {
+        let object_ctor: Handle<JsFunction> = cx.global("Object")?;
+        let keys_fn = object_ctor.get::<JsFunction, _, _>(cx, "keys")?;
+        let keys_arr = keys_fn
+            .call_with(cx)
+            .this(object_ctor)
+            .arg(obj)
+            .apply::<JsArray, _>(cx)?;
+
+        let mut out = Vec::with_capacity(keys_arr.len(cx) as usize);
+        for i in 0..keys_arr.len(cx) {
+            let v = keys_arr.get_value(cx, i)?;
+            if let Ok(s) = v.downcast::<JsString, _>(cx) {
+                out.push(s.value(cx));
+            }
+        }
+        Ok(out)
+    })
+    .unwrap_or_default()
+}
+
+/// Constructs `ctor(...args)` through `Reflect.construct`.
 pub(crate) fn reflect_construct<'a, C: Context<'a>>(
     cx: &mut C,
     ctor: Handle<'a, JsFunction>,
@@ -142,7 +195,7 @@ fn is_regexp_like<'a, C: Context<'a>>(cx: &mut C, v: Handle<'a, JsValue>) -> boo
     has_source && has_flags && has_exec
 }
 
-// Attempts to json stringify with replacer and returns a fallible result for bridge encoding/decoding between Rust, V8, and Neon.
+// JSON.stringify with a replacer that preserves supported non-JSON bridge types.
 fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
     cx: &mut C,
     value: Handle<'a, JsValue>,
@@ -302,9 +355,9 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                     }
                 }
 
-                // ArrayBuffer / TypedArrays / DataView
-                //
-                // Encode to the same wire tag used by bootstrap.js: __buffer { kind, bytes, byteOffset, length }.
+                // Nested ArrayBuffer/view values need raw view bytes, not
+                // typed-array element values. Buffer.from(view) would truncate
+                // Int16Array/Float64Array/etc.; pass the backing buffer window.
                 if let Ok(ab_ctor) = cx.global::<JsFunction>("ArrayBuffer") {
                     let is_view = cx
                         .try_catch(|cx| {
@@ -325,18 +378,45 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                     let is_array_buffer = object_to_string_tag(&mut cx, v)
                         .map(|s| s == "[object ArrayBuffer]")
                         .unwrap_or(false);
+                    let is_shared_array_buffer = object_to_string_tag(&mut cx, v)
+                        .map(|s| s == "[object SharedArrayBuffer]")
+                        .unwrap_or(false);
 
-                    if is_view || is_array_buffer {
-                        // Build a bytes Buffer using Buffer.from(...)
+                    if is_view || is_array_buffer || is_shared_array_buffer {
                         if let Ok(buf_ctor) = cx.global::<JsFunction>("Buffer") {
                             if let Ok(from_any) = buf_ctor.get_value(&mut cx, "from") {
                                 if let Ok(from_fn) = from_any.downcast::<JsFunction, _>(&mut cx) {
-                                    let out_any = from_fn
-                                        .call_with(&mut cx)
-                                        .this(buf_ctor)
-                                        .arg(v)
-                                        .apply::<JsValue, _>(&mut cx)
-                                        .unwrap_or_else(|_| cx.undefined().upcast());
+                                    let out_any = if is_view {
+                                        if let Ok(obj) = v.downcast::<JsObject, _>(&mut cx) {
+                                            let buf_any = obj
+                                                .get_value(&mut cx, "buffer")
+                                                .unwrap_or_else(|_| cx.undefined().upcast());
+                                            let bo_any = obj
+                                                .get_value(&mut cx, "byteOffset")
+                                                .unwrap_or_else(|_| cx.number(0.0).upcast());
+                                            let bl_any = obj
+                                                .get_value(&mut cx, "byteLength")
+                                                .unwrap_or_else(|_| cx.number(0.0).upcast());
+
+                                            from_fn
+                                                .call_with(&mut cx)
+                                                .this(buf_ctor)
+                                                .arg(buf_any)
+                                                .arg(bo_any)
+                                                .arg(bl_any)
+                                                .apply::<JsValue, _>(&mut cx)
+                                                .unwrap_or_else(|_| cx.undefined().upcast())
+                                        } else {
+                                            cx.undefined().upcast()
+                                        }
+                                    } else {
+                                        from_fn
+                                            .call_with(&mut cx)
+                                            .this(buf_ctor)
+                                            .arg(v)
+                                            .apply::<JsValue, _>(&mut cx)
+                                            .unwrap_or_else(|_| cx.undefined().upcast())
+                                    };
 
                                     if let Ok(out_buf) = out_any.downcast::<JsBuffer, _>(&mut cx) {
                                         let bytes = out_buf.as_slice(&mut cx).to_vec();
@@ -349,8 +429,9 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                                         let kind = if is_array_buffer {
                                             "ArrayBuffer".to_string()
+                                        } else if is_shared_array_buffer {
+                                            "SharedArrayBuffer".to_string()
                                         } else {
-                                            // v.constructor.name best-effort
                                             let mut name = "Uint8Array".to_string();
                                             if let Ok(obj) = v.downcast::<JsObject, _>(&mut cx) {
                                                 if let Ok(ctor_any) =
@@ -372,9 +453,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                                             name
                                         };
 
-                                        let byte_offset = if is_array_buffer {
-                                            0usize
-                                        } else {
+                                        let byte_offset = if is_view {
                                             v.downcast::<JsObject, _>(&mut cx)
                                                 .ok()
                                                 .and_then(|o| {
@@ -386,11 +465,11 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                                                         .map(|n| n.value(&mut cx) as usize)
                                                 })
                                                 .unwrap_or(0usize)
+                                        } else {
+                                            0usize
                                         };
 
-                                        let byte_length = if is_array_buffer {
-                                            bytes.len()
-                                        } else {
+                                        let byte_length = if is_view {
                                             v.downcast::<JsObject, _>(&mut cx)
                                                 .ok()
                                                 .and_then(|o| {
@@ -402,10 +481,14 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                                                         .map(|n| n.value(&mut cx) as usize)
                                                 })
                                                 .unwrap_or(bytes.len())
+                                        } else {
+                                            bytes.len()
                                         };
 
-                                        // For typed arrays: length is element length. For DataView: byteLength.
-                                        let length = if kind == "DataView" {
+                                        let length = if kind == "DataView"
+                                            || is_array_buffer
+                                            || is_shared_array_buffer
+                                        {
                                             byte_length
                                         } else {
                                             v.downcast::<JsObject, _>(&mut cx)
@@ -442,18 +525,13 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                 // Map / Set (encode as tagged arrays)
                 if let Ok(obj) = v.downcast::<JsObject, _>(&mut cx) {
-                    let is_map = obj
-                        .get_value(&mut cx, "entries")
-                        .map(|x| x.is_a::<JsFunction, _>(&mut cx))
-                        .unwrap_or(false)
-                        && obj
-                            .get_value(&mut cx, "get")
-                            .map(|x| x.is_a::<JsFunction, _>(&mut cx))
-                            .unwrap_or(false);
+                    let tag = object_to_string_tag(&mut cx, v);
+                    let is_map = tag.as_deref() == Some("[object Map]");
 
                     if is_map {
-                        let array_ctor = cx.global::<JsObject>("Array")?;
-                        let from_any = array_ctor.get_value(&mut cx, "from")?;
+                        let array_ctor = cx.global::<JsFunction>("Array")?;
+                        let array_obj = array_ctor.upcast::<JsObject>();
+                        let from_any = array_obj.get_value(&mut cx, "from")?;
                         if let Ok(from_fn) = from_any.downcast::<JsFunction, _>(&mut cx) {
                             let entries_any = obj.get_value(&mut cx, "entries")?;
                             if let Ok(entries_fn) = entries_any.downcast::<JsFunction, _>(&mut cx) {
@@ -465,7 +543,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                                 let pairs_any = from_fn
                                     .call_with(&mut cx)
-                                    .this(array_ctor)
+                                    .this(array_obj)
                                     .arg(iter)
                                     .apply::<JsValue, _>(&mut cx)
                                     .unwrap_or_else(|_| cx.undefined().upcast());
@@ -477,18 +555,12 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
                         }
                     }
 
-                    let is_set = obj
-                        .get_value(&mut cx, "values")
-                        .map(|x| x.is_a::<JsFunction, _>(&mut cx))
-                        .unwrap_or(false)
-                        && obj
-                            .get_value(&mut cx, "has")
-                            .map(|x| x.is_a::<JsFunction, _>(&mut cx))
-                            .unwrap_or(false);
+                    let is_set = tag.as_deref() == Some("[object Set]");
 
                     if is_set {
-                        let array_ctor = cx.global::<JsObject>("Array")?;
-                        let from_any = array_ctor.get_value(&mut cx, "from")?;
+                        let array_ctor = cx.global::<JsFunction>("Array")?;
+                        let array_obj = array_ctor.upcast::<JsObject>();
+                        let from_any = array_obj.get_value(&mut cx, "from")?;
                         if let Ok(from_fn) = from_any.downcast::<JsFunction, _>(&mut cx) {
                             let values_any = obj.get_value(&mut cx, "values")?;
                             if let Ok(values_fn) = values_any.downcast::<JsFunction, _>(&mut cx) {
@@ -500,7 +572,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
 
                                 let vals_any = from_fn
                                     .call_with(&mut cx)
-                                    .this(array_ctor)
+                                    .this(array_obj)
                                     .arg(iter)
                                     .apply::<JsValue, _>(&mut cx)
                                     .unwrap_or_else(|_| cx.undefined().upcast());
@@ -530,7 +602,7 @@ fn try_json_stringify_with_replacer<'a, C: Context<'a>>(
     serde_json::from_str::<serde_json::Value>(&s.value(cx)).ok()
 }
 
-// Attempts to v8 serialize bytes and returns a fallible result for bridge encoding/decoding between Rust, V8, and Neon.
+// Uses Node's v8 serializer when a non-plain object cannot be represented by wire JSON.
 fn try_v8_serialize_bytes<'a, C: Context<'a>>(
     cx: &mut C,
     value: Handle<'a, JsValue>,
@@ -562,7 +634,256 @@ fn try_v8_serialize_bytes<'a, C: Context<'a>>(
     .ok()
 }
 
-/// Constructs neon value from source input for bridge encoding/decoding between Rust, V8, and Neon.
+struct NeonGraphEncodeState<'a> {
+    seen: Vec<(u64, Handle<'a, JsObject>)>,
+    next_id: u64,
+}
+
+impl<'a> NeonGraphEncodeState<'a> {
+    fn new() -> Self {
+        Self {
+            seen: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    fn seen_id<C: Context<'a>>(&self, cx: &mut C, obj: Handle<'a, JsObject>) -> Option<u64> {
+        self.seen.iter().find_map(|(id, seen)| {
+            if seen.strict_equals(cx, obj) {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn remember(&mut self, obj: Handle<'a, JsObject>) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        self.seen.push((id, obj));
+        id
+    }
+}
+
+fn wire_undefined_json() -> serde_json::Value {
+    serde_json::json!({ UNDEFINED_KEY: true })
+}
+
+fn wire_number_json(tag: &str) -> serde_json::Value {
+    serde_json::json!({ NUMBER_KEY: tag })
+}
+
+fn graph_ref_json(id: u64) -> serde_json::Value {
+    serde_json::json!({ GRAPH_REF_KEY: id })
+}
+
+fn graph_value_json(id: u64, kind: &str, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        GRAPH_ID_KEY: id,
+        GRAPH_KIND_KEY: kind,
+        GRAPH_VALUE_KEY: value,
+    })
+}
+
+fn object_is_arraybuffer_view<'a, C: Context<'a>>(cx: &mut C, value: Handle<'a, JsValue>) -> bool {
+    if let Ok(ab_ctor) = cx.global::<JsFunction>("ArrayBuffer") {
+        return cx
+            .try_catch(|cx| {
+                let fn_any = ab_ctor.get_value(cx, "isView")?;
+                let fn_is_view = fn_any.downcast::<JsFunction, _>(cx).unwrap();
+                fn_is_view
+                    .call_with(cx)
+                    .this(ab_ctor)
+                    .arg(value)
+                    .apply::<JsBoolean, _>(cx)
+            })
+            .ok()
+            .map(|b| b.value(cx))
+            .unwrap_or(false);
+    }
+    false
+}
+
+fn is_binary_like_value<'a, C: Context<'a>>(cx: &mut C, value: Handle<'a, JsValue>) -> bool {
+    if value.is_a::<JsBuffer, _>(cx)
+        || value.is_a::<JsUint8Array, _>(cx)
+        || value.is_a::<JsArrayBuffer, _>(cx)
+    {
+        return true;
+    }
+
+    matches!(
+        object_to_string_tag(cx, value).as_deref(),
+        Some("[object SharedArrayBuffer]")
+    ) || object_is_arraybuffer_view(cx, value)
+}
+
+fn dehydrate_neon_to_wire_inner<'a, C: Context<'a>>(
+    cx: &mut C,
+    value: Handle<'a, JsValue>,
+    state: &mut NeonGraphEncodeState<'a>,
+    depth: usize,
+) -> Result<serde_json::Value, Throw> {
+    if depth > 200 {
+        return Ok(wire_undefined_json());
+    }
+
+    if value.is_a::<JsUndefined, _>(cx) {
+        return Ok(wire_undefined_json());
+    }
+    if value.is_a::<JsNull, _>(cx) {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(v) = value.downcast::<JsBoolean, _>(cx) {
+        return Ok(serde_json::Value::Bool(v.value(cx)));
+    }
+    if let Ok(v) = value.downcast::<JsString, _>(cx) {
+        return Ok(serde_json::Value::String(v.value(cx)));
+    }
+    if let Ok(v) = value.downcast::<JsNumber, _>(cx) {
+        let n = v.value(cx);
+        if n == 0.0 && n.is_sign_negative() {
+            return Ok(serde_json::json!({ NUMBER_NEG_ZERO_KEY: "-0" }));
+        }
+        if n.is_nan() {
+            return Ok(wire_number_json("NaN"));
+        }
+        if n == f64::INFINITY {
+            return Ok(wire_number_json("Infinity"));
+        }
+        if n == f64::NEG_INFINITY {
+            return Ok(wire_number_json("-Infinity"));
+        }
+        return Ok(serde_json::Number::from_f64(n)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(wire_undefined_json));
+    }
+    if value.is_a::<neon::types::JsBigInt, _>(cx) {
+        let s = value
+            .to_string(cx)
+            .map(|s| s.value(cx))
+            .unwrap_or_else(|_| "0".to_string());
+        return Ok(serde_json::json!({ BIGINT_KEY: s }));
+    }
+    if value.is_a::<JsFunction, _>(cx) {
+        return Ok(wire_undefined_json());
+    }
+
+    if is_binary_like_value(cx, value) || value.downcast::<JsDate, _>(cx).is_ok() {
+        return Ok(crate::bridge::wire::to_wire_json(&from_neon_value(
+            cx, value,
+        )?));
+    }
+
+    let tag = object_to_string_tag(cx, value);
+
+    if matches!(tag.as_deref(), Some("[object Map]" | "[object Set]")) {
+        if let Some(j) = try_json_stringify_with_replacer(cx, value) {
+            return Ok(j);
+        }
+        return Ok(crate::bridge::wire::to_wire_json(&from_neon_value(
+            cx, value,
+        )?));
+    }
+
+    if matches!(
+        tag.as_deref(),
+        Some("[object RegExp]" | "[object URL]" | "[object URLSearchParams]" | "[object Error]")
+    ) {
+        return Ok(crate::bridge::wire::to_wire_json(&from_neon_value(
+            cx, value,
+        )?));
+    }
+
+    if let Ok(arr) = value.downcast::<JsArray, _>(cx) {
+        let Ok(obj) = value.downcast::<JsObject, _>(cx) else {
+            return Ok(wire_undefined_json());
+        };
+        if let Some(id) = state.seen_id(cx, obj) {
+            return Ok(graph_ref_json(id));
+        }
+        let id = state.remember(obj);
+        let mut out = Vec::with_capacity(arr.len(cx) as usize);
+        for i in 0..arr.len(cx) {
+            let item = arr
+                .get_value(cx, i)
+                .unwrap_or_else(|_| cx.undefined().upcast::<JsValue>());
+            out.push(dehydrate_neon_to_wire_inner(cx, item, state, depth + 1)?);
+        }
+        return Ok(graph_value_json(
+            id,
+            GRAPH_KIND_ARRAY,
+            serde_json::Value::Array(out),
+        ));
+    }
+
+    if matches!(tag.as_deref(), Some("[object Object]")) {
+        let Ok(obj) = value.downcast::<JsObject, _>(cx) else {
+            return Ok(wire_undefined_json());
+        };
+        if let Some(id) = state.seen_id(cx, obj) {
+            return Ok(graph_ref_json(id));
+        }
+        let id = state.remember(obj);
+        let mut out = serde_json::Map::new();
+        for key in own_enumerable_string_keys(cx, obj) {
+            if key == "__proto__" {
+                continue;
+            }
+            let vv = obj
+                .get_value(cx, key.as_str())
+                .unwrap_or_else(|_| cx.undefined().upcast::<JsValue>());
+            out.insert(key, dehydrate_neon_to_wire_inner(cx, vv, state, depth + 1)?);
+        }
+        return Ok(graph_value_json(
+            id,
+            GRAPH_KIND_OBJECT,
+            serde_json::Value::Object(out),
+        ));
+    }
+
+    if let Some(j) = try_json_stringify_with_replacer(cx, value) {
+        return Ok(j);
+    }
+
+    Ok(wire_undefined_json())
+}
+
+pub(crate) fn dehydrate_neon_to_wire<'a, C: Context<'a>>(
+    cx: &mut C,
+    value: Handle<'a, JsValue>,
+) -> Result<serde_json::Value, Throw> {
+    let mut state = NeonGraphEncodeState::new();
+    dehydrate_neon_to_wire_inner(cx, value, &mut state, 0)
+}
+
+fn buffer_view_kind_from_tag(tag: Option<&str>) -> Option<String> {
+    let tag = tag?;
+    if !tag.starts_with("[object ") || !tag.ends_with(']') {
+        return None;
+    }
+    let kind = &tag[8..tag.len().saturating_sub(1)];
+    if kind.is_empty() {
+        None
+    } else {
+        Some(kind.to_string())
+    }
+}
+
+fn constructor_name<'a, C: Context<'a>>(cx: &mut C, value: Handle<'a, JsValue>) -> Option<String> {
+    let obj = value.downcast::<JsObject, _>(cx).ok()?;
+    let ctor_any = obj.get_value(cx, "constructor").ok()?;
+    if let Ok(ctor_fn) = ctor_any.downcast::<JsFunction, _>(cx) {
+        let ctor_obj = ctor_fn.upcast::<JsObject>();
+        return get_string_prop(cx, ctor_obj, "name").filter(|s| !s.trim().is_empty());
+    }
+    if let Ok(ctor_obj) = ctor_any.downcast::<JsObject, _>(cx) {
+        return get_string_prop(cx, ctor_obj, "name").filter(|s| !s.trim().is_empty());
+    }
+    None
+}
+
+/// Converts a Node/Neon value into the internal bridge representation.
 pub fn from_neon_value<'a, C: Context<'a>>(
     cx: &mut C,
     value: Handle<'a, JsValue>,
@@ -598,16 +919,53 @@ pub fn from_neon_value<'a, C: Context<'a>>(
         return Ok(JsValueBridge::DateMs(v.value(cx)));
     }
 
+    if is_regexp_like(cx, value) {
+        let obj = value
+            .downcast::<JsObject, _>(cx)
+            .unwrap_or_else(|_| cx.empty_object());
+        let source = get_string_prop(cx, obj, "source").unwrap_or_default();
+        let flags = get_string_prop(cx, obj, "flags").unwrap_or_default();
+        return Ok(JsValueBridge::RegExp { source, flags });
+    }
+
+    if let Some(tag) = object_to_string_tag(cx, value) {
+        if tag == "[object URL]" {
+            if let Ok(obj) = value.downcast::<JsObject, _>(cx) {
+                if let Some(href) = get_string_prop(cx, obj, "href") {
+                    return Ok(JsValueBridge::Url { href });
+                }
+            }
+        }
+
+        if tag == "[object URLSearchParams]" {
+            if let Ok(obj) = value.downcast::<JsObject, _>(cx) {
+                let query = cx
+                    .try_catch(|cx| {
+                        let to_string_fn = obj.get::<JsFunction, _, _>(cx, "toString")?;
+                        let out = to_string_fn
+                            .call_with(cx)
+                            .this(obj)
+                            .apply::<JsString, _>(cx)?;
+                        Ok(out.value(cx))
+                    })
+                    .unwrap_or_default();
+                return Ok(JsValueBridge::UrlSearchParams { query });
+            }
+        }
+    }
+
     // Fast-path Buffer (Node): treat as Uint8Array bytes.
-    if let Ok(v) = value.downcast::<JsBuffer, _>(cx) {
-        let bytes = v.as_slice(cx).to_vec();
-        let len = bytes.len();
-        return Ok(JsValueBridge::BufferView {
-            kind: "Uint8Array".into(),
-            bytes: Bytes::from(bytes),
-            byte_offset: 0,
-            length: len,
-        });
+    if is_node_buffer(cx, value) {
+        if let Ok(v) = value.downcast::<JsBuffer, _>(cx) {
+            let bytes = v.as_slice(cx).to_vec();
+            let len = bytes.len();
+            return Ok(JsValueBridge::BufferView {
+                kind: "Uint8Array".into(),
+                bytes: Bytes::from(bytes),
+                byte_offset: 0,
+                length: len,
+            });
+        }
     }
 
     // Fast-path non-Buffer ArrayBuffer / TypedArray / DataView.
@@ -675,13 +1033,8 @@ pub fn from_neon_value<'a, C: Context<'a>>(
                         } else if is_sab {
                             "SharedArrayBuffer".to_string()
                         } else {
-                            value
-                                .downcast::<JsObject, _>(cx)
-                                .ok()
-                                .and_then(|o| o.get_value(cx, "constructor").ok())
-                                .and_then(|c| c.downcast::<JsObject, _>(cx).ok())
-                                .and_then(|co| get_string_prop(cx, co, "name"))
-                                .filter(|s| !s.trim().is_empty())
+                            constructor_name(cx, value)
+                                .or_else(|| buffer_view_kind_from_tag(tag.as_deref()))
                                 .unwrap_or_else(|| "Uint8Array".to_string())
                         };
 
@@ -759,11 +1112,21 @@ pub fn from_neon_value<'a, C: Context<'a>>(
     }
 
     // Structured values (objects/arrays):
-    // - Plain Object/Array stay on JSON wire for robust Node<->Deno transport compatibility.
+    // - Plain Object/Array prefer structured clone so cyclic/shared graphs
+    //   preserve identity without relying on JS-side graph markers.
+    // - When structured clone is unavailable (for example nested functions),
+    //   fall back to Rust-side wire encoding.
     // - Non-plain structured objects try V8 structured clone first, then JSON fallback.
     if value.is_a::<JsArray, _>(cx) || value.is_a::<JsObject, _>(cx) {
         let tag = object_to_string_tag(cx, value);
         let is_plain = matches!(tag.as_deref(), Some("[object Object]" | "[object Array]"));
+
+        if is_plain {
+            if let Some(bytes) = try_v8_serialize_bytes(cx, value) {
+                return Ok(JsValueBridge::V8Serialized(bytes));
+            }
+            return dehydrate_neon_to_wire(cx, value).map(JsValueBridge::Json);
+        }
 
         if !is_plain {
             if let Some(bytes) = try_v8_serialize_bytes(cx, value) {
@@ -781,7 +1144,7 @@ pub fn from_neon_value<'a, C: Context<'a>>(
     Ok(JsValueBridge::Undefined)
 }
 
-// Make arraybuffer from bytes.
+// Builds an exact ArrayBuffer copy from raw bytes.
 fn make_arraybuffer_from_bytes<'a, C: Context<'a>>(
     cx: &mut C,
     bytes: &[u8],
@@ -866,7 +1229,7 @@ fn make_arraybuffer_from_bytes<'a, C: Context<'a>>(
     Ok(ab_obj.upcast())
 }
 
-// Make shared arraybuffer from bytes.
+// Builds a SharedArrayBuffer copy when available, otherwise falls back to ArrayBuffer.
 fn make_shared_arraybuffer_from_bytes<'a, C: Context<'a>>(
     cx: &mut C,
     bytes: &[u8],
@@ -908,7 +1271,49 @@ fn make_shared_arraybuffer_from_bytes<'a, C: Context<'a>>(
     Ok(sab_obj.upcast())
 }
 
-// Buffer view to neon.
+fn buffer_view_bytes_per_element(kind: &str) -> usize {
+    match kind {
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "DataView" => 1,
+        "Int16Array" | "Uint16Array" => 2,
+        "Int32Array" | "Uint32Array" | "Float32Array" => 4,
+        "Float64Array" | "BigInt64Array" | "BigUint64Array" => 8,
+        _ => 1,
+    }
+}
+
+fn buffer_view_window(
+    kind: &str,
+    raw_byte_len: usize,
+    byte_offset: usize,
+    length: usize,
+) -> Option<(usize, usize)> {
+    if matches!(kind, "ArrayBuffer" | "SharedArrayBuffer") {
+        return Some((0, length.min(raw_byte_len)));
+    }
+
+    let bytes_per_element = buffer_view_bytes_per_element(kind);
+    let span_bytes = length.checked_mul(bytes_per_element)?;
+
+    if byte_offset <= raw_byte_len {
+        if let Some(end) = byte_offset.checked_add(span_bytes) {
+            if end <= raw_byte_len {
+                return Some((byte_offset, length));
+            }
+        }
+    }
+
+    // Some producers copy only the view bytes but preserve the original
+    // byteOffset. Rebase those copied payloads onto offset 0 before constructing.
+    if span_bytes <= raw_byte_len {
+        return Some((0, length));
+    }
+
+    let safe_offset = byte_offset.min(raw_byte_len);
+    let available = raw_byte_len.saturating_sub(safe_offset);
+    Some((safe_offset, available / bytes_per_element))
+}
+
+// Reconstructs ArrayBuffer/TypedArray/DataView values for the Node realm.
 fn buffer_view_to_neon<'a, C: Context<'a>>(
     cx: &mut C,
     kind: &str,
@@ -916,9 +1321,15 @@ fn buffer_view_to_neon<'a, C: Context<'a>>(
     byte_offset: usize,
     length: usize,
 ) -> Result<Handle<'a, JsValue>, Throw> {
+    let (view_offset, view_length) = buffer_view_window(kind, bytes.len(), byte_offset, length)
+        .ok_or_else(|| {
+            cx.throw_error::<_, Throw>("Invalid buffer view bounds")
+                .unwrap_err()
+        })?;
+
     // Hot path: most message payloads are full Uint8Array byte buffers.
     // Returning Node Buffer here avoids expensive per-byte JS property sets.
-    if kind == "Uint8Array" && byte_offset == 0 && length == bytes.len() {
+    if kind == "Uint8Array" && view_offset == 0 && view_length == bytes.len() {
         let mut out = JsBuffer::new(cx, bytes.len())?;
         out.as_mut_slice(cx).copy_from_slice(bytes);
         return Ok(out.upcast());
@@ -942,8 +1353,8 @@ fn buffer_view_to_neon<'a, C: Context<'a>>(
     if kind == "DataView" {
         let dv_ctor = cx.global::<JsFunction>("DataView")?;
         let ab_v = ab_obj.upcast::<JsValue>();
-        let bo_v = cx.number(byte_offset as f64).upcast::<JsValue>();
-        let len_v = cx.number(length as f64).upcast::<JsValue>();
+        let bo_v = cx.number(view_offset as f64).upcast::<JsValue>();
+        let len_v = cx.number(view_length as f64).upcast::<JsValue>();
         return reflect_construct(cx, dv_ctor, &[ab_v, bo_v, len_v]);
     }
 
@@ -956,8 +1367,8 @@ fn buffer_view_to_neon<'a, C: Context<'a>>(
     if let Some(ctor_any) = ctor_any {
         if let Ok(ctor) = ctor_any.downcast::<JsFunction, _>(cx) {
             let ab_v = ab_obj.upcast::<JsValue>();
-            let bo_v = cx.number(byte_offset as f64).upcast::<JsValue>();
-            let len_v = cx.number(length as f64).upcast::<JsValue>();
+            let bo_v = cx.number(view_offset as f64).upcast::<JsValue>();
+            let len_v = cx.number(view_length as f64).upcast::<JsValue>();
 
             if let Ok(v) = reflect_construct(cx, ctor, &[ab_v, bo_v, len_v]) {
                 return Ok(v);
@@ -968,12 +1379,12 @@ fn buffer_view_to_neon<'a, C: Context<'a>>(
     // Fallback: Uint8Array view.
     let u8_ctor = cx.global::<JsFunction>("Uint8Array")?;
     let ab_v = ab_obj.upcast::<JsValue>();
-    let bo_v = cx.number(byte_offset as f64).upcast::<JsValue>();
-    let len_v = cx.number(length as f64).upcast::<JsValue>();
+    let bo_v = cx.number(view_offset as f64).upcast::<JsValue>();
+    let len_v = cx.number(view_length as f64).upcast::<JsValue>();
     reflect_construct(cx, u8_ctor, &[ab_v, bo_v, len_v])
 }
 
-// Json to neon.
+// Converts plain/wire JSON into Node values, including tagged bridge objects.
 fn json_to_neon<'a, C: Context<'a>>(
     cx: &mut C,
     v: &serde_json::Value,
@@ -1109,7 +1520,7 @@ fn json_to_neon<'a, C: Context<'a>>(
                 return Ok(cx.string(s).upcast());
             }
 
-            // __buffer wire tag: { __buffer: { kind, bytes, byteOffset, length } }
+            // __buffer wire tag: { __buffer: { kind, bytes|base64, byteOffset, length } }
             if let Some(b) = map.get(BUFFER_KEY).and_then(|x| x.as_object()) {
                 let kind = b
                     .get("kind")
@@ -1121,24 +1532,35 @@ fn json_to_neon<'a, C: Context<'a>>(
 
                 let length = b.get("length").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
 
-                let empty: Vec<serde_json::Value> = Vec::new();
-                let bytes_arr_ref = b.get("bytes").and_then(|x| x.as_array()).unwrap_or(&empty);
-
-                let mut out_bytes = rent_byte_vec(bytes_arr_ref.len());
-                for it in bytes_arr_ref.iter() {
-                    match it.as_u64() {
-                        Some(n) if n <= 255 => out_bytes.push(n as u8),
-                        _ => {
-                            give_back_byte_vec(out_bytes);
-                            return Ok(cx.undefined().upcast());
+                if let Some(bytes_arr_ref) = b.get("bytes").and_then(|x| x.as_array()) {
+                    let mut out_bytes = rent_byte_vec(bytes_arr_ref.len());
+                    for it in bytes_arr_ref.iter() {
+                        match it.as_u64() {
+                            Some(n) if n <= 255 => out_bytes.push(n as u8),
+                            _ => {
+                                give_back_byte_vec(out_bytes);
+                                return Ok(cx.undefined().upcast());
+                            }
                         }
                     }
+
+                    let out = buffer_view_to_neon(cx, kind, &out_bytes, byte_offset, length)
+                        .unwrap_or_else(|_| cx.undefined().upcast());
+                    give_back_byte_vec(out_bytes);
+                    return Ok(out);
                 }
 
-                let out = buffer_view_to_neon(cx, kind, &out_bytes, byte_offset, length)
-                    .unwrap_or_else(|_| cx.undefined().upcast());
-                give_back_byte_vec(out_bytes);
-                return Ok(out);
+                if let Some(base64) = b.get("base64").and_then(|x| x.as_str()) {
+                    let Ok(out_bytes) = base64::engine::general_purpose::STANDARD.decode(base64)
+                    else {
+                        return Ok(cx.undefined().upcast());
+                    };
+                    let out = buffer_view_to_neon(cx, kind, &out_bytes, byte_offset, length)
+                        .unwrap_or_else(|_| cx.undefined().upcast());
+                    return Ok(out);
+                }
+
+                return Ok(cx.undefined().upcast());
             }
 
             if let Some(pairs) = map.get(MAP_KEY).and_then(|x| x.as_array()) {

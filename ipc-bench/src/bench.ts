@@ -27,8 +27,11 @@ type BenchConfig = {
     iterations: number;
     warmup: number;
     restarts: number;
+    inflight: number;
+    trimRatio: number;
     unsafeStreamMemory: boolean;
     scenarios: ScenarioKey[];
+    transferModes: TransferMode[];
 };
 
 type Ack = { size: number; checksum: number };
@@ -82,6 +85,8 @@ const scenarioCatalog: ScenarioMeta[] = [
 ];
 
 let useUnsafeStreamMemory = false;
+let runMaxInFlight = 64;
+const ITERATION_SETTLE_MS = 25;
 
 function createBenchDenoWorker(): DenoWorker {
     if (useUnsafeStreamMemory) {
@@ -102,8 +107,11 @@ function parseArgs(): BenchConfig {
         iterations: 3,
         warmup: 1,
         restarts: 0,
+        inflight: 8,
+        trimRatio: 0.2,
         unsafeStreamMemory: false,
         scenarios: [...scenarioOrder],
+        transferModes: ["binary", "json", "string"],
     };
 
     for (let i = 0; i < args.length; i += 1) {
@@ -118,7 +126,21 @@ function parseArgs(): BenchConfig {
         else if (arg === "--iterations") out.iterations = Number(args[++i]);
         else if (arg === "--warmup") out.warmup = Number(args[++i]);
         else if (arg === "--restarts") out.restarts = Number(args[++i]);
+        else if (arg === "--inflight") out.inflight = Number(args[++i]);
+        else if (arg === "--trim-ratio") out.trimRatio = Number(args[++i]);
         else if (arg === "--unsafe-stream-memory") out.unsafeStreamMemory = true;
+        else if (arg === "--transfer-mode") {
+            const raw = String(args[++i] || "")
+                .split(",")
+                .map((v) => v.trim())
+                .filter(Boolean);
+            const next: TransferMode[] = [];
+            for (const mode of raw) {
+                if (mode === "binary" || mode === "json" || mode === "string") next.push(mode);
+                else if (mode === "all") next.push("binary", "json", "string");
+            }
+            out.transferModes = [...new Set(next)];
+        }
         else if (arg === "--scenarios") {
             const wanted = new Set(args[++i].split(",").map((v) => v.trim()));
             out.scenarios = scenarioOrder.filter((k) => wanted.has(k));
@@ -133,8 +155,12 @@ function parseArgs(): BenchConfig {
     if (!Number.isFinite(out.iterations) || out.iterations <= 0) throw new Error("Invalid --iterations");
     if (!Number.isFinite(out.warmup) || out.warmup < 0) throw new Error("Invalid --warmup");
     if (!Number.isFinite(out.restarts) || out.restarts < 0) throw new Error("Invalid --restarts");
+    if (!Number.isFinite(out.inflight) || out.inflight <= 0) throw new Error("Invalid --inflight");
+    if (!Number.isFinite(out.trimRatio) || out.trimRatio < 0 || out.trimRatio >= 0.5) throw new Error("Invalid --trim-ratio");
     out.restarts = Math.trunc(out.restarts);
+    out.inflight = Math.trunc(out.inflight);
     if (out.scenarios.length === 0) throw new Error("No scenarios selected");
+    if (out.transferModes.length === 0) throw new Error("No transfer modes selected");
     return out;
 }
 
@@ -231,8 +257,46 @@ function median(values: number[]): number {
     return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) * 0.5 : sorted[mid];
 }
 
+function trimmedMedian(values: number[], trimRatio: number): number {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const trimCount = Math.floor(sorted.length * Math.max(0, Math.min(0.49, trimRatio)));
+    const start = trimCount;
+    const end = sorted.length - trimCount;
+    const kept = end > start ? sorted.slice(start, end) : sorted;
+    return median(kept);
+}
+
+async function mapWithConcurrency<T>(count: number, concurrency: number, task: (index: number) => Promise<T>): Promise<T[]> {
+    if (count <= 0) return [];
+    const out = new Array<T>(count);
+    let cursor = 0;
+    const workers = Math.max(1, Math.min(count, concurrency));
+    await Promise.all(
+        Array.from({ length: workers }, async () => {
+            while (true) {
+                const i = cursor;
+                cursor += 1;
+                if (i >= count) return;
+                out[i] = await task(i);
+            }
+        }),
+    );
+    return out;
+}
+
 function mbps(totalBytes: number, ms: number): number {
     return totalBytes / (ms / 1000) / (1024 * 1024);
+}
+
+async function settleAfterIteration(): Promise<void> {
+    try {
+        const gc = (globalThis as any).gc;
+        if (typeof gc === "function") gc();
+    } catch {
+        // ignore
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, ITERATION_SETTLE_MS));
 }
 
 function fmtMbps(v: number): string {
@@ -367,15 +431,14 @@ async function setupNodePostMessage(workerCount: number): Promise<any> {
 
 async function runNodePostMessage(payload: TransferPayload, messages: number, workerCount: number, ctx: any): Promise<number> {
     const { workers, pending, nextId } = ctx;
-    const promises = Array.from({ length: messages }, (_, i) => {
+    const out = await mapWithConcurrency(messages, runMaxInFlight, async (i) => {
         const w = workers[i % workerCount];
         const id = nextId();
-        return new Promise<Ack>((resolve, reject) => {
+        return await new Promise<Ack>((resolve, reject) => {
             pending.set(id, { resolve, reject });
             w.postMessage({ type: "echo", id, payload });
         });
     });
-    const out = await Promise.all(promises);
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
@@ -436,12 +499,11 @@ async function runNodeHttp(payload: TransferPayload, messages: number, workerCou
     const mode = transferModeOf(payload);
     const body = mode === "binary" ? payload : mode === "json" ? JSON.stringify(payload) : payload;
     const contentType = mode === "binary" ? "application/octet-stream" : mode === "json" ? "application/json" : "text/plain";
-    const promises = Array.from({ length: messages }, async (_, i) => {
+    const out = await mapWithConcurrency(messages, runMaxInFlight, async (i) => {
         const idx = i % workerCount;
         const port = servers[idx].port;
         return await postHttpAck(port, contentType, body, agents[idx]);
     });
-    const out = await Promise.all(promises);
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
@@ -496,19 +558,64 @@ async function setupDenoPostMessage(workerCount: number): Promise<any> {
 
 async function runDenoPostMessage(payload: TransferPayload, messages: number, workerCount: number, ctx: any): Promise<number> {
     const { workers, pending, nextId } = ctx;
-    const promises = Array.from({ length: messages }, (_, i) => {
-        const id = nextId();
-        const w = workers[i % workerCount];
-        return new Promise<Ack>((resolve, reject) => {
-            pending.set(id, { resolve, reject });
-            w.postMessage({ type: "echo", id, payload });
-            setTimeout(() => {
-                if (pending.delete(id)) reject(new Error(`Deno postMessage timeout (${id})`));
-            }, 30_000).unref();
-        });
+    const messageIds = new Set<number>();
+    let next = 0;
+    let inFlight = 0;
+    let done = 0;
+    let acc = 0x811c9dc5 >>> 0;
+    const op = new Promise<number>((resolve, reject) => {
+        let failed = false;
+        const fail = (error: unknown) => {
+            if (failed) return;
+            failed = true;
+            reject(error);
+        };
+        const launch = (): void => {
+            while (!failed && inFlight < runMaxInFlight && next < messages) {
+                const idx = next++;
+                const id = nextId();
+                const w = workers[idx % workerCount];
+                inFlight += 1;
+                messageIds.add(id);
+                pending.set(id, {
+                    resolve: (ack: Ack) => {
+                        if (failed) return;
+                        messageIds.delete(id);
+                        inFlight -= 1;
+                        done += 1;
+                        acc ^= (ack.checksum ^ ack.size) >>> 0;
+                        acc = Math.imul(acc, 16777619) >>> 0;
+                        if (done >= messages) {
+                            resolve(acc >>> 0);
+                            return;
+                        }
+                        launch();
+                    },
+                    reject: (err: unknown) => {
+                        messageIds.delete(id);
+                        inFlight = Math.max(0, inFlight - 1);
+                        fail(err);
+                    },
+                });
+                try {
+                    w.postMessage({ type: "echo", id, payload });
+                } catch (err) {
+                    pending.delete(id);
+                    messageIds.delete(id);
+                    inFlight = Math.max(0, inFlight - 1);
+                    fail(err);
+                    return;
+                }
+            }
+        };
+        launch();
     });
-    const out = await Promise.all(promises);
-    return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
+    try {
+        return await withTimeout(op, 30_000, `Deno postMessage batch (${messages} messages)`);
+    } catch (error) {
+        for (const id of messageIds) pending.delete(id);
+        throw error;
+    }
 }
 
 async function teardownDenoPostMessage(ctx: any): Promise<void> {
@@ -546,10 +653,11 @@ async function setupDenoEval(workerCount: number): Promise<any> {
 
 async function runDenoEval(payload: TransferPayload, messages: number, workerCount: number, ctx: any): Promise<number> {
     const { workers } = ctx;
-    const promises = Array.from({ length: messages }, (_, i) =>
-        workers[i % workerCount].eval("(p) => globalThis.__benchEcho(p)", { args: [payload] }) as Promise<Ack>,
-    );
-    const out = await Promise.all(promises);
+    const out = await mapWithConcurrency(messages, runMaxInFlight, async (i) => {
+        return await (workers[i % workerCount].eval("(p) => globalThis.__benchEcho(p)", {
+            args: [payload],
+        }) as Promise<Ack>);
+    });
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
@@ -587,10 +695,11 @@ async function setupQuickJSEval(workerCount: number): Promise<any> {
 
 async function runQuickJSEval(payload: TransferPayload, messages: number, workerCount: number, ctx: any): Promise<number> {
     const { workers } = ctx;
-    const promises = Array.from({ length: messages }, (_, i) =>
-        workers[i % workerCount].eval("(p) => globalThis.__benchEcho(p)", { args: [payload] }) as Promise<Ack>,
-    );
-    const out = await Promise.all(promises);
+    const out = await mapWithConcurrency(messages, runMaxInFlight, async (i) => {
+        return await (workers[i % workerCount].eval("(p) => globalThis.__benchEcho(p)", {
+            args: [payload],
+        }) as Promise<Ack>);
+    });
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
@@ -629,10 +738,9 @@ async function setupDenoHandle(workerCount: number): Promise<any> {
 
 async function runDenoHandle(payload: TransferPayload, messages: number, workerCount: number, ctx: any): Promise<number> {
     const { handles } = ctx;
-    const promises = Array.from({ length: messages }, (_, i) =>
-        handles[i % workerCount].call([payload]) as Promise<Ack>,
-    );
-    const out = await Promise.all(promises);
+    const out = await mapWithConcurrency(messages, runMaxInFlight, async (i) => {
+        return await (handles[i % workerCount].call([payload]) as Promise<Ack>);
+    });
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
@@ -719,6 +827,23 @@ function endDuplex(duplex: any): Promise<void> {
     });
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        timer.unref();
+        p.then(
+            (v) => {
+                clearTimeout(timer);
+                resolve(v);
+            },
+            (e) => {
+                clearTimeout(timer);
+                reject(e);
+            },
+        );
+    });
+}
+
 async function setupDenoStream(workerCount: number): Promise<any> {
     const workers = Array.from({ length: workerCount }, () => createBenchDenoWorker());
     const pending = new Map<number, { resolve: (ack: Ack) => void; reject: (err: unknown) => void }>();
@@ -730,7 +855,7 @@ async function setupDenoStream(workerCount: number): Promise<any> {
         keys.push(key);
         writers.push(await workers[i].stream.connect(key, useUnsafeStreamMemory ? { unsafeSharedMemory: true } : undefined));
     }
-    await Promise.all(workers.map((w, i) => w.eval(denoStreamScript, { args: [keys[i], !useUnsafeStreamMemory] })));
+    await Promise.all(workers.map((w, i) => w.eval(denoStreamScript, { args: [keys[i], true] })));
     workers.forEach((w) => {
         w.on("message", (msg: any) => {
             if (Array.isArray(msg?.acks)) {
@@ -755,65 +880,85 @@ async function runDenoStream(payload: TransferPayload, messages: number, workerC
     const { writers, pending, nextId } = ctx;
     const mode = transferModeOf(payload);
     const bytes = mode === "binary" ? payload : Buffer.from(mode === "json" ? JSON.stringify(payload) : payload, "utf8");
-    const perWorkerFrames = Array.from({ length: workerCount }, () => [] as Uint8Array[]);
-    const promises: Array<Promise<Ack>> = [];
-    for (let i = 0; i < messages; i += 1) {
-        const wi = i % workerCount;
-        const id = nextId();
-        const ackPromise = new Promise<Ack>((resolve, reject) => {
-            pending.set(id, { resolve, reject });
-            setTimeout(() => {
-                if (pending.delete(id)) reject(new Error(`Deno stream timeout (${id})`));
-            }, 30_000).unref();
-        });
-        const frame = new Uint8Array(16 + bytes.length);
-        frame[0] = id & 0xff;
-        frame[1] = (id >>> 8) & 0xff;
-        frame[2] = (id >>> 16) & 0xff;
-        frame[3] = (id >>> 24) & 0xff;
-        frame[4] = 1;
-        frame[5] = 0;
-        frame[6] = 0;
-        frame[7] = 0;
-        frame[8] = bytes.length & 0xff;
-        frame[9] = (bytes.length >>> 8) & 0xff;
-        frame[10] = (bytes.length >>> 16) & 0xff;
-        frame[11] = (bytes.length >>> 24) & 0xff;
-        frame[12] = mode === "binary" ? 0 : mode === "json" ? 1 : 2;
-        frame[13] = 0;
-        frame[14] = 0;
-        frame[15] = 0;
-        frame.set(bytes, 16);
-        perWorkerFrames[wi].push(frame);
-        promises.push(ackPromise);
-    }
-    await Promise.all(
-        perWorkerFrames.map(async (frames, wi) => {
-            if (frames.length === 0) return;
-            if (useUnsafeStreamMemory) {
+    const messageIds: number[] = [];
+    const allAcks: Ack[] = [];
+    for (let base = 0; base < messages; base += runMaxInFlight) {
+        const count = Math.min(runMaxInFlight, messages - base);
+        const perWorkerFrames = Array.from({ length: workerCount }, () => [] as Uint8Array[]);
+        const promises: Array<Promise<Ack>> = [];
+        for (let j = 0; j < count; j += 1) {
+            const i = base + j;
+            const wi = i % workerCount;
+            const id = nextId();
+            messageIds.push(id);
+            const ackPromise = new Promise<Ack>((resolve, reject) => {
+                pending.set(id, { resolve, reject });
+            });
+            const frame = new Uint8Array(16 + bytes.length);
+            frame[0] = id & 0xff;
+            frame[1] = (id >>> 8) & 0xff;
+            frame[2] = (id >>> 16) & 0xff;
+            frame[3] = (id >>> 24) & 0xff;
+            frame[4] = 1;
+            frame[5] = 0;
+            frame[6] = 0;
+            frame[7] = 0;
+            frame[8] = bytes.length & 0xff;
+            frame[9] = (bytes.length >>> 8) & 0xff;
+            frame[10] = (bytes.length >>> 16) & 0xff;
+            frame[11] = (bytes.length >>> 24) & 0xff;
+            frame[12] = mode === "binary" ? 0 : mode === "json" ? 1 : 2;
+            frame[13] = 0;
+            frame[14] = 0;
+            frame[15] = 0;
+            frame.set(bytes, 16);
+            perWorkerFrames[wi].push(frame);
+            promises.push(ackPromise);
+        }
+        await Promise.all(
+            perWorkerFrames.map(async (frames, wi) => {
+                if (frames.length === 0) return;
+                const total = frames.reduce((n, f) => n + f.byteLength, 0);
+                const merged = Buffer.allocUnsafe(total);
+                let off = 0;
                 for (const frame of frames) {
-                    await writeDuplexChunk(writers[wi], frame);
+                    merged.set(frame, off);
+                    off += frame.byteLength;
                 }
-                return;
-            }
-            const total = frames.reduce((n, f) => n + f.byteLength, 0);
-            const merged = Buffer.allocUnsafe(total);
-            let off = 0;
-            for (const frame of frames) {
-                merged.set(frame, off);
-                off += frame.byteLength;
-            }
-            await writeDuplexChunk(writers[wi], merged);
-        }),
-    );
-
-    const out = await Promise.all(promises);
-    return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
+                await writeDuplexChunk(writers[wi], merged);
+            }),
+        );
+        try {
+            const chunkAcks = await withTimeout(Promise.all(promises), 30_000, `Deno stream batch (${count} messages)`);
+            allAcks.push(...chunkAcks);
+        } catch (error) {
+            for (const id of messageIds) pending.delete(id);
+            throw error;
+        }
+    }
+    return mergeChecksums(allAcks.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
 async function teardownDenoStream(ctx: any): Promise<void> {
+    for (const entry of ctx.pending.values()) {
+        entry.reject(new Error("Bench teardown"));
+    }
     ctx.pending.clear();
-    await Promise.all(ctx.writers.map((w: any) => endDuplex(w)));
+    await Promise.all(
+        ctx.writers.map(async (w: any) => {
+            try {
+                await withTimeout(endDuplex(w), 5000, "stream duplex end");
+            } catch {
+                try {
+                    if (w && !w.destroyed && typeof w.destroy === "function") {
+                        w.destroy(new Error("stream teardown timeout"));
+                    }
+                } catch {
+                    // ignore teardown fallback errors
+                }
+            }
+        }),
+    );
     await Promise.all(ctx.workers.map((w: DenoWorker) => w.close({ force: true })));
 }
 
@@ -854,10 +999,9 @@ async function setupQuickJSHandle(workerCount: number): Promise<any> {
 async function runQuickJSHandle(payload: TransferPayload, messages: number, workerCount: number, ctx: any): Promise<number> {
     const { handles } = ctx;
     const handlePayload = payload instanceof Uint8Array ? Array.from(payload) : payload;
-    const promises = Array.from({ length: messages }, (_, i) =>
-        handles[i % workerCount].call([handlePayload]) as Promise<Ack>,
-    );
-    const out = await Promise.all(promises);
+    const out = await mapWithConcurrency(messages, runMaxInFlight, async (i) => {
+        return await (handles[i % workerCount].call([handlePayload]) as Promise<Ack>);
+    });
     return mergeChecksums(out.map((a) => ((a.checksum ^ a.size) >>> 0)));
 }
 
@@ -1088,6 +1232,7 @@ function printTable(title: string, scenarios: ScenarioMeta[], results: Map<strin
 async function main(): Promise<void> {
     const config = parseArgs();
     useUnsafeStreamMemory = config.unsafeStreamMemory;
+    runMaxInFlight = config.inflight;
     const selectedScenarios = scenarioCatalog.filter((s) => config.scenarios.includes(s.key));
     const selectedNodeScenarios = localScenarios.filter((s) => config.scenarios.includes(s.key));
     const wantsBunMain = config.scenarios.some((k) => k.startsWith("bun+bun-"));
@@ -1097,7 +1242,7 @@ async function main(): Promise<void> {
 
     console.log("# IPC Bandwidth Bench");
     console.log(
-        `config: payloadBytesList=${config.payloadBytesList.join(",")} messages=${config.messages} iterations=${config.iterations} warmup=${config.warmup} restarts=${config.restarts} unsafeStreamMemory=${config.unsafeStreamMemory}`,
+        `config: payloadBytesList=${config.payloadBytesList.join(",")} messages=${config.messages} iterations=${config.iterations} warmup=${config.warmup} restarts=${config.restarts} inflight=${config.inflight} trimRatio=${config.trimRatio} transferModes=${config.transferModes.join(",")} unsafeStreamMemory=${config.unsafeStreamMemory}`,
     );
     if (wantsBunMain && !hasBun) console.log("runtime: bun not found in PATH (Bun main scenarios skipped)");
     if (wantsDenoMain && !hasDeno) console.log("runtime: deno not found in PATH (Deno main scenarios skipped)");
@@ -1147,75 +1292,87 @@ async function main(): Promise<void> {
                     return expectedFoldForCount(modeExpectedAck, modePayloadBytes, config.messages);
                 };
 
-                for (let i = 0; i < config.warmup; i += 1) {
-                    await runLocal(payload, expectedAck);
+                if (config.transferModes.includes("binary")) {
+                    for (let i = 0; i < config.warmup; i += 1) {
+                        await runLocal(payload, expectedAck);
+                        await settleAfterIteration();
+                    }
+
+                    const dts: number[] = [];
+                    let checksum: number | undefined;
+                    for (let i = 0; i < config.iterations; i += 1) {
+                        const t0 = performance.now();
+                        const sum = await runLocal(payload, expectedAck);
+                        const dt = performance.now() - t0;
+                        dts.push(dt);
+                        if (checksum == null) checksum = sum;
+                        else if (checksum !== sum) throw new Error(`Inconsistent checksum in ${scenario.key}`);
+                        await settleAfterIteration();
+                    }
+
+                    if (checksum == null) throw new Error("Missing checksum");
+                    if (checksum !== expectedFold) {
+                        throw new Error(`Checksum mismatch for ${scenario.key}: expected ${expectedFold}, got ${checksum}`);
+                    }
+
+                    const speed = mbps(totalBytes, trimmedMedian(dts, config.trimRatio));
+                    results.set(scenario.key, speed);
+                    console.log(`done: ${scenario.label} -> ${fmtMbps(speed)}`);
                 }
 
-                const dts: number[] = [];
-                let checksum: number | undefined;
-                for (let i = 0; i < config.iterations; i += 1) {
-                    const t0 = performance.now();
-                    const sum = await runLocal(payload, expectedAck);
-                    const dt = performance.now() - t0;
-                    dts.push(dt);
-                    if (checksum == null) checksum = sum;
-                    else if (checksum !== sum) throw new Error(`Inconsistent checksum in ${scenario.key}`);
+                if (config.transferModes.includes("json")) {
+                    for (let i = 0; i < config.warmup; i += 1) {
+                        await runLocal(jsonPayload, expectedAckJson);
+                        await settleAfterIteration();
+                    }
+
+                    const jsonDts: number[] = [];
+                    let jsonChecksum: number | undefined;
+                    for (let i = 0; i < config.iterations; i += 1) {
+                        const t0 = performance.now();
+                        const sum = await runLocal(jsonPayload, expectedAckJson);
+                        const dt = performance.now() - t0;
+                        jsonDts.push(dt);
+                        if (jsonChecksum == null) jsonChecksum = sum;
+                        else if (jsonChecksum !== sum) throw new Error(`Inconsistent JSON checksum in ${scenario.key}`);
+                        await settleAfterIteration();
+                    }
+
+                    if (jsonChecksum == null) throw new Error("Missing JSON checksum");
+                    if (jsonChecksum !== expectedFoldJson) {
+                        throw new Error(`JSON checksum mismatch for ${scenario.key}: expected ${expectedFoldJson}, got ${jsonChecksum}`);
+                    }
+                    const jsonSpeed = mbps(totalBytes, trimmedMedian(jsonDts, config.trimRatio));
+                    jsonResults.set(scenario.key, jsonSpeed);
+                    console.log(`done: ${scenario.label} (json) -> ${fmtMbps(jsonSpeed)}`);
                 }
 
-                if (checksum == null) throw new Error("Missing checksum");
-                if (checksum !== expectedFold) {
-                    throw new Error(`Checksum mismatch for ${scenario.key}: expected ${expectedFold}, got ${checksum}`);
-                }
+                if (config.transferModes.includes("string")) {
+                    for (let i = 0; i < config.warmup; i += 1) {
+                        await runLocal(stringPayload, expectedAckString);
+                        await settleAfterIteration();
+                    }
 
-                const speed = mbps(totalBytes, median(dts));
-                results.set(scenario.key, speed);
-                console.log(`done: ${scenario.label} -> ${fmtMbps(speed)}`);
+                    const stringDts: number[] = [];
+                    let stringChecksum: number | undefined;
+                    for (let i = 0; i < config.iterations; i += 1) {
+                        const t0 = performance.now();
+                        const sum = await runLocal(stringPayload, expectedAckString);
+                        const dt = performance.now() - t0;
+                        stringDts.push(dt);
+                        if (stringChecksum == null) stringChecksum = sum;
+                        else if (stringChecksum !== sum) throw new Error(`Inconsistent string checksum in ${scenario.key}`);
+                        await settleAfterIteration();
+                    }
 
-                for (let i = 0; i < config.warmup; i += 1) {
-                    await runLocal(jsonPayload, expectedAckJson);
+                    if (stringChecksum == null) throw new Error("Missing string checksum");
+                    if (stringChecksum !== expectedFoldString) {
+                        throw new Error(`String checksum mismatch for ${scenario.key}: expected ${expectedFoldString}, got ${stringChecksum}`);
+                    }
+                    const stringSpeed = mbps(totalBytes, trimmedMedian(stringDts, config.trimRatio));
+                    stringResults.set(scenario.key, stringSpeed);
+                    console.log(`done: ${scenario.label} (string) -> ${fmtMbps(stringSpeed)}`);
                 }
-
-                const jsonDts: number[] = [];
-                let jsonChecksum: number | undefined;
-                for (let i = 0; i < config.iterations; i += 1) {
-                    const t0 = performance.now();
-                    const sum = await runLocal(jsonPayload, expectedAckJson);
-                    const dt = performance.now() - t0;
-                    jsonDts.push(dt);
-                    if (jsonChecksum == null) jsonChecksum = sum;
-                    else if (jsonChecksum !== sum) throw new Error(`Inconsistent JSON checksum in ${scenario.key}`);
-                }
-
-                if (jsonChecksum == null) throw new Error("Missing JSON checksum");
-                if (jsonChecksum !== expectedFoldJson) {
-                    throw new Error(`JSON checksum mismatch for ${scenario.key}: expected ${expectedFoldJson}, got ${jsonChecksum}`);
-                }
-                const jsonSpeed = mbps(totalBytes, median(jsonDts));
-                jsonResults.set(scenario.key, jsonSpeed);
-                console.log(`done: ${scenario.label} (json) -> ${fmtMbps(jsonSpeed)}`);
-
-                for (let i = 0; i < config.warmup; i += 1) {
-                    await runLocal(stringPayload, expectedAckString);
-                }
-
-                const stringDts: number[] = [];
-                let stringChecksum: number | undefined;
-                for (let i = 0; i < config.iterations; i += 1) {
-                    const t0 = performance.now();
-                    const sum = await runLocal(stringPayload, expectedAckString);
-                    const dt = performance.now() - t0;
-                    stringDts.push(dt);
-                    if (stringChecksum == null) stringChecksum = sum;
-                    else if (stringChecksum !== sum) throw new Error(`Inconsistent string checksum in ${scenario.key}`);
-                }
-
-                if (stringChecksum == null) throw new Error("Missing string checksum");
-                if (stringChecksum !== expectedFoldString) {
-                    throw new Error(`String checksum mismatch for ${scenario.key}: expected ${expectedFoldString}, got ${stringChecksum}`);
-                }
-                const stringSpeed = mbps(totalBytes, median(stringDts));
-                stringResults.set(scenario.key, stringSpeed);
-                console.log(`done: ${scenario.label} (string) -> ${fmtMbps(stringSpeed)}`);
             } finally {
                 await scenario.teardown(persistentCtx);
             }
@@ -1227,27 +1384,39 @@ async function main(): Promise<void> {
                     console.log(`skip: ${s.label} (bun not found in PATH)`);
                 }
             } else {
-                const bunOut = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts, config.unsafeStreamMemory);
-                const bunOutJson = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts, config.unsafeStreamMemory);
-                const bunOutString = await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts, config.unsafeStreamMemory);
+                const bunOut = config.transferModes.includes("binary")
+                    ? await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts, config.unsafeStreamMemory)
+                    : {};
+                const bunOutJson = config.transferModes.includes("json")
+                    ? await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts, config.unsafeStreamMemory)
+                    : {};
+                const bunOutString = config.transferModes.includes("string")
+                    ? await runBunMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts, config.unsafeStreamMemory)
+                    : {};
                 for (const s of selectedScenarios.filter((x) => x.main === "Bun")) {
-                    const speed = bunOut[s.key];
-                    if (speed == null) console.log(`skip: ${s.label} (missing result from bun runtime)`);
-                    else {
-                        results.set(s.key, speed);
-                        console.log(`done: ${s.label} -> ${fmtMbps(speed)}`);
+                    if (config.transferModes.includes("binary")) {
+                        const speed = (bunOut as Record<string, number>)[s.key];
+                        if (speed == null) console.log(`skip: ${s.label} (missing result from bun runtime)`);
+                        else {
+                            results.set(s.key, speed);
+                            console.log(`done: ${s.label} -> ${fmtMbps(speed)}`);
+                        }
                     }
-                    const jsonSpeed = bunOutJson[s.key];
-                    if (jsonSpeed == null) console.log(`skip: ${s.label} (json result missing from bun runtime)`);
-                    else {
-                        jsonResults.set(s.key, jsonSpeed);
-                        console.log(`done: ${s.label} (json) -> ${fmtMbps(jsonSpeed)}`);
+                    if (config.transferModes.includes("json")) {
+                        const jsonSpeed = (bunOutJson as Record<string, number>)[s.key];
+                        if (jsonSpeed == null) console.log(`skip: ${s.label} (json result missing from bun runtime)`);
+                        else {
+                            jsonResults.set(s.key, jsonSpeed);
+                            console.log(`done: ${s.label} (json) -> ${fmtMbps(jsonSpeed)}`);
+                        }
                     }
-                    const stringSpeed = bunOutString[s.key];
-                    if (stringSpeed == null) console.log(`skip: ${s.label} (string result missing from bun runtime)`);
-                    else {
-                        stringResults.set(s.key, stringSpeed);
-                        console.log(`done: ${s.label} (string) -> ${fmtMbps(stringSpeed)}`);
+                    if (config.transferModes.includes("string")) {
+                        const stringSpeed = (bunOutString as Record<string, number>)[s.key];
+                        if (stringSpeed == null) console.log(`skip: ${s.label} (string result missing from bun runtime)`);
+                        else {
+                            stringResults.set(s.key, stringSpeed);
+                            console.log(`done: ${s.label} (string) -> ${fmtMbps(stringSpeed)}`);
+                        }
                     }
                 }
             }
@@ -1259,35 +1428,47 @@ async function main(): Promise<void> {
                     console.log(`skip: ${s.label} (deno not found in PATH)`);
                 }
             } else {
-                const denoOut = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts, config.unsafeStreamMemory);
-                const denoOutJson = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts, config.unsafeStreamMemory);
-                const denoOutString = await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts, config.unsafeStreamMemory);
+                const denoOut = config.transferModes.includes("binary")
+                    ? await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "binary", config.restarts, config.unsafeStreamMemory)
+                    : {};
+                const denoOutJson = config.transferModes.includes("json")
+                    ? await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "json", config.restarts, config.unsafeStreamMemory)
+                    : {};
+                const denoOutString = config.transferModes.includes("string")
+                    ? await runDenoMain(payloadBytes, config.messages, config.warmup, config.iterations, "string", config.restarts, config.unsafeStreamMemory)
+                    : {};
                 for (const s of selectedScenarios.filter((x) => x.main === "Deno")) {
-                    const speed = denoOut[s.key];
-                    if (speed == null) console.log(`skip: ${s.label} (missing result from deno runtime)`);
-                    else {
-                        results.set(s.key, speed);
-                        console.log(`done: ${s.label} -> ${fmtMbps(speed)}`);
+                    if (config.transferModes.includes("binary")) {
+                        const speed = (denoOut as Record<string, number>)[s.key];
+                        if (speed == null) console.log(`skip: ${s.label} (missing result from deno runtime)`);
+                        else {
+                            results.set(s.key, speed);
+                            console.log(`done: ${s.label} -> ${fmtMbps(speed)}`);
+                        }
                     }
-                    const jsonSpeed = denoOutJson[s.key];
-                    if (jsonSpeed == null) console.log(`skip: ${s.label} (json result missing from deno runtime)`);
-                    else {
-                        jsonResults.set(s.key, jsonSpeed);
-                        console.log(`done: ${s.label} (json) -> ${fmtMbps(jsonSpeed)}`);
+                    if (config.transferModes.includes("json")) {
+                        const jsonSpeed = (denoOutJson as Record<string, number>)[s.key];
+                        if (jsonSpeed == null) console.log(`skip: ${s.label} (json result missing from deno runtime)`);
+                        else {
+                            jsonResults.set(s.key, jsonSpeed);
+                            console.log(`done: ${s.label} (json) -> ${fmtMbps(jsonSpeed)}`);
+                        }
                     }
-                    const stringSpeed = denoOutString[s.key];
-                    if (stringSpeed == null) console.log(`skip: ${s.label} (string result missing from deno runtime)`);
-                    else {
-                        stringResults.set(s.key, stringSpeed);
-                        console.log(`done: ${s.label} (string) -> ${fmtMbps(stringSpeed)}`);
+                    if (config.transferModes.includes("string")) {
+                        const stringSpeed = (denoOutString as Record<string, number>)[s.key];
+                        if (stringSpeed == null) console.log(`skip: ${s.label} (string result missing from deno runtime)`);
+                        else {
+                            stringResults.set(s.key, stringSpeed);
+                            console.log(`done: ${s.label} (string) -> ${fmtMbps(stringSpeed)}`);
+                        }
                     }
                 }
             }
         }
 
-        printTable("Binary Transfer", selectedScenarios, results);
-        printTable("JSON Transfer", selectedScenarios, jsonResults);
-        printTable("String Transfer", selectedScenarios, stringResults);
+        if (config.transferModes.includes("binary")) printTable("Binary Transfer", selectedScenarios, results);
+        if (config.transferModes.includes("json")) printTable("JSON Transfer", selectedScenarios, jsonResults);
+        if (config.transferModes.includes("string")) printTable("String Transfer", selectedScenarios, stringResults);
     }
 }
 

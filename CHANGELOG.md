@@ -2,9 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
-## TODO:
-- add worker.module.query api to get a list of loaded modules in memory
+## [0.9.50] Apr 24, 2026
 
+### Fixed
+- Fixed bridge serialization for sliced `TypedArray` and `DataView` values:
+  - Node -> Deno and Deno -> Node transfers now preserve the view byte window instead of reconstructing from the wrong backing-buffer offset.
+  - stream chunk conversion now treats typed-array `length` as element count, not byte count.
+- Fixed binary wire payload handling:
+  - larger `ArrayBuffer`/typed-array payloads now use compact base64 wire encoding instead of very large JSON number arrays.
+  - buffer hydration now accepts both legacy byte arrays and base64 payloads.
+  - decoded Node buffers are copied into exact `ArrayBuffer` instances so pooled backing-store bytes are not exposed accidentally.
+- Fixed object graph fidelity for plain Deno results:
+  - shared acyclic object references now fall back to graph-aware dehydration instead of being flattened by the fast JSON path.
+- Hardened prototype-sensitive bridge payloads:
+  - `__proto__` keys are filtered from graph/global serialization.
+  - wire-marker detection now recurses through arrays and treats prototype-sensitive keys as requiring safe hydration.
+- Fixed request id generation so pending request ids remain one-based and unique from the first request.
+- Fixed a startup race for inspector-enabled workers by waiting briefly for the inspector listener to bind before returning from worker creation.
+- Fixed CommonJS ESM facade generation for reserved named exports such as `case`.
+
+### Changed
+- Improved direct V8 bridge construction for common non-JSON values including `BigInt`, `RegExp`, `URL`, `URLSearchParams`, `Map`, `Set`, host functions, and plain acyclic JSON data.
+- Shifted more bridge encoding/decoding responsibility into Rust-native paths:
+  - `eval(...)` arguments now cross the Node boundary as raw JS values so the Rust bridge stays the canonical encoder.
+  - worker `postMessage` and host callback dispatch now prefer raw V8 fast paths, with JS wire dehydration kept as a compatibility fallback where needed.
+- Changed high-volume data-plane sends to use nonblocking backpressure behavior, while keeping control-plane request delivery blocking for completion guarantees.
+- Reworked CJS helper code into dedicated TypeScript helpers and expanded CJS export/require detection for generated facades.
+- Reworked handle-runtime helper source into its own module and reduced duplicated apply-operation logic.
+
+### Benchmarks
+- Updated IPC bandwidth benchmarks with bounded concurrency (`--inflight`), trimmed medians (`--trim-ratio`), selectable transfer modes, per-iteration settling, and more robust stream teardown.
+
+### Tests
+- Added regression coverage for sliced typed arrays/DataViews across both bridge directions.
+- Added regression coverage for shared acyclic object graph preservation.
+- Added Rust coverage for base64 buffer decoding, sliced-view rebasing, stream byte slicing, request id allocation, and prototype-sensitive wire marker detection.
+- Added module-eval coverage for CJS reserved named exports.
+
+### Docs & Maintenance
+- Updated README wording and examples for installation requirements, remote import configuration, cleanup calls, stream transport wording, Node.js/CJS interop, and inspector config.
+- Rewrote terse or stale internal comments in bridge, runtime, filesystem, module loading, env, and native API code.
 
 ## [0.9.40] Mar 31, 2026
 

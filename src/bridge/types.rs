@@ -2,6 +2,7 @@ use bytes::Bytes;
 use neon::{prelude::*, result::Throw};
 use serde::{Deserialize, Serialize};
 
+/// Runtime-neutral representation of JavaScript values crossing the Node, Rust, and Deno boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
 pub enum JsValueBridge {
@@ -11,7 +12,8 @@ pub enum JsValueBridge {
     Number(f64),
     String(String),
 
-    BigInt(String), // decimal string
+    /// Decimal string form, preserving values that cannot round-trip through `f64`.
+    BigInt(String),
     DateMs(f64),
 
     RegExp {
@@ -19,15 +21,18 @@ pub enum JsValueBridge {
         flags: String,
     },
 
-    // Binary values
+    /// Raw bytes plus the JS view metadata needed to reconstruct ArrayBuffer views.
     BufferView {
-        kind: String, // "ArrayBuffer" | "Uint8Array" | "Int32Array" | "DataView" | ...
+        /// Constructor name such as `ArrayBuffer`, `Uint8Array`, `Int32Array`, or `DataView`.
+        kind: String,
         bytes: Bytes,
         byte_offset: usize,
-        length: usize, // for typed arrays: element length; for DataView: byteLength; for ArrayBuffer: byteLength
+        /// Typed arrays use element length; DataView and ArrayBuffer use byte length.
+        length: usize,
     },
 
-    Map(Vec<(JsValueBridge, JsValueBridge)>), // primitive keys only
+    /// Map entries in insertion order. Some JS-side encoders may omit non-primitive keys.
+    Map(Vec<(JsValueBridge, JsValueBridge)>),
     Set(Vec<JsValueBridge>),
 
     Url {
@@ -54,6 +59,7 @@ pub enum JsValueBridge {
     },
 }
 
+/// Options attached to one eval or evalModule request.
 #[derive(Debug, Clone)]
 pub struct EvalOptions {
     pub filename: String,
@@ -66,7 +72,7 @@ pub struct EvalOptions {
 }
 
 impl Default for EvalOptions {
-    // Provides default default values used by bridge encoding/decoding between Rust, V8, and Neon.
+    // Defaults match script eval behavior unless callers request module loading or limits.
     fn default() -> Self {
         Self {
             filename: "Unnamed Script".to_string(),
@@ -81,7 +87,7 @@ impl Default for EvalOptions {
 }
 
 impl EvalOptions {
-    /// Constructs neon from source input for bridge encoding/decoding between Rust, V8, and Neon.
+    /// Parses eval options from a JavaScript options object.
     pub fn from_neon<'a>(cx: &mut FunctionContext<'a>, idx: i32) -> Result<Self, Throw> {
         let mut out = EvalOptions::default();
 
@@ -156,7 +162,7 @@ impl EvalOptions {
 }
 
 impl JsValueBridge {
-    /// Js error to bridge.
+    /// Converts a Deno core JavaScript error into a bridge error payload.
     pub fn js_error_to_bridge(e: Box<deno_core::error::JsError>) -> Self {
         Self::Error {
             name: "Error".into(),
@@ -167,7 +173,7 @@ impl JsValueBridge {
         }
     }
 
-    /// Any error to bridge.
+    /// Converts an arbitrary Rust error into a bridge error payload.
     pub fn any_error_to_bridge(e: deno_core::error::AnyError) -> Self {
         Self::Error {
             name: "Error".into(),
@@ -178,7 +184,7 @@ impl JsValueBridge {
         }
     }
 
-    /// Simple err.
+    /// Builds a generic bridge error with only a message.
     pub fn simple_err(msg: String) -> Self {
         Self::Error {
             name: "Error".into(),

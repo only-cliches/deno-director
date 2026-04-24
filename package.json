@@ -1,6 +1,6 @@
 {
   "name": "deno-director",
-  "version": "0.9.40",
+  "version": "0.9.50",
   "description": "Embed isolated Deno runtimes inside a Node.js process with a native bridge, explicit runtime policy, and a full host-side control surface.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

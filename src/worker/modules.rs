@@ -16,8 +16,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use regex::Regex;
+use tokio::sync::mpsc;
 
 use deno_core::url::Url;
 
@@ -36,7 +36,7 @@ enum CallbackDecisionWait {
     TimedOut,
 }
 
-// Controls debug logging behavior used by module loading and import policy flow.
+// Enables verbose module-loader diagnostics without changing runtime policy.
 fn dbg_imports_enabled() -> bool {
     std::env::var("DENOJS_WORKER_DEBUG_IMPORTS")
         .ok()
@@ -79,7 +79,8 @@ pub struct ModuleRegistry {
 impl ModuleRegistry {
     const DEFAULT_PERSISTENT_LIMIT: usize = 512;
 
-    // Internal helper for module loading and import policy flow; it handles configured persistent limit.
+    // Persistent registry entries are capped to avoid unbounded growth from
+    // repeated evalModule/registerModule calls.
     fn configured_persistent_limit() -> usize {
         std::env::var("DENOJS_WORKER_PERSISTENT_MODULE_LIMIT")
             .ok()
@@ -101,7 +102,7 @@ impl ModuleRegistry {
         }
     }
 
-    /// Creates a new instance initialized for module loading and import policy flow.
+    /// Creates a registry with the configured persistent-module cap.
     pub fn new(_base_url: Url) -> Self {
         Self::with_persistent_limit(Self::configured_persistent_limit())
     }
@@ -208,7 +209,7 @@ impl ModuleRegistry {
         format!("denojs-worker://virtual/__vm_{n}.{ext}")
     }
 
-    /// Checks whether has and returns the boolean result for module resolution, policy, and remote loading.
+    /// Returns true when a module or user-facing alias is registered.
     pub fn has(&self, specifier: &str) -> bool {
         self.state
             .lock()
@@ -234,7 +235,7 @@ impl ModuleRegistry {
         state.aliases.get(specifier).cloned()
     }
 
-    /// Stores ephemeral in caches/state used by module resolution, policy, and remote loading.
+    /// Stores a temporary module that is evicted after the loader consumes it.
     pub fn put_ephemeral(&self, specifier: &str, code: &str, module_type: ModuleType) {
         let mut state = match self.state.lock() {
             Ok(g) => g,
@@ -257,7 +258,7 @@ impl ModuleRegistry {
         }
     }
 
-    /// Stores persistent in caches/state used by module resolution, policy, and remote loading.
+    /// Stores a persistent generated module subject to the registry LRU cap.
     pub fn put_persistent(&self, specifier: &str, code: &str, module_type: ModuleType) {
         let mut state = match self.state.lock() {
             Ok(g) => g,
@@ -302,7 +303,7 @@ impl ModuleRegistry {
         Self::evict_persistent_if_needed(&mut state);
     }
 
-    /// Removes remove from tracked state used by module resolution, policy, and remote loading.
+    /// Removes a module by canonical specifier or user alias.
     pub fn remove(&self, specifier: &str) {
         let mut state = match self.state.lock() {
             Ok(g) => g,
@@ -412,7 +413,7 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Checks whether request path matches an allow-list path boundary.
+    // Matches an allow-list path only at exact or segment boundaries.
     fn path_is_prefix_boundary(allow_path: &str, req_path: &str) -> bool {
         if allow_path.is_empty() || allow_path == "/" {
             return true;
@@ -447,7 +448,8 @@ impl DynamicModuleLoader {
         Self::path_is_prefix_boundary(allow.path(), req.path())
     }
 
-    // Internal helper for module loading and import policy flow; it handles node disk resolve enabled.
+    // Node disk resolution is enabled by either legacy top-level flags or the
+    // newer moduleLoader config.
     fn node_disk_resolve_enabled(&self) -> bool {
         self.node_resolve
             || self.node_compat
@@ -458,17 +460,18 @@ impl DynamicModuleLoader {
                 .unwrap_or(false)
     }
 
-    // Internal helper for module loading and import policy flow; it handles jsr resolve enabled.
+    // JSR resolution is intentionally feature-gated because it rewrites package
+    // specifiers to remote HTTPS imports.
     fn jsr_resolve_enabled(&self) -> bool {
         self.module_loader_cfg().jsr_resolve
     }
 
-    /// Checks whether internal virtual url and returns the boolean result for module resolution, policy, and remote loading.
+    /// Returns true for virtual URLs owned by this module loader.
     pub fn is_internal_virtual_url(u: &Url) -> bool {
         u.scheme() == "denojs-worker" && u.host_str() == Some("virtual")
     }
 
-    /// Checks whether bare specifier and returns the boolean result for module resolution, policy, and remote loading.
+    /// Returns true for package-style specifiers that need Node/JSR resolution.
     pub fn is_bare_specifier(specifier: &str) -> bool {
         if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
         {
@@ -500,7 +503,7 @@ impl DynamicModuleLoader {
         None
     }
 
-    /// Encodes resolve url into transport-safe form for module resolution, policy, and remote loading.
+    /// Wraps a resolve request in an internal URL so the Deno loader can round-trip it.
     pub fn encode_resolve_url(&self, specifier: &str, referrer: &str) -> Url {
         let mut u = Url::parse("denojs-worker://resolve").expect("parse resolve url");
         u.query_pairs_mut()
@@ -509,7 +512,7 @@ impl DynamicModuleLoader {
         u
     }
 
-    /// Decodes resolve url from wire/serialized form for module resolution, policy, and remote loading.
+    /// Decodes an internal resolve URL back into the original specifier and referrer.
     pub fn decode_resolve_url(u: &Url) -> Option<(String, String)> {
         if u.scheme() != "denojs-worker" {
             return None;
@@ -526,7 +529,7 @@ impl DynamicModuleLoader {
         Some((spec?, referrer.unwrap_or_default()))
     }
 
-    /// Checks whether sandbox and returns the boolean result for module resolution, policy, and remote loading.
+    /// Returns true when a resolved file URL stays inside the configured sandbox root.
     pub fn within_sandbox(&self, _file_url: &Url) -> bool {
         let root_abs =
             std::fs::canonicalize(&self.sandbox_root).unwrap_or_else(|_| self.sandbox_root.clone());
@@ -618,7 +621,11 @@ impl DynamicModuleLoader {
     }
 
     // Resolves package.json exports targets for a bare package subpath.
-    fn resolve_node_package_exports(pkg_dir: &Path, subpath: &str, exts: &[&str]) -> Option<PathBuf> {
+    fn resolve_node_package_exports(
+        pkg_dir: &Path,
+        subpath: &str,
+        exts: &[&str],
+    ) -> Option<PathBuf> {
         let pkg_json = pkg_dir.join("package.json");
         if !pkg_json.exists() {
             return None;
@@ -671,7 +678,9 @@ impl DynamicModuleLoader {
         }
 
         match exports {
-            serde_json::Value::String(_) | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::Value::String(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => {
                 if let Some(map) = exports.as_object() {
                     if let Some(target) = map.get(&request).and_then(pick_target)
                         && let Some(resolved) = candidate_from_target(pkg_dir, &target, exts)
@@ -695,7 +704,8 @@ impl DynamicModuleLoader {
                         if !request.starts_with(prefix) || !request.ends_with(suffix) {
                             continue;
                         }
-                        let middle = &request[prefix.len()..request.len().saturating_sub(suffix.len())];
+                        let middle =
+                            &request[prefix.len()..request.len().saturating_sub(suffix.len())];
                         let target = pick_target(target)?;
                         let mapped = target.replace('*', middle);
                         if let Some(resolved) = candidate_from_target(pkg_dir, &mapped, exts) {
@@ -931,7 +941,7 @@ impl DynamicModuleLoader {
         Self::decode_resolve_url(module_specifier).unwrap_or_else(|| (spec, referrer_from_runtime))
     }
 
-    // Internal helper for module loading and import policy flow; it handles imports policy error.
+    // Converts the coarse imports policy into an early load error when imports are disabled.
     fn imports_policy_error(&self, orig_spec: &str) -> Option<JsErrorBox> {
         match self.imports_policy {
             crate::worker::state::ImportsPolicy::DenyAll => Some(JsErrorBox::generic(format!(
@@ -942,7 +952,7 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Internal helper for module loading and import policy flow; it handles callback imports blocked during eval sync.
+    // Callback imports cannot run during evalSync because they would need to re-enter Node.
     fn callback_imports_blocked_during_eval_sync(&self) -> bool {
         self.eval_sync_active
             .as_ref()
@@ -997,12 +1007,12 @@ impl DynamicModuleLoader {
         self.try_deno_resolve(specifier, referrer)
     }
 
-    // Checks whether wrap with redirect and returns the boolean result for module resolution, policy, and remote loading.
+    // Internal resolve URLs are redirected after callback/import-policy decisions.
     fn should_wrap_with_redirect(requested_specifier: &Url) -> bool {
         requested_specifier.scheme() == "denojs-worker"
     }
 
-    // Resolves allow disk or error according to rules used by module resolution, policy, and remote loading.
+    // Applies disk-style resolution for callback decisions that explicitly allow disk.
     fn resolve_allow_disk_or_error(
         &self,
         orig_spec: &str,
@@ -1011,7 +1021,7 @@ impl DynamicModuleLoader {
         self.resolve_like_allow_disk(orig_spec, orig_referrer)
     }
 
-    // Resolves rewritten or error according to rules used by module resolution, policy, and remote loading.
+    // Resolves a callback-provided replacement specifier using disk-style rules.
     fn resolve_rewritten_or_error(
         &self,
         new_spec: &str,
@@ -1020,7 +1030,7 @@ impl DynamicModuleLoader {
         self.resolve_like_allow_disk(new_spec.trim(), orig_referrer)
     }
 
-    // Checks whether load remote non callback and returns the boolean result for module resolution, policy, and remote loading.
+    // Allows remote fetches when no imports callback is involved and the scheme is enabled.
     fn should_load_remote_non_callback(&self, module_specifier: &Url) -> bool {
         (module_specifier.scheme() == "http" && self.http_resolve_enabled())
             || (module_specifier.scheme() == "https" && self.https_resolve_enabled())
@@ -1114,13 +1124,15 @@ impl DynamicModuleLoader {
                 .unwrap_or_else(|| "js".to_string());
             let classification = self.classify_module_source(&path, &ext, &source);
             let force_match = self.match_forced_cjs_rule(&path);
-            let looks_like_cjs = !Self::looks_like_esm_source(&source)
-                && Self::looks_like_cjs_source(&source);
+            let looks_like_cjs =
+                !Self::looks_like_esm_source(&source) && Self::looks_like_cjs_source(&source);
             let should_wrap = force_match.is_some()
                 || looks_like_cjs
                 || self.should_wrap_file_as_cjs(&path, &ext, &classification);
-            let (orig_specifier, orig_referrer) =
-                Self::original_spec_and_referrer(&requested_specifier, maybe_referrer_owned.as_ref());
+            let (orig_specifier, orig_referrer) = Self::original_spec_and_referrer(
+                &requested_specifier,
+                maybe_referrer_owned.as_ref(),
+            );
             self.emit_import_classified(
                 &orig_specifier,
                 &orig_referrer,
@@ -1196,7 +1208,8 @@ impl DynamicModuleLoader {
         })
     }
 
-    // Reads or fetch remote source for module resolution, policy, and remote loading.
+    // Reads the remote-module cache unless reload is requested, then fetches
+    // and refreshes the cache with payload-size guards.
     async fn read_or_fetch_remote_source(
         &self,
         module_specifier: &Url,
@@ -1228,7 +1241,7 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Loads remote non callback module during module resolution, policy, and remote loading.
+    // Loads a direct remote module when no imports callback is involved.
     async fn load_remote_non_callback_module(
         &self,
         module_specifier: Url,
@@ -1249,7 +1262,8 @@ impl DynamicModuleLoader {
         ))
     }
 
-    // Normalizes callback decision into a canonical form before it is used by module resolution, policy, and remote loading.
+    // Treat closed callback channels as a policy block, but surface timeouts as
+    // errors so callers can distinguish slow callbacks from explicit denial.
     fn normalize_callback_decision(
         wait: CallbackDecisionWait,
         orig_spec: &str,
@@ -1266,7 +1280,8 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Internal helper for module loading and import policy flow; it handles source typed wrapper.
+    // The callback-provided source is stored under a generated module URL; this
+    // wrapper preserves the originally requested specifier for the module graph.
     fn source_typed_wrapper(virt: &str) -> String {
         format!(
             "export * from {v};\nexport {{ default }} from {v};\n",
@@ -1275,7 +1290,7 @@ impl DynamicModuleLoader {
         )
     }
 
-    // Builds source typed module required by module resolution, policy, and remote loading.
+    // Builds a virtual module from source returned by the imports callback.
     fn build_source_typed_module(
         &self,
         requested_specifier: &Url,
@@ -1348,7 +1363,7 @@ impl DynamicModuleLoader {
         Self::normalize_callback_decision(wait, orig_spec)
     }
 
-    // Returns parsed permissions config used by module permission checks.
+    // Returns the raw permissions config used by module permission checks.
     fn permissions_cfg(&self) -> Option<&serde_json::Value> {
         self.permissions.as_ref()
     }
@@ -1412,7 +1427,7 @@ impl DynamicModuleLoader {
         allow.eq_ignore_ascii_case(host)
     }
 
-    // Checks whether import url and returns the boolean result for module resolution, policy, and remote loading.
+    // Matches a remote URL against permissions.import host, prefix, or wildcard rules.
     fn allows_import_url(&self, u: &Url) -> bool {
         let Some(cfg) = self.permissions_cfg() else {
             return false;
@@ -1450,7 +1465,7 @@ impl DynamicModuleLoader {
         false
     }
 
-    // Checks whether net url and returns the boolean result for module resolution, policy, and remote loading.
+    // Matches a remote URL against permissions.net host[:port] rules.
     fn allows_net_url(&self, u: &Url) -> bool {
         let Some(cfg) = self.permissions_cfg() else {
             return false;
@@ -1521,17 +1536,17 @@ impl DynamicModuleLoader {
         self.module_loader.clone().unwrap_or_default()
     }
 
-    // Internal helper for module loading and import policy flow; it handles https resolve enabled.
+    // Feature gate for HTTPS module fetching.
     fn https_resolve_enabled(&self) -> bool {
         self.module_loader_cfg().https_resolve
     }
 
-    // Internal helper for module loading and import policy flow; it handles http resolve enabled.
+    // Feature gate for HTTP module fetching.
     fn http_resolve_enabled(&self) -> bool {
         self.module_loader_cfg().http_resolve
     }
 
-    // Internal helper for module loading and import policy flow; it handles file imports outside the worker cwd sandbox.
+    // Feature gate for file imports outside the worker cwd sandbox.
     fn allow_outside_cwd_enabled(&self) -> bool {
         self.module_loader_cfg().allow_outside_cwd
     }
@@ -1604,7 +1619,7 @@ impl DynamicModuleLoader {
         JsErrorBox::generic(msg)
     }
 
-    // Checks whether CJS interop wrapping is enabled.
+    // Returns true when CJS files should be wrapped in an ESM facade.
     fn cjs_interop_enabled(&self) -> bool {
         !matches!(
             self.module_loader_cfg().cjs_interop,
@@ -1612,7 +1627,7 @@ impl DynamicModuleLoader {
         )
     }
 
-    // Transpiles ts enabled as part of module resolution, policy, and remote loading.
+    // Feature gate for TS/TSX/JSX transpilation.
     fn transpile_ts_enabled(&self) -> bool {
         self.module_loader_cfg().transpile_ts
     }
@@ -1623,12 +1638,12 @@ impl DynamicModuleLoader {
         p.rsplit('.').next().map(|s| s.to_string())
     }
 
-    // Checks whether a module URL points to a `.wasm` file.
+    // Detects WebAssembly module URLs after resolution.
     fn is_wasm_url(u: &Url) -> bool {
         Self::module_ext(u).as_deref() == Some("wasm")
     }
 
-    // Checks whether a raw module specifier references a `.wasm` path.
+    // Detects direct `.wasm` specifiers before URL resolution.
     fn is_wasm_specifier(specifier: &str) -> bool {
         if let Ok(u) = Url::parse(specifier) {
             return Self::is_wasm_url(&u);
@@ -1649,7 +1664,7 @@ impl DynamicModuleLoader {
         )))
     }
 
-    // Checks whether ts like ext and returns the boolean result for module resolution, policy, and remote loading.
+    // File extensions that may require transpilation before Deno loads them.
     fn is_ts_like_ext(ext: &str) -> bool {
         matches!(ext, "ts" | "tsx" | "jsx")
     }
@@ -1748,7 +1763,7 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Checks whether a string is a JS identifier supported by ESM named exports.
+    // Returns true when a property name can be used as a JavaScript binding identifier.
     fn is_js_identifier(name: &str) -> bool {
         let mut chars = name.chars();
         let Some(first) = chars.next() else {
@@ -1760,6 +1775,58 @@ impl DynamicModuleLoader {
         chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
     }
 
+    // Reserved words need export aliases because `export const case = ...` is invalid syntax.
+    fn is_js_reserved_word(name: &str) -> bool {
+        matches!(
+            name,
+            "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "new"
+                | "null"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "static"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "yield"
+        )
+    }
 
     // Returns nearest package root and parsed package.json if found.
     fn nearest_package_json(path: &Path) -> Option<(PathBuf, serde_json::Value)> {
@@ -1819,7 +1886,7 @@ impl DynamicModuleLoader {
         }
     }
 
-    // Checks whether source appears to use CommonJS patterns.
+    // Lightweight fallback when parser-backed CJS analysis is unavailable or inconclusive.
     fn looks_like_cjs_source(source: &str) -> bool {
         source.contains("module.exports")
             || source.contains("exports.")
@@ -1863,7 +1930,7 @@ impl DynamicModuleLoader {
         Regex::new(&full).ok()
     }
 
-    // Attempts to match configured forced-CJS rule for this path.
+    // Returns the matching forced-CJS rule label for diagnostics, if any.
     fn match_forced_cjs_rule(&self, path: &Path) -> Option<String> {
         let cfg = self.module_loader_cfg();
         if cfg.cjs_force_paths.is_empty() {
@@ -1889,8 +1956,9 @@ impl DynamicModuleLoader {
                 }
                 CjsForcePathRule::Glob(raw) => {
                     let pattern = self.resolve_force_entry_path(&raw);
-                    static GLOB_CACHE: OnceLock<Mutex<HashMap<String, Option<globset::GlobMatcher>>>> =
-                        OnceLock::new();
+                    static GLOB_CACHE: OnceLock<
+                        Mutex<HashMap<String, Option<globset::GlobMatcher>>>,
+                    > = OnceLock::new();
                     let cache = GLOB_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
                     let compiled = if let Ok(mut c) = cache.lock() {
                         if let Some(hit) = c.get(&pattern) {
@@ -1981,8 +2049,10 @@ impl DynamicModuleLoader {
             Ok(parsed) => {
                 let esm = !parsed.compute_is_script();
                 let cjs_analysis = parsed.analyze_cjs();
-                let cjs =
-                    !esm && (!cjs_analysis.exports.is_empty() || !cjs_analysis.reexports.is_empty() || Self::looks_like_cjs_source(source));
+                let cjs = !esm
+                    && (!cjs_analysis.exports.is_empty()
+                        || !cjs_analysis.reexports.is_empty()
+                        || Self::looks_like_cjs_source(source));
                 ModuleSyntaxClassification {
                     cjs,
                     esm,
@@ -2023,7 +2093,7 @@ impl DynamicModuleLoader {
         computed
     }
 
-    // Checks whether file should be wrapped with Node-style CJS interop facade.
+    // Decides whether a resolved source file should execute under the Node-style CJS facade.
     fn should_wrap_file_as_cjs(
         &self,
         path: &Path,
@@ -2122,10 +2192,30 @@ impl DynamicModuleLoader {
         spec.to_string()
     }
 
-    // Collects literal `require("...")` calls used by CJS wrapper shim.
+    // Collects parser-discovered reexports plus simple literal `require("...")` calls.
     fn collect_cjs_require_specifiers(source: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
+
+        if let Ok(specifier) = Url::parse("file:///__denojs_worker_cjs_probe__.js")
+            && let Ok(parsed) = deno_ast::parse_program(deno_ast::ParseParams {
+                specifier,
+                text: source.into(),
+                media_type: deno_ast::MediaType::JavaScript,
+                capture_tokens: false,
+                scope_analysis: false,
+                maybe_syntax: None,
+            })
+        {
+            let cjs_analysis = parsed.analyze_cjs();
+            for dep in cjs_analysis.reexports.iter() {
+                let raw = dep.to_string();
+                if seen.insert(raw.clone()) {
+                    out.push((raw.clone(), Self::normalize_cjs_require_specifier(&raw)));
+                }
+            }
+        }
+
         let mut cursor = 0usize;
         while let Some(off) = source[cursor..].find("require(") {
             let start = cursor + off + "require(".len();
@@ -2168,12 +2258,62 @@ impl DynamicModuleLoader {
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            if i < bytes.len() && bytes[i] as char == ')' {
-                if seen.insert(raw.clone()) {
-                    out.push((raw.clone(), Self::normalize_cjs_require_specifier(&raw)));
-                }
+            if i < bytes.len() && bytes[i] as char == ')' && seen.insert(raw.clone()) {
+                out.push((raw.clone(), Self::normalize_cjs_require_specifier(&raw)));
             }
             cursor = i.saturating_add(1);
+        }
+
+        out
+    }
+
+    // Scans CJS source for probable named exports that the ESM facade should expose.
+    fn collect_cjs_named_exports(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Ok(specifier) = Url::parse("file:///__denojs_worker_cjs_probe__.js")
+            && let Ok(parsed) = deno_ast::parse_program(deno_ast::ParseParams {
+                specifier,
+                text: source.into(),
+                media_type: deno_ast::MediaType::JavaScript,
+                capture_tokens: false,
+                scope_analysis: false,
+                maybe_syntax: None,
+            })
+        {
+            let cjs_analysis = parsed.analyze_cjs();
+            for name in cjs_analysis.exports.iter() {
+                let name = name.to_string();
+                if Self::is_js_identifier(&name)
+                    && name != "default"
+                    && name != "__esModule"
+                    && seen.insert(name.clone())
+                {
+                    out.push(name);
+                }
+            }
+        }
+        for raw_line in source.lines() {
+            if let Some(name) = Self::parse_exports_assignment_name(raw_line)
+                && seen.insert(name.clone())
+            {
+                out.push(name);
+            }
+            if let Some(name) = Self::parse_module_exports_assignment_name(raw_line)
+                && seen.insert(name.clone())
+            {
+                out.push(name);
+            }
+            if let Some(name) = Self::parse_define_property_export_name(raw_line)
+                && seen.insert(name.clone())
+            {
+                out.push(name);
+            }
+        }
+        for name in Self::parse_module_exports_object_literal_names(source) {
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
         }
         out
     }
@@ -2289,27 +2429,72 @@ impl DynamicModuleLoader {
         out
     }
 
-    // Scans CJS source and returns probable named exports for ESM facade aliases.
-    fn collect_cjs_named_exports(source: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = BTreeSet::new();
-        for raw_line in source.lines() {
-            if let Some(name) = Self::parse_exports_assignment_name(raw_line) {
-                names.insert(name);
-            }
-            if let Some(name) = Self::parse_module_exports_assignment_name(raw_line) {
-                names.insert(name);
-            }
-            if let Some(name) = Self::parse_define_property_export_name(raw_line) {
-                names.insert(name);
+    // Builds an ESM facade that evaluates CJS source with Node-style wrapper semantics.
+    pub fn build_module_eval_cjs_source(source: &str) -> Option<String> {
+        let source_json = serde_json::to_string(source).ok()?;
+        let named = Self::collect_cjs_named_exports(source);
+        let requires = Self::collect_cjs_require_specifiers(source);
+
+        let mut esm = String::new();
+        for (idx, (_raw, norm)) in requires.iter().enumerate() {
+            let spec_json = serde_json::to_string(norm).ok()?;
+            esm.push_str(&format!("import * as __ddReq{idx} from {spec_json};\n"));
+        }
+        esm.push_str("const exports = {};\n");
+        esm.push_str("const module = { exports, filename: \"<module.eval:cjs>\", id: \"<module.eval:cjs>\", loaded: false, parent: null, children: [], paths: [] };\n");
+        esm.push_str("const __ddRequireMap = new Map();\n");
+        for (idx, (raw, norm)) in requires.iter().enumerate() {
+            let raw_json = serde_json::to_string(raw).ok()?;
+            let norm_json = serde_json::to_string(norm).ok()?;
+            esm.push_str(&format!("__ddRequireMap.set({raw_json}, __ddReq{idx});\n"));
+            if raw != norm {
+                esm.push_str(&format!("__ddRequireMap.set({norm_json}, __ddReq{idx});\n"));
             }
         }
-        for name in Self::parse_module_exports_object_literal_names(source) {
-            names.insert(name);
+        esm.push_str("const require = (spec) => {\n");
+        esm.push_str("  const __ddMod = __ddRequireMap.get(String(spec));\n");
+        esm.push_str(
+            "  if (!__ddMod) throw new Error(`Unsupported require() in module.eval({ cjs: true }): ${String(spec)}`);\n",
+        );
+        esm.push_str("  try {\n");
+        esm.push_str("    const __ddDef = (__ddMod && (typeof __ddMod === \"object\" || typeof __ddMod === \"function\")) ? __ddMod.default : undefined;\n");
+        esm.push_str("    if (__ddDef && (typeof __ddDef === \"object\" || typeof __ddDef === \"function\")) return __ddDef;\n");
+        esm.push_str("  } catch {}\n");
+        esm.push_str("  if (__ddMod && (typeof __ddMod === \"object\" || typeof __ddMod === \"function\")) {\n");
+        esm.push_str("    const __ddOut = Object.create(null);\n");
+        esm.push_str(
+            "    for (const __k of Object.keys(__ddMod)) { try { __ddOut[__k] = __ddMod[__k]; } catch {} }\n",
+        );
+        esm.push_str("    return __ddOut;\n");
+        esm.push_str("  }\n");
+        esm.push_str("  return __ddMod;\n");
+        esm.push_str("};\n");
+        esm.push_str(&format!("const __ddSource = {source_json};\n"));
+        esm.push_str(
+            "const __ddFn = new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\", __ddSource);\n",
+        );
+        esm.push_str(
+            "try { __ddFn.call(module.exports, module.exports, require, module, module.filename, \".\"); } finally { module.loaded = true; }\n",
+        );
+        esm.push_str("const __ddFinal = module.exports;\n");
+        esm.push_str("const __ddNamed = (__ddFinal && (typeof __ddFinal === \"object\" || typeof __ddFinal === \"function\")) ? __ddFinal : Object.create(null);\n");
+        esm.push_str("export default __ddFinal;\n");
+        let mut alias_idx = 0usize;
+        for name in named {
+            let key_json = serde_json::to_string(&name).ok()?;
+            if Self::is_js_reserved_word(&name) {
+                let alias = format!("__ddExport_{alias_idx}");
+                alias_idx += 1;
+                esm.push_str(&format!("const {alias} = __ddNamed[{key_json}];\n"));
+                esm.push_str(&format!("export {{ {alias} as {name} }};\n"));
+            } else {
+                esm.push_str(&format!("export const {name} = __ddNamed[{key_json}];\n"));
+            }
         }
-        names.into_iter().collect()
+        Some(esm)
     }
 
-    // Builds ESM source that evaluates CJS source via Node-style wrapper semantics.
+    // Builds an ESM facade that evaluates CJS source with Node-style wrapper semantics.
     fn build_node_cjs_interop_source(resolved: &Url, source: &str) -> Option<String> {
         let source_json = serde_json::to_string(source).ok()?;
         let resolved_json = serde_json::to_string(resolved.as_str()).ok()?;
@@ -2359,10 +2544,14 @@ impl DynamicModuleLoader {
         let mut alias_idx = 0usize;
         for name in named {
             let key_json = serde_json::to_string(&name).ok()?;
-            let alias = format!("__ddExport_{alias_idx}");
-            alias_idx += 1;
-            esm.push_str(&format!("const {alias} = __ddNamed[{key_json}];\n"));
-            esm.push_str(&format!("export {{ {alias} as {name} }};\n"));
+            if Self::is_js_reserved_word(&name) {
+                let alias = format!("__ddExport_{alias_idx}");
+                alias_idx += 1;
+                esm.push_str(&format!("const {alias} = __ddNamed[{key_json}];\n"));
+                esm.push_str(&format!("export {{ {alias} as {name} }};\n"));
+            } else {
+                esm.push_str(&format!("export const {name} = __ddNamed[{key_json}];\n"));
+            }
         }
         Some(esm)
     }
@@ -2388,7 +2577,12 @@ impl DynamicModuleLoader {
 
         if std::env::var("DENOJS_WORKER_DEBUG_CJS")
             .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
         {
             let matched = std::env::var("DENOJS_WORKER_DEBUG_CJS_MATCH")
@@ -2489,7 +2683,7 @@ impl DynamicModuleLoader {
         cache_dir.join(format!("{h:016x}.js"))
     }
 
-    // Internal helper for module loading and import policy flow; it handles maybe transpile ts like.
+    // Transpiles TypeScript-like sources when loader policy allows it.
     fn maybe_transpile_ts_like(
         &self,
         module_specifier: &Url,
@@ -2554,7 +2748,7 @@ Specifier: {}",
 }
 
 impl ModuleLoader for DynamicModuleLoader {
-    // Resolves resolve according to rules used by module resolution, policy, and remote loading.
+    // Entry point called by Deno's module graph resolver.
     fn resolve(
         &self,
         specifier: &str,
@@ -2854,12 +3048,12 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    // Test helper used by module-loader unit tests.
+    // Creates a registry with a small persistent-cache limit for eviction tests.
     fn test_registry(limit: usize) -> ModuleRegistry {
         ModuleRegistry::with_persistent_limit_for_test(limit)
     }
 
-    // Test helper used by module-loader unit tests.
+    // Builds a minimal loader with configurable remote policy.
     fn test_loader(https_resolve: bool, permissions: serde_json::Value) -> DynamicModuleLoader {
         let (node_tx, _node_rx) = mpsc::channel(1);
         DynamicModuleLoader {
@@ -2880,7 +3074,7 @@ mod tests {
         }
     }
 
-    // Internal helper for module loading and import policy flow; it handles run async.
+    // Runs async module-loader code on a single-threaded test runtime.
     fn run_async<T>(fut: impl std::future::Future<Output = T>) -> T {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2890,7 +3084,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles persistent entries are evicted after first load when over limit.
+    // Persistent entries over the limit are evicted after their first successful load.
     fn persistent_entries_are_evicted_after_first_load_when_over_limit() {
         let reg = test_registry(2);
         let base = Url::parse("file:///tmp/").expect("url");
@@ -2912,7 +3106,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles never loaded persistent entries are not evicted.
+    // Never-loaded persistent entries remain cached until they are first used.
     fn never_loaded_persistent_entries_are_not_evicted() {
         let reg = test_registry(1);
         let base = Url::parse("file:///tmp/").expect("url");
@@ -2934,7 +3128,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles remote load blocked when https resolve disabled.
+    // HTTPS imports require httpsResolve in addition to permissions.
     fn remote_load_blocked_when_https_resolve_disabled() {
         let loader = test_loader(false, serde_json::json!({ "import": true, "net": true }));
         let url = Url::parse("https://example.com/mod.ts").expect("url");
@@ -2942,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles remote load requires import and net permissions.
+    // Remote imports require both import and net permission grants.
     fn remote_load_requires_import_and_net_permissions() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": false }));
         let url = Url::parse("https://example.com/mod.ts").expect("url");
@@ -2956,7 +3150,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles import allow url does not match host prefix confusion.
+    // Host allow-lists must not accept prefix-confusable domains.
     fn import_allow_url_does_not_match_host_prefix_confusion() {
         let loader = test_loader(
             true,
@@ -2974,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles import allow url honors path boundary.
+    // URL path allow-lists match only at path segment boundaries.
     fn import_allow_url_honors_path_boundary() {
         let loader = test_loader(
             true,
@@ -2992,7 +3186,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles ipv6 host-port matching correctly.
+    // IPv6 allow-list entries may include optional port constraints.
     fn match_host_port_ipv6_respects_port_constraints() {
         assert!(DynamicModuleLoader::match_host_port(
             "[::1]:443",
@@ -3027,7 +3221,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles map jsr specifier maps jsr and std forms.
+    // JSR shorthand supports explicit jsr: URLs and @std package names.
     fn map_jsr_specifier_maps_jsr_and_std_forms() {
         let a = DynamicModuleLoader::map_jsr_specifier("jsr:@std/assert");
         assert_eq!(a.as_deref(), Some("https://jsr.io/@std/assert"));
@@ -3040,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles original spec and referrer prefers decoded resolve url.
+    // Internal resolve URLs carry the original specifier and referrer as query params.
     fn original_spec_and_referrer_prefers_decoded_resolve_url() {
         let u = Url::parse(
             "denojs-worker://resolve?specifier=https%3A%2F%2Fexample.com%2Fa.ts&referrer=file%3A%2F%2F%2Ftmp%2Fmain.ts",
@@ -3052,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles original spec and referrer falls back to runtime referrer.
+    // Normal module URLs fall back to Deno's runtime referrer metadata.
     fn original_spec_and_referrer_falls_back_to_runtime_referrer() {
         let module = Url::parse("file:///tmp/mod.ts").expect("url");
         let runtime_ref = deno_core::ModuleLoadReferrer {
@@ -3067,7 +3261,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles imports policy error only for deny all.
+    // Only DenyAll should produce an import-policy error before resolution.
     fn imports_policy_error_only_for_deny_all() {
         let deny = DynamicModuleLoader {
             imports_policy: ImportsPolicy::DenyAll,
@@ -3099,7 +3293,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles callback imports blocked during eval sync tracks atomic state.
+    // Synchronous eval blocks callback imports while the eval call is active.
     fn callback_imports_blocked_during_eval_sync_tracks_atomic_state() {
         let active = Arc::new(AtomicBool::new(false));
         let loader = DynamicModuleLoader {
@@ -3113,7 +3307,7 @@ mod tests {
     }
 
     #[test]
-    // Checks whether wrap with redirect is true only for internal resolve scheme and returns the boolean result for module resolution, policy, and remote loading.
+    // Only internal resolve placeholder URLs need source wrappers.
     fn should_wrap_with_redirect_is_true_only_for_internal_resolve_scheme() {
         let internal = Url::parse("denojs-worker://resolve?specifier=x").expect("url");
         let file = Url::parse("file:///tmp/mod.ts").expect("url");
@@ -3125,7 +3319,7 @@ mod tests {
     }
 
     #[test]
-    // Resolves allowed disk target resolves direct remote urls according to rules used by module resolution, policy, and remote loading.
+    // Remote URLs that already pass policy should not be rewritten as disk paths.
     fn resolve_allowed_disk_target_resolves_direct_remote_urls() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         let out = loader
@@ -3135,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    // Resolves rewritten target supports absolute url and trim according to rules used by module resolution, policy, and remote loading.
+    // Callback rewrites may return padded absolute URLs.
     fn resolve_rewritten_target_supports_absolute_url_and_trim() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         let out = loader
@@ -3145,7 +3339,7 @@ mod tests {
     }
 
     #[test]
-    // Checks whether load remote non callback respects scheme and config and returns the boolean result for module resolution, policy, and remote loading.
+    // Remote loading honors both URL scheme and module-loader configuration.
     fn should_load_remote_non_callback_respects_scheme_and_config() {
         let https_only = DynamicModuleLoader {
             module_loader: Some(ModuleLoaderConfig {
@@ -3214,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles final module type for remote forces js for ts like ext.
+    // Remote TS-like modules are transpiled to JavaScript before execution.
     fn final_module_type_for_remote_forces_js_for_ts_like_ext() {
         assert_eq!(
             DynamicModuleLoader::final_module_type_for_remote("ts", ModuleType::Json),
@@ -3235,7 +3429,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes callback decision maps channel closed to block into a canonical form before it is used by module resolution, policy, and remote loading.
+    // A closed Node callback channel fails closed instead of allowing imports.
     fn normalize_callback_decision_maps_channel_closed_to_block() {
         let out = DynamicModuleLoader::normalize_callback_decision(
             CallbackDecisionWait::ChannelClosed,
@@ -3246,7 +3440,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes callback decision preserves decision variant into a canonical form before it is used by module resolution, policy, and remote loading.
+    // Successful callback decisions should pass through unchanged.
     fn normalize_callback_decision_preserves_decision_variant() {
         let out = DynamicModuleLoader::normalize_callback_decision(
             CallbackDecisionWait::Decision(ImportDecision::Resolve(
@@ -3262,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    // Normalizes callback decision reports timeout with specifier into a canonical form before it is used by module resolution, policy, and remote loading.
+    // Timeout errors include the requested specifier for diagnostics.
     fn normalize_callback_decision_reports_timeout_with_specifier() {
         let err = DynamicModuleLoader::normalize_callback_decision(
             CallbackDecisionWait::TimedOut,
@@ -3276,7 +3470,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles source typed wrapper quotes virtual specifier.
+    // Virtual wrapper source must quote the generated specifier exactly.
     fn source_typed_wrapper_quotes_virtual_specifier() {
         let virt = "denojs-worker://virtual/__vm_42.js";
         let wrapper = DynamicModuleLoader::source_typed_wrapper(virt);
@@ -3305,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    // Resolves allow disk or error produces expected success and error according to rules used by module resolution, policy, and remote loading.
+    // Direct allow-disk decisions either resolve to a URL or return a useful error.
     fn resolve_allow_disk_or_error_produces_expected_success_and_error() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
 
@@ -3321,7 +3515,7 @@ mod tests {
     }
 
     #[test]
-    // Resolves rewritten or error produces expected success and error according to rules used by module resolution, policy, and remote loading.
+    // Rewrite decisions either resolve the target URL or report the bad target.
     fn resolve_rewritten_or_error_produces_expected_success_and_error() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
 
@@ -3337,7 +3531,7 @@ mod tests {
     }
 
     #[test]
-    // Builds source typed module registers virtual module for js required by module resolution, policy, and remote loading.
+    // Callback-provided JS source is registered under a generated virtual URL.
     fn build_source_typed_module_registers_virtual_module_for_js() {
         let loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         let requested = Url::parse("denojs-worker://resolve?specifier=x").expect("url");
@@ -3350,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    // Builds source typed module rejects ts when transpile disabled required by module resolution, policy, and remote loading.
+    // TS-like callback sources must be rejected when transpilation is disabled.
     fn build_source_typed_module_rejects_ts_when_transpile_disabled() {
         let loader = DynamicModuleLoader {
             module_loader: Some(ModuleLoaderConfig {
@@ -3370,7 +3564,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles request import decision returns reply from node channel.
+    // Import callbacks return their decision through the Node channel reply.
     fn request_import_decision_returns_reply_from_node_channel() {
         run_async(async {
             let (tx, mut rx) = mpsc::channel(1);
@@ -3394,7 +3588,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles request import decision channel closed maps to block.
+    // Dropped callback replies fail closed to Block.
     fn request_import_decision_channel_closed_maps_to_block() {
         run_async(async {
             let (tx, mut rx) = mpsc::channel(1);
@@ -3418,7 +3612,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles request import decision timeout returns error.
+    // Timed-out import callbacks produce a diagnostic error.
     fn request_import_decision_timeout_returns_error() {
         run_async(async {
             let (tx, mut rx) = mpsc::channel(1);
@@ -3445,7 +3639,7 @@ mod tests {
     }
 
     #[test]
-    // Internal helper for module loading and import policy flow; it handles request import decision unavailable when channel closed.
+    // A closed Node channel is distinct from a callback decision of Block.
     fn request_import_decision_unavailable_when_channel_closed() {
         run_async(async {
             let (tx, rx) = mpsc::channel(1);
@@ -3505,8 +3699,11 @@ module.exports = { '': 1, "": 2, "ok": 3 };
         let source = r#""use strict";
 exports.value = 42;
 "#;
-        let text = DynamicModuleLoader::build_node_cjs_interop_source(&resolved, source).expect("facade");
-        assert!(text.contains("new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\""));
+        let text =
+            DynamicModuleLoader::build_node_cjs_interop_source(&resolved, source).expect("facade");
+        assert!(text.contains(
+            "new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\""
+        ));
         assert!(text.contains("const __ddRequireMap = new Map();"));
         assert!(text.contains("const __ddRequire = (spec) => {"));
         assert!(text.contains("export default __ddFinal;"));
@@ -3518,9 +3715,26 @@ exports.value = 42;
     fn cjs_interop_escapes_reserved_export_names() {
         let resolved = Url::parse("file:///tmp/pkg/kw.js").expect("url");
         let source = r#"module.exports = { case: 1, ok: 3 };"#;
-        let text = DynamicModuleLoader::build_node_cjs_interop_source(&resolved, source).expect("facade");
+        let text =
+            DynamicModuleLoader::build_node_cjs_interop_source(&resolved, source).expect("facade");
         assert!(text.contains(" as case }"));
-        assert!(text.contains(" as ok }"));
+        assert!(text.contains("export const ok = __ddNamed[\"ok\"];"));
+    }
+
+    #[test]
+    // module.eval({ cjs: true }) uses placeholder CommonJS globals and the same reserved-word export escaping.
+    fn module_eval_cjs_facade_uses_module_eval_placeholders() {
+        let source = r#"
+exports.case = "reserved";
+exports.ok = require("path").basename("/tmp/demo.txt");
+"#;
+        let text = DynamicModuleLoader::build_module_eval_cjs_source(source).expect("facade");
+        assert!(text.contains("filename: \"<module.eval:cjs>\""));
+        assert!(text.contains("module.filename, \".\""));
+        assert!(text.contains("Unsupported require() in module.eval({ cjs: true })"));
+        assert!(text.contains("import * as __ddReq0 from \"node:path\";"));
+        assert!(text.contains(" as case }"));
+        assert!(text.contains("export const ok = __ddNamed[\"ok\"];"));
     }
 
     #[test]
@@ -3549,25 +3763,24 @@ exports.value = 42;
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("esm")).expect("mkdir");
         std::fs::create_dir_all(root.join("cjs")).expect("mkdir");
-        std::fs::write(
-            root.join("esm/package.json"),
-            r#"{ "type": "module" }"#,
-        )
-        .expect("write");
-        std::fs::write(
-            root.join("cjs/package.json"),
-            r#"{ "type": "commonjs" }"#,
-        )
-        .expect("write");
+        std::fs::write(root.join("esm/package.json"), r#"{ "type": "module" }"#).expect("write");
+        std::fs::write(root.join("cjs/package.json"), r#"{ "type": "commonjs" }"#).expect("write");
 
         let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         if let Some(cfg) = loader.module_loader.as_mut() {
             cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
         }
-        let esm_js = loader.classify_module_source(&root.join("esm/mod.js"), "js", "export const x = 1;");
-        let cjs_js = loader.classify_module_source(&root.join("cjs/mod.js"), "js", "module.exports = { x: 1 };");
-        let cjs_cjs = loader.classify_module_source(&root.join("cjs/mod.cjs"), "cjs", "module.exports = 1;");
-        let esm_mjs = loader.classify_module_source(&root.join("cjs/mod.mjs"), "mjs", "export default 1;");
+        let esm_js =
+            loader.classify_module_source(&root.join("esm/mod.js"), "js", "export const x = 1;");
+        let cjs_js = loader.classify_module_source(
+            &root.join("cjs/mod.js"),
+            "js",
+            "module.exports = { x: 1 };",
+        );
+        let cjs_cjs =
+            loader.classify_module_source(&root.join("cjs/mod.cjs"), "cjs", "module.exports = 1;");
+        let esm_mjs =
+            loader.classify_module_source(&root.join("cjs/mod.mjs"), "mjs", "export default 1;");
         assert!(!loader.should_wrap_file_as_cjs(&root.join("esm/mod.js"), "js", &esm_js));
         assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.js"), "js", &cjs_js));
         assert!(loader.should_wrap_file_as_cjs(&root.join("cjs/mod.cjs"), "cjs", &cjs_cjs));
@@ -3632,7 +3845,11 @@ exports.value = 42;
             r#"{ "name": "pkg", "main": "index.js" }"#,
         )
         .expect("write outside pkg json");
-        std::fs::write(outside.join("pkg/index.js"), "module.exports = { ok: true };").expect("write outside index");
+        std::fs::write(
+            outside.join("pkg/index.js"),
+            "module.exports = { ok: true };",
+        )
+        .expect("write outside index");
         std::fs::create_dir_all(root.join("node_modules")).expect("mkdir root");
 
         #[cfg(unix)]
@@ -3709,17 +3926,17 @@ exports.value = 42;
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
-        std::fs::write(
-            root.join("pkg/package.json"),
-            r#"{ "type": "commonjs" }"#,
-        )
-        .expect("write");
+        std::fs::write(root.join("pkg/package.json"), r#"{ "type": "commonjs" }"#).expect("write");
 
         let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         if let Some(cfg) = loader.module_loader.as_mut() {
             cfg.cjs_interop = crate::worker::state::CjsInteropMode::Node;
         }
-        let cls = loader.classify_module_source(&root.join("pkg/index.js"), "js", r#"export*from "./x.js";"#);
+        let cls = loader.classify_module_source(
+            &root.join("pkg/index.js"),
+            "js",
+            r#"export*from "./x.js";"#,
+        );
         assert!(!loader.should_wrap_file_as_cjs(&root.join("pkg/index.js"), "js", &cls));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3780,11 +3997,7 @@ exports.value = 42;
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
-        std::fs::write(
-            root.join("pkg/package.json"),
-            r#"{ "type": "commonjs" }"#,
-        )
-        .expect("write");
+        std::fs::write(root.join("pkg/package.json"), r#"{ "type": "commonjs" }"#).expect("write");
 
         let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         if let Some(cfg) = loader.module_loader.as_mut() {
@@ -3845,8 +4058,16 @@ exports.value = 42;
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("node_modules/pkg_a")).expect("mkdir");
         std::fs::create_dir_all(root.join("node_modules/pkg_b")).expect("mkdir");
-        std::fs::write(root.join("node_modules/pkg_a/index.js"), "module.exports = 1;").expect("write");
-        std::fs::write(root.join("node_modules/pkg_b/index.js"), "module.exports = 1;").expect("write");
+        std::fs::write(
+            root.join("node_modules/pkg_a/index.js"),
+            "module.exports = 1;",
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("node_modules/pkg_b/index.js"),
+            "module.exports = 1;",
+        )
+        .expect("write");
 
         let mut loader = test_loader(true, serde_json::json!({ "import": true, "net": true }));
         loader.sandbox_root = root.clone();
@@ -3862,18 +4083,26 @@ exports.value = 42;
             ];
         }
 
-        assert!(loader
-            .match_forced_cjs_rule(&root.join("node_modules/pkg_a/index.js"))
-            .is_some());
-        assert!(loader
-            .match_forced_cjs_rule(&root.join("node_modules/pkg_b/index.js"))
-            .is_some());
-        assert!(loader
-            .match_forced_cjs_rule(&root.join("node_modules/pkg_c/main.js"))
-            .is_some());
-        assert!(loader
-            .match_forced_cjs_rule(&root.join("node_modules/pkg_d/index.js"))
-            .is_none());
+        assert!(
+            loader
+                .match_forced_cjs_rule(&root.join("node_modules/pkg_a/index.js"))
+                .is_some()
+        );
+        assert!(
+            loader
+                .match_forced_cjs_rule(&root.join("node_modules/pkg_b/index.js"))
+                .is_some()
+        );
+        assert!(
+            loader
+                .match_forced_cjs_rule(&root.join("node_modules/pkg_c/main.js"))
+                .is_some()
+        );
+        assert!(
+            loader
+                .match_forced_cjs_rule(&root.join("node_modules/pkg_d/index.js"))
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

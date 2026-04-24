@@ -3,7 +3,7 @@ use neon::prelude::*;
 use crate::bridge::errors::host_function_error;
 use crate::bridge::types::JsValueBridge;
 
-// Returns thenable from state used by runtime bridge internals.
+// Detects Promise-like results without requiring a real Promise instance.
 fn get_thenable<'a>(
     cx: &mut TaskContext<'a>,
     v: Handle<'a, JsValue>,
@@ -16,7 +16,7 @@ fn get_thenable<'a>(
     Some((obj, then_fn))
 }
 
-// Thrown to bridge.
+// Converts arbitrary thrown JS values into a host-function error payload.
 fn thrown_to_bridge<'a>(cx: &mut TaskContext<'a>, thrown: Handle<'a, JsValue>) -> JsValueBridge {
     match crate::bridge::neon_codec::from_neon_value(cx, thrown) {
         Ok(JsValueBridge::Error {

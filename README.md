@@ -12,18 +12,18 @@
 
 </div>
 
-**Securely orchestrate, sandbox, and bridge Deno runtimes directly within Node.js.**
+**Orchestrate, sandbox, and bridge Deno runtimes directly within Node.js.**
 
-Deno Director is a high-performance orchestration layer that allows you to spawn, manage, and communicate with embedded Deno V8 isolates from your Node.js applications. Whether you are building a multi-tenant edge compute platform, a plugin system, or just need to execute untrusted third-party code securely, Deno Director provides a seamless, type-safe, and highly tunable bridge between runtimes.
+Deno Director is a high-performance orchestration layer that allows you to spawn, manage, and communicate with embedded Deno V8 isolates from your Node.js applications. Whether you are building a multi-tenant edge compute platform, a plugin system, or need to run third-party code with explicit permissions and resource limits, Deno Director provides a seamless, type-safe, and highly tunable bridge between runtimes.
 
 ---
 
 ## 🚀 Why Deno Director?
 
-* **Ironclad Sandboxing:** Execute untrusted code with confidence. Control exactly what the runtime can access with fine-grained limits on memory, CPU time, file system (`read`/`write`), and network (`net`).
-* **Zero-Config TypeScript & JSX:** Evaluate `.ts`, `.tsx`, and `.jsx` seamlessly. Deno Director handles the AST parsing, transpilation, and caching automatically.
+* **Explicit Sandboxing:** Control what each runtime can access with fine-grained limits on memory, CPU time, file system (`read`/`write`), and network (`net`).
+* **TypeScript & JSX Support:** Evaluate `.ts`, `.tsx`, and `.jsx` sources. Deno Director handles AST parsing and transpilation, with optional caching for loader paths that use a cache directory.
 * **High-Fidelity Bridging:** Stop fighting with `JSON.stringify`. Naturally pass complex JavaScript types across the runtime boundary, including `Map`, `Set`, `Date`, `RegExp`, `Error`, `ArrayBuffer`, and `Uint8Array`.
-* **Blazing Fast Streams:** Built-in support for bi-directional, flow-controlled binary streaming between Node and Deno using native Node `Duplex` streams.
+* **Flow-Controlled Streams:** Built-in support for bi-directional binary streaming between Node and Deno using native Node `Duplex` streams.
 * **Node.js & CJS Interop:** Enable `nodeJs` compatibility to let your sandboxed code resolve `node_modules` and execute CommonJS code inside an ESM facade.
 * **Live Telemetry & Observability:** Built-in APIs to monitor CPU usage, event loop lag, operation latency, and V8 heap statistics per worker.
 * **Dynamic Import Control:** Intercept and rewrite dynamic imports on the fly using custom `imports` callback policies.
@@ -36,29 +36,31 @@ Deno Director is a high-performance orchestration layer that allows you to spawn
 npm install deno-director
 ```
 
+Deno Director builds a native addon during install, so the host needs a working Rust toolchain (`cargo`) in addition to Node.js/npm.
+
 ---
 
 ## ⚡ Quick Start
 
-Create a director, spin up a secure worker, and execute some TypeScript in milliseconds.
+Create a worker and execute TypeScript in milliseconds.
 
 ```typescript
 import { DenoWorker } from "deno-director";
 
 // 1. Initialize a worker
 const worker = new DenoWorker({
-    permissions: { 
+    permissions: {
         net: ["api.github.com"], // Only allow requests to GitHub
         read: false,             // Block file system reads
         write: false             // Block file system writes
     },
-    limits: { 
+    limits: {
         maxEvalMs: 500,          // Timeout execution after 500ms
         maxMemoryBytes: 64 * 1024 * 1024 // Cap memory at 64MB
     }
 });
 
-// 3. Evaluate TypeScript directly
+// 2. Evaluate TypeScript directly
 const result = await worker.eval(`
     const fetchRepo = async (user: string): Promise<string> => {
         return \`Fetching data for \${user}...\`;
@@ -68,8 +70,8 @@ const result = await worker.eval(`
 
 console.log(result); // "Fetching data for denoland..."
 
-// 4. Clean up
-await director.close();
+// 3. Clean up
+await worker.close();
 ```
 
 ---
@@ -77,7 +79,7 @@ await director.close();
 ## 🧠 Core Concepts
 
 ### 1. The Director (`DenoDirector`)
-The central orchestrator. It manages the lifecycle of multiple runtimes, assigns unique IDs, and allows you to query active workers via custom labels and tags. 
+The central orchestrator. It manages the lifecycle of multiple runtimes, assigns unique IDs, and allows you to query active workers via custom labels and tags.
 
 ### 2. The Worker (`DenoWorker`)
 A single, isolated Deno V8 instance. It exposes APIs for evaluation (`eval`, `evalSync`, `module.eval`), messaging (`postMessage`), streaming, and environment variable injection.
@@ -91,18 +93,20 @@ If you need to spin up dozens of identical isolates, create a template. Template
 
 When running third-party or untrusted code, you often need strict control over what dependencies that code can pull in. The `imports` property on the worker configuration object allows you to define exactly how module resolution behaves inside the sandbox.
 
-It accepts three types of values: a **boolean** (`true` or `false`) or a highly flexible **callback function**.
+It accepts two kinds of values: a **boolean** (`true` or `false`) or a highly flexible **callback function**.
 
 ### 1. The Simple Switch (Boolean)
 
 If you want to outright ban or permit all module loading, you can use a simple boolean:
 
 * **`imports: false`** (Default): Completely disables all imports (`import ...` or `await import(...)`). Any attempt to load a module will immediately throw an error.
-* **`imports: true`**: Allows standard disk and remote module resolution, governed by your `permissions` (like `net` and `read`).
+* **`imports: true`**: Allows standard disk and remote module resolution, governed by your `permissions` (like `read`, `import`, and `net`) and `moduleLoader` scheme settings (`httpsResolve` / `httpResolve`).
+
+For remote URL imports, enable both the scheme in `moduleLoader` and the matching permissions. For example: `moduleLoader: { httpsResolve: true }` with `permissions: { import: true, net: true }`.
 
 ### 2. The Callback (Dynamic Interception)
 
-Passing a callback function to `imports` unlocks the ability to intercept, rewrite, or mock *every single import* requested by the Deno runtime, right from your Node.js host. 
+Passing a callback function to `imports` unlocks the ability to intercept, rewrite, or mock *every single import* requested by the Deno runtime, right from your Node.js host.
 
 The callback receives the requested `specifier`, the `referrer` (the file asking for the import), and a boolean flag indicating if it was a dynamic `import()`.
 
@@ -112,12 +116,14 @@ You can return (or resolve a Promise to) several different shapes depending on w
 Return `true` to allow the import or `false` to block it.
 
 ```typescript
-const worker = await director.start({
+const worker = new DenoWorker({
+    moduleLoader: { httpsResolve: true },
+    permissions: { import: true, net: true },
     imports: (specifier, referrer, isDynamic) => {
         // Block any imports from untrusted-cdn.com
         if (specifier.startsWith("https://untrusted-cdn.com")) {
             console.warn(`Blocked import from ${referrer}`);
-            return false; 
+            return false;
         }
         return true; // Let Deno handle the rest normally
     }
@@ -128,7 +134,9 @@ const worker = await director.start({
 You can seamlessly swap out dependencies on the fly by returning `{ resolve: string }`. This is incredibly useful for mapping bare specifiers to specific URLs or injecting secure versions of libraries.
 
 ```typescript
-const worker = await director.start({
+const worker = new DenoWorker({
+    moduleLoader: { httpsResolve: true },
+    permissions: { import: true, net: true },
     imports: (specifier) => {
         // Transparently reroute 'lodash' to a specific ESM CDN URL
         if (specifier === "lodash") {
@@ -143,13 +151,13 @@ const worker = await director.start({
 You don't even need the file to exist on disk or the web. You can return raw source code directly from Node.js into the Deno isolate using the `{ src: string, srcLoader?: string }` shape (or just a raw string, which defaults to `"js"`).
 
 ```typescript
-const worker = await director.start({
+const worker = new DenoWorker({
     imports: async (specifier) => {
         // Provide a synthetic config module on demand
         if (specifier === "app://config.ts") {
             // Fetch live config from a Node.js database
             const dbConfig = await fetchTenantConfigFromMongo();
-            
+
             return {
                 src: `export const config = ${JSON.stringify(dbConfig)};`,
                 srcLoader: "ts" // Tell Deno Director to transpile this as TypeScript
@@ -166,13 +174,13 @@ await worker.eval(`
 `);
 ```
 
-#### Why this is a Game-Changer
+#### Why this is useful
 
 By combining the imports callback with sourceLoaders, you can create a completely synthetic, database-backed file system for your Deno isolates. You can serve code dynamically based on the current user, enforce strict dependency pinning, or inject host-provided mocks without writing a single file to disk.
 
 
 ## High-Performance Binary Streams
-Need to pipe large amounts of data between Node and Deno? Deno Director creates native Node `Duplex` streams backed by shared memory or high-speed IPC, complete with backpressure and credit-based flow control.
+Need to pipe large amounts of data between Node and Deno? Deno Director creates Node `Duplex` streams over native bridge IPC, complete with backpressure and credit-based flow control. Experimental shared-memory transport is available as an opt-in mode.
 
 ```typescript
 // Node.js side
@@ -199,7 +207,7 @@ const myHandle = await worker.handle.eval(`
 
 // Manipulate the Deno object directly from Node
 await myHandle.call("set", ["retries", 1]);
-const status = await myHandle.get("status"); 
+const status = await myHandle.get("status");
 
 // Cleanup memory to avoid leaks in the isolate
 await myHandle.dispose();
@@ -209,22 +217,25 @@ await myHandle.dispose();
 Legacy code doesn't have to be a blocker. Deno Director can synthesize ESM facades for CommonJS code and allow module resolution of local `node_modules`.
 
 ```typescript
-const worker = await director.start({
-    nodeJs: { 
-        modules: true,     // use NodeJS style module resultion for ESM imports.
+const worker = new DenoWorker({
+    nodeJs: {
+        modules: true,     // use Node.js-style module resolution for ESM imports.
         cjsInterop: true,  // enable CJS modules
         runtime: true      // enable Node runtime behavior
-    },
-    // a shorthand if you want all nodeJS compat to be enabled
+    }
+});
+
+const workerWithAllNodeCompat = new DenoWorker({
+    // shorthand for { modules: true, runtime: true, cjsInterop: true }
     nodeJs: true
 });
 ```
 
 ### Real-Time Telemetry & Observability
-Monitor the health of your isolates to detect rogue code before it crashes your host process.
+Monitor resource use, latency, and runtime health so problematic code is visible before it affects the host process.
 
 ```typescript
-// Measure CPU usage over the last 1000ms
+// Measure CPU usage over the next 1000ms
 const cpuStats = await worker.stats.cpu({ measureMs: 1000 });
 console.log(`CPU Usage: ${cpuStats.usagePercentage}%`);
 
@@ -427,4 +438,4 @@ Passed during worker creation.
 * **`globals`**: Initial host values mapped directly to `globalThis` on startup.
 * **`modules`**: Pre-registered source modules mapped to specifiers.
 * **`lifecycle`**: Event hooks for `beforeStart`, `afterStart`, `beforeStop`, `afterStop`, and `onCrash`.
-* **`inspect`**: Enable V8 inspector with `host`, `port`, and `break_on_first_statement`.
+* **`inspect`**: Enable V8 inspector with `host`, `port`, and `break`.

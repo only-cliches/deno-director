@@ -128,6 +128,23 @@ describe("bridge: expanded types", () => {
     }
   });
 
+  test("Node -> Deno eval args preserve TypedArrays + DataView", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const i16 = new Int16Array([1, 2, 3]);
+      expect(await dw.eval("(x) => x instanceof Int16Array", { args: [i16] })).toBe(true);
+      expect(await dw.eval("(x) => Array.from(x)", { args: [i16] })).toEqual([1, 2, 3]);
+
+      const ab = new ArrayBuffer(4);
+      const dv = new DataView(ab);
+      dv.setUint32(0, 0x01020304, false);
+      expect(await dw.eval("(x) => x instanceof DataView", { args: [dv] })).toBe(true);
+      expect(await dw.eval("(x) => x.getUint32(0, false)", { args: [dv] })).toBe(0x01020304);
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("Deno -> Node: TypedArrays (roundtrip class + bytes)", async () => {
     const dw = createTestWorker({ console: false });
     try {
@@ -189,6 +206,35 @@ describe("bridge: expanded types", () => {
     }
   });
 
+  test("Deno -> Node: sliced TypedArray and DataView preserve view bytes", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const i16 = await dw.eval(`
+        (() => {
+          const ab = new ArrayBuffer(8);
+          const all = new Int16Array(ab);
+          all.set([11, 22, 33, 44]);
+          return new Int16Array(ab, 2, 2);
+        })()
+      `);
+      expect(i16).toBeInstanceOf(Int16Array);
+      expect(Array.from(i16 as Int16Array)).toEqual([22, 33]);
+
+      const dv = await dw.eval(`
+        (() => {
+          const ab = new ArrayBuffer(8);
+          const all = new Uint8Array(ab);
+          all.set([1, 2, 3, 4, 5, 6, 7, 8]);
+          return new DataView(ab, 2, 4);
+        })()
+      `);
+      expect(dv).toBeInstanceOf(DataView);
+      bytesEq(dv, [3, 4, 5, 6]);
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("Node -> Deno: TypedArrays + DataView", async () => {
     const dw = createTestWorker({ console: false });
     try {
@@ -203,6 +249,25 @@ describe("bridge: expanded types", () => {
       await dw.global.set("dv", dv);
       expect(await dw.eval("dv instanceof DataView")).toBe(true);
       expect(await dw.eval("dv.getUint32(0, false)")).toBe(0x01020304);
+    } finally {
+      await dw.close();
+    }
+  });
+
+  test("Node -> Deno: sliced TypedArray and DataView preserve view bytes", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const backing = new ArrayBuffer(8);
+      new Int16Array(backing).set([11, 22, 33, 44]);
+      await dw.global.set("i16Slice", new Int16Array(backing, 2, 2));
+      expect(await dw.eval("i16Slice instanceof Int16Array")).toBe(true);
+      expect(await dw.eval("Array.from(i16Slice)")).toEqual([22, 33]);
+
+      const dvBacking = new ArrayBuffer(8);
+      new Uint8Array(dvBacking).set([1, 2, 3, 4, 5, 6, 7, 8]);
+      await dw.global.set("dvSlice", new DataView(dvBacking, 2, 4));
+      expect(await dw.eval("dvSlice instanceof DataView")).toBe(true);
+      expect(await dw.eval("Array.from(new Uint8Array(dvSlice.buffer, dvSlice.byteOffset, dvSlice.byteLength))")).toEqual([3, 4, 5, 6]);
     } finally {
       await dw.close();
     }
@@ -331,6 +396,22 @@ describe("bridge: expanded types", () => {
       expect(await dw.eval("usp instanceof URLSearchParams")).toBe(true);
       expect(await dw.eval("usp.get('a')")).toBe("1");
       expect(await dw.eval("usp.get('b')")).toBe("2");
+    } finally {
+      await dw.close();
+    }
+  });
+
+  test("Node -> Deno eval args preserve URL + URLSearchParams", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const url = new URL("https://example.com/a?b=c");
+      expect(await dw.eval("(x) => x instanceof URL", { args: [url] })).toBe(true);
+      expect(await dw.eval("(x) => x.href", { args: [url] })).toBe("https://example.com/a?b=c");
+
+      const usp = new URLSearchParams("a=1&b=2");
+      expect(await dw.eval("(x) => x instanceof URLSearchParams", { args: [usp] })).toBe(true);
+      expect(await dw.eval("(x) => x.get('a')", { args: [usp] })).toBe("1");
+      expect(await dw.eval("(x) => x.get('b')", { args: [usp] })).toBe("2");
     } finally {
       await dw.close();
     }

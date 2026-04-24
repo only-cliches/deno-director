@@ -154,6 +154,19 @@ describe("deno_worker: data serialization", () => {
     expect(out.same).toBe(out.b);
   });
 
+  it("preserves shared acyclic object graphs (Deno -> Node result)", async () => {
+    dw = createTestWorker();
+
+    const out: any = await dw.eval(`
+      (() => {
+        const shared = { value: 42 };
+        return { left: shared, right: shared };
+      })()
+    `);
+
+    expect(out.left).toBe(out.right);
+  });
+
   it("property-based: round-trips JSON-serializable values", async () => {
     dw = createTestWorker();
 

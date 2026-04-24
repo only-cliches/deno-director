@@ -78,6 +78,21 @@ describe("module.eval: module namespace API", () => {
     }
   });
 
+  test("module.eval cjs:true supports reserved named exports", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const mod = await dw.module.eval(`
+        exports.case = "reserved";
+        exports.ok = 3;
+      `, { cjs: true });
+
+      expect(mod["case"]).toBe("reserved");
+      expect(mod.ok).toBe(3);
+    } finally {
+      await dw.close();
+    }
+  });
+
   test("module.eval cjs:true supports static require and Babel-style exports", async () => {
     const dw = createTestWorker({ console: false, nodeJs: { modules: true } });
     try {
@@ -94,6 +109,21 @@ describe("module.eval: module namespace API", () => {
       expect(typeof mod.basename).toBe("function");
       expect(mod.basename("/tmp/demo/file.ts")).toBe("file.ts");
       expect(mod.default).toBeDefined();
+    } finally {
+      await dw.close();
+    }
+  });
+
+  test("module.eval cjs:true exposes CommonJS wrapper globals", async () => {
+    const dw = createTestWorker({ console: false });
+    try {
+      const mod = await dw.module.eval(`
+        exports.filename = __filename;
+        exports.dirname = __dirname;
+      `, { cjs: true });
+
+      expect(mod.filename).toBe("<module.eval:cjs>");
+      expect(mod.dirname).toBe(".");
     } finally {
       await dw.close();
     }
